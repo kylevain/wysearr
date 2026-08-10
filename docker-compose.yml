@@ -10,7 +10,7 @@ x-common: &common
 services:
   qbittorrent:
     <<: *common
-    image: lscr.io/linuxserver/qbittorrent:latest
+    image: lscr.io/linuxserver/qbittorrent:5.1.4
     container_name: qbittorrent
     environment:
       PUID: ${PUID:-1000}
@@ -79,7 +79,7 @@ services:
 
   whisparr:
     <<: *common
-    image: ghcr.io/hotio/whisparr:latest
+    image: ghcr.io/hotio/whisparr:nightly
     container_name: whisparr
     volumes:
       - ./config/whisparr:/config
