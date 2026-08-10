@@ -1,0 +1,100 @@
+name: wysearr
+
+x-common: &common
+  restart: unless-stopped
+  environment:
+    PUID: ${PUID:-1000}
+    PGID: ${PGID:-1000}
+    TZ: ${TZ:-Pacific/Honolulu}
+
+services:
+  qbittorrent:
+    <<: *common
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Pacific/Honolulu}
+      WEBUI_PORT: ${QBITTORRENT_PORT:-8080}
+    volumes:
+      - ./config/qbittorrent:/config
+      - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
+    ports:
+      - "${QBITTORRENT_PORT:-8080}:8080"
+      - "6881:6881"
+      - "6881:6881/udp"
+
+  prowlarr:
+    <<: *common
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    volumes:
+      - ./config/prowlarr:/config
+    ports:
+      - "${PROWLARR_PORT:-9696}:9696"
+
+  sonarr:
+    <<: *common
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    volumes:
+      - ./config/sonarr:/config
+      - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
+      - ${MEDIA_ROOT:-/mnt/media}:/media
+    ports:
+      - "${SONARR_PORT:-8989}:8989"
+
+  radarr:
+    <<: *common
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    volumes:
+      - ./config/radarr:/config
+      - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
+      - ${MEDIA_ROOT:-/mnt/media}:/media
+    ports:
+      - "${RADARR_PORT:-7878}:7878"
+
+  lidarr:
+    <<: *common
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    volumes:
+      - ./config/lidarr:/config
+      - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
+      - ${MEDIA_ROOT:-/mnt/media}:/media
+    ports:
+      - "${LIDARR_PORT:-8686}:8686"
+
+  bazarr:
+    <<: *common
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    volumes:
+      - ./config/bazarr:/config
+      - ${MEDIA_ROOT:-/mnt/media}:/media
+    ports:
+      - "${BAZARR_PORT:-6767}:6767"
+
+  whisparr:
+    <<: *common
+    image: ghcr.io/hotio/whisparr:latest
+    container_name: whisparr
+    volumes:
+      - ./config/whisparr:/config
+      - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
+      - ${MEDIA_ROOT:-/mnt/media}:/media
+    ports:
+      - "${WHISPARR_PORT:-6969}:6969"
+
+  bookbot:
+    <<: *common
+    build:
+      context: .
+      dockerfile: docker/bookbot/Dockerfile
+    container_name: bookbot
+    volumes:
+      - ./config/bookbot:/config
+      - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
+      - ${MEDIA_ROOT:-/mnt/media}:/media

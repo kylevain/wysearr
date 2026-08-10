@@ -1,11 +1,9 @@
-# WyseARR
+# WyseARR Stack v1
 
-Hostname: wysearr
+Extract this archive into `~/homelab`, then run:
 
-Hardware: Dell Wyse 5010
+```bash
+./deploy.sh
+```
 
-OS: Debian 13
-
-Admin User: wyseadmin
-
-Purpose: Media acquisition and automation node.
+The deploy script validates `/mnt/media`, creates runtime directories, builds BookBot, pulls images, and starts the stack.

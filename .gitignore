@@ -1,4 +1,8 @@
-config/*.env
-config/**/*.env
-
-docker/qbittorrent/config/
+.env
+config/**
+!config/.gitkeep
+state/**
+!state/.gitkeep
+*.log
+__pycache__/
+*.pyc
