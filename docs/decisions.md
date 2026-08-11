@@ -21,3 +21,7 @@ Media-specific channels route requests to deterministic handlers:
 Pilot may generate structured requests but does not directly control acquisition services.
 
 SQLite approved as a local service-state pathway for request tracking, history, recovery, and auditability. Databases remain service-owned and are not centralized by default.
+
+Naming context:
+- Dewey references the Dewey Decimal System and represents the media library conversational interface.
+- Huey and Louie follow the Donald Duck nephews naming pattern. Huey is assigned to Discord request intake. Louie is reserved for future media-library automation.
