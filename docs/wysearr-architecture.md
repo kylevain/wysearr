@@ -21,3 +21,45 @@ qBittorrent, Prowlarr, Sonarr, Radarr, Lidarr, Readarr, Whisparr, Bazarr, BookBo
 
 ## Secrets
 No secrets are committed. Copy `.env.example` to `.env` locally.
+
+## Request Architecture
+
+Discord is the human request interface.
+
+Media-specific Discord channels define request intent. The request listener does not infer media type from message content.
+
+Examples:
+
+- movies/tv → movie and television requests
+- ebooks → ebook requests
+- audiobooks → audiobook requests
+- manga/comics → comic requests
+- roms → ROM requests
+- sheet music → sheet music requests
+- future channels → future media handlers
+
+The selected channel determines which deterministic handler processes the request.
+
+## Request State
+
+SQLite is an approved local service-state pathway.
+
+Request state may be stored locally for:
+
+- request tracking
+- approval state
+- processing history
+- recovery
+- auditability
+
+Databases remain service-owned and are not centralized by default.
+
+## Pilot Integration
+
+Pilot acts as an intent and request generation layer.
+
+Pilot may create structured requests, but does not directly control acquisition services.
+
+Flow:
+
+Pilot → structured request → Discord/request pipeline → deterministic handlers → ARR/library services
