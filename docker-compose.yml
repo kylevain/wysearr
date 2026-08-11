@@ -98,3 +98,14 @@ services:
       - ./config/bookbot:/config
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
       - ${MEDIA_ROOT:-/mnt/media}:/media
+
+  huey:
+    <<: *common
+    build:
+      context: .
+      dockerfile: docker/huey/Dockerfile
+    container_name: huey
+    environment:
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
+    volumes:
+      - ./state/huey:/state
