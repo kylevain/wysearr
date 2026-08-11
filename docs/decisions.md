@@ -25,3 +25,9 @@ SQLite approved as a local service-state pathway for request tracking, history, 
 Naming context:
 - Dewey references the Dewey Decimal System and represents the media library conversational interface.
 - Huey and Louie follow the Donald Duck nephews naming pattern. Huey is assigned to Discord request intake. Louie is reserved for future media-library automation.
+
+2026-08-11: SQLite backup strategy identified as future architecture work.
+
+VainLab services may use service-owned SQLite databases. A future backup strategy should evaluate consistent SQLite-safe backup methods across services.
+
+This is intentionally outside Huey/Dewey/Louie implementation scope.
