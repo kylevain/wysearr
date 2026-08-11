@@ -31,3 +31,5 @@ Naming context:
 VainLab services may use service-owned SQLite databases. A future backup strategy should evaluate consistent SQLite-safe backup methods across services.
 
 This is intentionally outside Huey/Dewey/Louie implementation scope.
+
+Dewey may generate normalized structured requests and submit them through the same Huey request pipeline. Huey remains the deterministic intake and routing layer.

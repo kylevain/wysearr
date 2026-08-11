@@ -6,6 +6,7 @@ from pathlib import Path
 
 import discord
 import yaml
+from parser import parse_request
 
 ROOT = Path("/app")
 CONFIG = ROOT / "config" / "channels.yml"
@@ -38,6 +39,8 @@ def record_request(message, media_type):
     with sqlite3.connect(DB) as conn:
         cur = conn.cursor()
 
+        parsed = parse_request(message.content)
+
         cur.execute(
             """
             INSERT INTO requests (
@@ -46,9 +49,11 @@ def record_request(message, media_type):
                 channel_id,
                 message_id,
                 media_type,
-                raw_request
+                raw_request,
+                title,
+                author
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(message.author.id),
@@ -57,6 +62,8 @@ def record_request(message, media_type):
                 str(message.id),
                 media_type,
                 message.content,
+                parsed["title"],
+                parsed["author"],
             ),
         )
 
