@@ -1,37 +1,19 @@
-# WyseARR Hardware Inventory
+# WyseARR inventory
 
-Captured: 2026-08-09
+Captured and reconciled: 2026-08-11.
 
-## Identity
+| Item | Production value |
+| --- | --- |
+| Host | Dell Wyse 5010, hostname `wysearr` |
+| OS | Debian 13, x86_64 |
+| Network | `192.168.4.86/22`, wired Gigabit Ethernet |
+| CPU | AMD G-T48E, 2 cores / 2 threads |
+| Memory | 8 GB RAM, 7.6 GiB swap |
+| Local storage | approximately 1 TB SATA SSD |
+| Docker | Engine 26.1.5, Compose plugin 2.26.1 |
+| DAS mount | `//192.168.4.46/Media` at `/mnt/media` via CIFS |
+| Container identity | UID/GID 1000 for media access |
 
-Hostname: wysearr Hardware: Dell Wyse 5010 OS: Debian 13 Admin:
-wyseadmin IP: 192.168.4.86/22
-
-## CPU
-
-Model: AMD G-T48E Processor Cores: 2 Threads: 2 Architecture: x86_64
-Virtualization: AMD-V
-
-## Memory
-
-Installed RAM: 8 GB Available after boot: \~7 GiB Swap: 7.6 GiB
-
-## Storage
-
-Primary Disk: \~1 TB SATA SSD
-
-Partitions: - EFI: 976 MiB - Root: 945.3 GiB ext4 - Swap: 7.6 GiB
-
-## Network
-
-Interface: - enp4s0 - Wired Realtek Gigabit Ethernet
-
-IPv4: - 192.168.4.86/22
-
-## Role
-
-Media acquisition and automation node.
-
-Planned responsibilities: - ARR coordination - qBittorrent - Discord
-listener - Download processing - Filename cleanup - Subtitle handling -
-Library organization
+The local SSD holds acquisition activity and disposable retained torrents. The
+DAS holds permanent library files. At validation time the DAS had approximately
+9.8 TiB free and the required media roots were writable from the containers.

@@ -1,26 +1,19 @@
-# Legacy BookBot
+# Legacy BookBot migration
 
-Recovered from Pi-SSD backup.
+The recovered shell implementation remains outside this repository under
+`/home/wyseadmin/legacy/bookbot` for historical reference only. It is not run by
+the production stack and its Pi-specific paths and secret handling must not be
+restored.
 
-Source:
-- /home/piadmin/bookbot-backup-2026-06-09.tar.gz
+Its useful behavior has been ported to the Python BookBot service:
 
-Components:
-- bookbot-cleanup.sh
-- bookbot-daily-digest.sh
-- bookbot-lib/discord.sh
-- bookbot-state/
+- media-specific destination and extension rules
+- normalized filenames/folders
+- duplicate preservation rather than overwrite
+- direct-media imports onto the DAS
+- terminal Huey state updates
+- post-import retention cleanup
 
-Capabilities:
-- ebook cleanup
-- comics cleanup
-- ROM cleanup
-- sheet music cleanup
-- audiobook folder processing
-- Discord notifications
-- daily addition digest
-
-Migration status:
-- Review complete
-- Paths require redesign for WyseARR
-- Secrets must not be migrated into Git
+The production source is `scripts/processing/`; its persisted ledger is under
+`config/bookbot`. Discord delivery is centralized in Huey, so the legacy direct
+Discord shell functions and daily digest are intentionally retired.

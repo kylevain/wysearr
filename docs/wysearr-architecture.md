@@ -1,65 +1,54 @@
-# WyseARR Architecture v1
+# WyseARR operator model
 
-Host: wysearr (192.168.4.86)
+This is the short operator view. The authoritative component and data-flow
+description is [architecture.md](architecture.md).
 
-## Storage
-- Temporary torrent data: WyseARR local SSD.
-- Permanent media library: `/mnt/media` from Pi-SSD/DAS.
-- Torrent paths: `watch/`, `active/`, `complete/`, `processed-torrents/`.
+## Normal use
 
-## Lifecycle
-1. qBittorrent receives torrent.
-2. Payload downloads to local SSD.
-3. Completed payload stays local for seeding.
-4. Import/processing copies cleaned library content to DAS.
-5. Original payload remains untouched while seeding.
-6. Seeding policy target: 14 days.
-7. Cleanup removes torrent job, local payload, `.torrent`, and related metadata after policy is satisfied.
+Users request movies, TV, ebooks, audiobooks, manga/comics, ROMs, and sheet
+music in the corresponding Discord channels. Only the combined movies/TV
+channel needs a type prefix:
 
-## Services
-qBittorrent, Prowlarr, Sonarr, Radarr, Lidarr, Readarr, Whisparr, Bazarr, BookBot processing, Discord integration.
+```text
+movie: The Third Man
+tv: Severance
+```
 
-## Secrets
-No secrets are committed. Copy `.env.example` to `.env` locally.
+Ebook and audiobook requests may add an author with `by`. Other direct-media
+requests may include an edition, platform, instrument, or format in the title
+when needed to disambiguate a release.
 
-## Request Architecture
+Huey immediately records the message and reports whether it was queued, needs a
+more specific request, or failed. The user does not operate qBittorrent or move
+files. When an ARR or BookBot confirms an import, or BookBot rejects one, Huey
+posts one terminal notification by the available original-message or
+request-status route. ARR API failures remain queued for a later reconciliation
+pass rather than being guessed terminal.
 
-Discord is the human request interface.
+Music and adult-library requests currently use their Lidarr and Whisparr Web
+UIs because no Discord channels are assigned to those media types.
 
-Media-specific Discord channels define request intent. The request listener does not infer media type from message content.
+## Data placement
 
-Examples:
+- Active and retained torrent data: local SSD under `state/torrents`.
+- TV, movies, music, adult media: ARR imports into `/mnt/media/<library>`.
+- Ebooks: `/mnt/media/ebooks/Books` for Kavita.
+- Manga/comics: `/mnt/media/ebooks/Comics` for Kavita.
+- Audiobooks: `/mnt/media/audiobooks` for Audiobookshelf.
+- ROMs: `/mnt/media/roms` for RomM.
+- Sheet music: `/mnt/media/sheetmusic`.
 
-- movies/tv → movie and television requests
-- ebooks → ebook requests
-- audiobooks → audiobook requests
-- manga/comics → comic requests
-- roms → ROM requests
-- sheet music → sheet music requests
-- future channels → future media handlers
+Successful imports retain the original torrent locally for 14 days and then
+remove both the qBittorrent job and local payload. Failed or incomplete imports
+are never eligible for automatic payload deletion.
 
-The selected channel determines which deterministic handler processes the request.
+## Administrator use
 
-## Request State
+`./deploy.sh` is the single redeploy/reconciliation command. It does not require
+manual YAML editing or repeated Web UI configuration. `python3 scripts/validate.py`
+is the non-destructive production acceptance check; it performs live service
+connection tests but does not mutate managed configuration or media. See
+[recovery.md](recovery.md) before restoring databases or rolling back code.
 
-SQLite is an approved local service-state pathway.
-
-Request state may be stored locally for:
-
-- request tracking
-- approval state
-- processing history
-- recovery
-- auditability
-
-Databases remain service-owned and are not centralized by default.
-
-## Pilot Integration
-
-Pilot acts as an intent and request generation layer.
-
-Pilot may create structured requests, but does not directly control acquisition services.
-
-Flow:
-
-Pilot → structured request → Discord/request pipeline → deterministic handlers → ARR/library services
+No secrets are committed. `.env`, service configuration, request databases, and
+private runtime checkpoints remain local and ignored by Git.

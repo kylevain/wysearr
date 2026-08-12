@@ -1,169 +1,58 @@
-# WyseARR Deployment Lessons Learned
+# Deployment lessons and upgrade checklist
 
-## Purpose
+## Compatibility is state plus image
 
-Record deployment lessons from WyseARR stack creation and recovery so future rebuilds, upgrades, and troubleshooting avoid repeating known failure modes.
+Whisparr's live database contained a quality definition from an incompatible
+image generation even though the container itself was running. A useful upgrade
+test must exercise API endpoints that deserialize persisted data, not only
+`/ping`. The production repair is narrow, creates and integrity-checks its
+rollback database before live mutation, refuses to modify a populated library
+automatically, and checks both quality definition and profile APIs afterward.
 
----
+qBittorrent remains at 5.1.4 because newer login behavior had failed integration
+testing with this ARR set. All service images are pinned by digest. An upgrade
+means intentionally changing the digest, backing up, recreating, and rerunning
+the entire production validator.
 
-## 1. ARR Image and Version Compatibility Must Be Verified Before Deployment
+## Running does not mean configured
 
-### Event
-An image was selected that did not match the expected automation/API workflow.
+Container uptime previously hid zero Prowlarr indexers, transient qBittorrent
+credentials, a failing Lidarr client, disabled Bazarr integrations, and idle Huey
+and BookBot placeholders. Production acceptance now verifies APIs, synced
+indexers, download clients, category paths, library roots, subtitle settings,
+SQLite schema/integrity, and custom-service readiness.
 
-Whisparr deployed with v2 behavior while the rest of the ARR stack followed Sonarr/Radarr/Lidarr v3-style automation patterns.
+## Configuration is reproducible but private
 
-### Impact
-- Root folder automation did not behave consistently.
-- API configuration paths differed from the rest of the stack.
-- Additional migration work was required.
+Bootstrap logic belongs in Git; credentials and service databases do not. The
+deployment reads/generates private `.env` values, converges APIs and category
+configuration idempotently, and takes SQLite-safe local checkpoints plus bounded
+qBittorrent resume-metadata snapshots. Active payloads and DAS library media are
+outside that checkpoint boundary. A Git clone without a runtime checkpoint
+cannot reconstruct external credentials or request history, and a checkpoint on
+the same disk is not an independent backup.
 
-### Resolution
-- Moved Whisparr to a compatible branch.
-- Revalidated API endpoints.
-- Reconfigured automation through API.
+## Storage failures must fail closed
 
-### Lesson Learned
-Before generating a deployment bundle:
-- verify image source
-- verify major version
-- verify API compatibility
-- verify configuration automation path
+The host may start Docker before a network share is mounted. Deployment
+therefore verifies that `/mnt/media` is the actual writable mount. Imports copy
+atomically and only mark a qBittorrent job imported after success. Retention
+deletes only imported-category jobs; it never treats age alone as proof of a
+safe import.
 
----
+## Upgrade checklist
 
-## 2. qBittorrent Version Must Be Pinned
-
-### Event
-qBittorrent was deployed using a newer version than some ARR integrations supported.
-
-### Impact
-- Direct qBittorrent API login worked.
-- ARR download client validation failed.
-- Whisparr reported authentication failures despite valid credentials.
-
-### Root Cause
-qBittorrent 5.2.x login behavior was incompatible with the Whisparr integration.
-
-### Resolution
-Pinned qBittorrent:
-
-```
-lscr.io/linuxserver/qbittorrent:5.1.4
-```
-
-### Lesson Learned
-Avoid `latest` for infrastructure dependencies where API compatibility matters.
-
-Pin versions for:
-- qBittorrent
-- ARR applications
-- databases
-- reverse proxies
-
----
-
-## 3. Configuration-First Deployment Is Preferred
-
-### Event
-Initial setup required WebUI interaction.
-
-### Impact
-- Slower deployment.
-- Increased risk of missed settings.
-- Poor fit for remote/mobile workflows.
-
-### Resolution
-Moved configuration to API-driven setup:
-- download clients
-- root folders
-- Prowlarr applications
-- sync settings
-
-### Lesson Learned
-Preferred deployment sequence:
-
-1. Generate compose
-2. Deploy containers
-3. Bootstrap configuration through APIs
-4. Validate state
-5. Commit
-
----
-
-## 4. Validate Current State Before Repeating Commands
-
-### Event
-Commands were repeated after state had already changed or without confirming current state.
-
-### Impact
-- Increased troubleshooting time.
-- Created unnecessary loops.
-
-### Lesson Learned
-Every command should have:
-- known target
-- expected output
-- decision path based on output
-
----
-
-## 5. Generated Artifacts Preferred Over Inline Editing
-
-### Event
-Inline shell edits were used for YAML/Dockerfile changes.
-
-### Impact
-- Increased risk of syntax corruption.
-- Reduced reproducibility.
-
-### Resolution
-Use generated artifacts.
-
-### Lesson Learned
-For:
-- compose files
-- Dockerfiles
-- scripts
-- configuration files
-
-Preferred workflow:
-
-1. Generate file
-2. Transfer file
-3. Validate
-4. Commit
-
----
-
-## Final Deployment State
-
-Validated components:
-
-- qBittorrent
-- Sonarr
-- Radarr
-- Lidarr
-- Whisparr
-- Prowlarr
-- BookBot
-
-Validated architecture:
-
-- Temporary downloads remain on WyseARR
-- Media library remains on DAS/Pi-SSD
-- ARR services access `/media`
-- qBittorrent routes through categories
-- Configuration committed to Git
-
----
-
-## Future Upgrade Checklist
-
-Before changing versions:
-
-- Check release compatibility
-- Check API compatibility
-- Pin versions before upgrade
-- Test in disposable environment if possible
-- Commit known-good state
+1. Commit the current known-good code. For a stateful change, stop the affected
+   owner and run `python3 scripts/backup.py` so its database/resume generation is
+   exact; verify the checkpoint before proceeding.
+2. Read the image's migration/release notes and change one compatibility boundary
+   at a time.
+3. Run unit tests, `docker compose config --quiet`, and `git diff --check`.
+4. Rebuild/recreate the affected container with its persistent configuration.
+5. Exercise service APIs, database integrity, download-client tests, indexer
+   sync, mount writes, healthchecks, and `python3 scripts/validate.py`.
+6. Inspect logs for authentication, migration, permissions, and repeated retry
+   errors before committing the upgrade.
+7. Keep the matching post-validation deployment checkpoint. If rollback later
+   requires an older image, restore its compatible pre-upgrade state while the
+   owning service is stopped; never let the old image open the newer database.

@@ -1,69 +1,11 @@
-Project: Wyse 3040 Torrent Downloader
+SUPERSEDED ARCHITECTURE NOTE
 
-Purpose:
-- Dedicated torrent appliance.
-- No media libraries.
-- No additional services.
+The former "Wyse 3040 Torrent Downloader" document described a different host,
+external USB storage, a qBittorrent watch-folder workflow, and a shell importer.
+It is retained only to explain old watch/, active/, complete/, and
+processed-torrents/ directories.
 
-Hardware:
-- Dell Wyse 3040
-- Internal eMMC:
-    - Debian
-    - qBittorrent-nox
-    - Web UI
-    - watch folder
-
-- External 2TB USB SSD:
-    - active/
-    - complete/
-    - processed-torrents/
-
-Pi4:
-- Hosts Kavita
-- Hosts Audiobookshelf
-- Hosts RomM
-- Hosts DAS storage
-- Hosts SnapRAID
-
-Storage Philosophy:
-- Temporary torrent storage remains on Wyse SSD.
-- Permanent media storage remains on DAS.
-- Original torrent payloads are disposable.
-- No SnapRAID protection required for torrent payloads.
-
-Workflow:
-
-1. User drops .torrent into watch/
-
-2. qBittorrent imports torrent
-
-3. .torrent moved to processed-torrents/
-
-4. Download stored in active/
-
-5. Completed download moved to complete/
-
-6. Torrent Importer runs automatically
-
-7. Importer:
-    - determines media type
-    - cleans filenames
-    - creates destination folders
-    - checks for duplicates
-    - copies file into library
-
-8. Library becomes immediately available
-
-9. Original remains in complete/ and continues seeding
-
-10. After 14 days:
-    - qBittorrent removes torrent job
-    - delete original payload from complete/
-    - delete matching .torrent from processed-torrents/
-    - remove associated qBittorrent metadata
-
-Result:
-- Immediate library availability
-- 14-day seeding
-- No permanent duplicate storage
-- DAS isolated from torrent activity
+The production host is the Dell Wyse 5010 named wysearr. The authoritative
+architecture is docs/architecture.md. qBittorrent now uses media categories;
+Huey, the ARR applications, and BookBot provide deterministic acquisition and
+import. The old watched-folder workflow is disabled and must not be redeployed.
