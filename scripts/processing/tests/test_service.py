@@ -352,6 +352,15 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(Exception):
             service.validate()
 
+    def test_validate_rejects_imported_category_relocation_path(self) -> None:
+        qbit = FakeQbittorrent([], self.downloads)
+        qbit.category_map["ebooks-imported"] = {
+            "savePath": str(self.downloads / "ebooks-imported")
+        }
+        service = self.service(qbit)
+        with self.assertRaises(Exception):
+            service.validate()
+
 
 if __name__ == "__main__":
     unittest.main()
