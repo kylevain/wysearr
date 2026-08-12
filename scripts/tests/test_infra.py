@@ -82,6 +82,35 @@ class ValidationTests(unittest.TestCase):
             self.assertTrue(check.ok)
             self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_bazarr_acceptance_requires_live_integrations_english_defaults_and_all_providers(self):
+        settings = {
+            "general": {
+                "use_sonarr": True,
+                "use_radarr": True,
+                "serie_default_enabled": True,
+                "serie_default_profile": 7,
+                "movie_default_enabled": True,
+                "movie_default_profile": 7,
+                "enabled_providers": [
+                    "embeddedsubtitles",
+                    "yifysubtitles",
+                    "subf2m",
+                ],
+            }
+        }
+        profiles = [{"profileId": 7, "name": "English"}]
+        status = {"sonarr_version": "4.0", "radarr_version": "6.0"}
+        self.assertEqual(
+            validate.bazarr_acceptance(settings, profiles, status),
+            (True, True, True),
+        )
+        settings["general"]["enabled_providers"].remove("subf2m")
+        status["radarr_version"] = ""
+        self.assertEqual(
+            validate.bazarr_acceptance(settings, profiles, status),
+            (False, True, False),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

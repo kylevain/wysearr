@@ -31,6 +31,7 @@ SERVICES = (
 )
 DIRECT_CATEGORIES = ("ebooks", "audiobooks", "manga-comics", "roms", "sheet-music")
 ARR_CATEGORIES = ("tv", "movies", "music", "spicy")
+BAZARR_PROVIDERS = {"embeddedsubtitles", "yifysubtitles", "subf2m"}
 
 
 @dataclass
@@ -108,6 +109,36 @@ def writable_check(path: Path, name: str) -> Check:
         return Check(name, True, "writable")
     except OSError as error:
         return Check(name, False, f"not writable: {error.strerror}")
+
+
+def bazarr_acceptance(
+    settings: dict[str, object], profiles: list[dict[str, object]], status: dict[str, object]
+) -> tuple[bool, bool, bool]:
+    general = settings.get("general", {})
+    if not isinstance(general, dict):
+        return False, False, False
+    integrations_ok = bool(
+        general.get("use_sonarr")
+        and general.get("use_radarr")
+        and status.get("sonarr_version")
+        and status.get("radarr_version")
+    )
+    english_ids = {
+        profile.get("profileId")
+        for profile in profiles
+        if str(profile.get("name", "")).casefold() == "english"
+        and profile.get("profileId") is not None
+    }
+    profile_ok = bool(
+        english_ids
+        and general.get("serie_default_enabled")
+        and general.get("movie_default_enabled")
+        and general.get("serie_default_profile") in english_ids
+        and general.get("movie_default_profile") in english_ids
+    )
+    configured_providers = set(general.get("enabled_providers") or [])
+    providers_ok = BAZARR_PROVIDERS <= configured_providers
+    return integrations_ok, profile_ok, providers_ok
 
 
 def validate() -> list[Check]:
@@ -233,11 +264,12 @@ def validate() -> list[Check]:
             profiles = json.load(response)
         with urllib.request.urlopen(status_request, timeout=15) as response:
             status = json.load(response)["data"]
-        integrated = settings["general"]["use_sonarr"] and settings["general"]["use_radarr"]
-        providers = settings["general"].get("enabled_providers", [])
+        integrated, profile_ok, providers_ok = bazarr_acceptance(
+            settings, profiles, status
+        )
         checks.append(Check("bazarr:arr-integration", integrated, f"sonarr={bool(status.get('sonarr_version'))} radarr={bool(status.get('radarr_version'))}"))
-        checks.append(Check("bazarr:language-profile", bool(profiles), f"configured={len(profiles)}"))
-        checks.append(Check("bazarr:providers", bool(providers), f"enabled={len(providers)}"))
+        checks.append(Check("bazarr:language-profile", profile_ok, "English defaults configured" if profile_ok else "English defaults missing"))
+        checks.append(Check("bazarr:providers", providers_ok, "required providers enabled" if providers_ok else "required providers missing"))
     except Exception as error:
         checks.append(Check("bazarr:api", False, type(error).__name__))
 
