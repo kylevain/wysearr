@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 from bookbot_lib.config import CATEGORY_SPECS, BookBotConfig
+from bookbot_lib.huey import HueyUpdater
 from bookbot_lib.ledger import ImportLedger
 from bookbot_lib.service import BookBotService
 from bookbot_lib.storage import LibraryImporter
@@ -180,8 +183,90 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(b"book", (destination / "Book.epub").read_bytes())
         self.assertFalse((destination / ".bookbot-import.json").exists())
         self.assertEqual([(HASH_A, "ebooks-imported")], qbit.set_calls)
-        self.assertEqual(1, len(self.huey.completed))
+        self.assertEqual(2, len(self.huey.completed))
         self.assertTrue(self.config.health_path.is_file())
+
+    def test_retained_import_reconciles_later_duplicate_huey_request(self) -> None:
+        source = self.downloads / "ebooks" / "Book.epub"
+        source.write_bytes(b"book")
+        torrent = completed_torrent(
+            HASH_A,
+            "ebooks",
+            source,
+            self.downloads,
+            tags="huey-1,huey-4",
+        )
+        qbit = FakeQbittorrent([torrent], self.downloads)
+        huey_database = self.config_dir / "huey.db"
+        raw_connection = sqlite3.connect(huey_database)
+        with closing(raw_connection) as connection, connection:
+            connection.executescript(
+                """
+                CREATE TABLE requests (
+                    id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    torrent_hash TEXT,
+                    external_id TEXT,
+                    library_path TEXT,
+                    error_message TEXT,
+                    updated_at TEXT
+                );
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY,
+                    request_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    message TEXT NOT NULL
+                );
+                """
+            )
+            connection.executemany(
+                """
+                INSERT INTO requests (id, status, torrent_hash, external_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (1, "downloading", HASH_A, HASH_A),
+                    (3, "failed", HASH_A, HASH_A),
+                    (4, "queued", HASH_B, HASH_B),
+                ),
+            )
+        service = BookBotService(
+            self.config,
+            qbittorrent=qbit,  # type: ignore[arg-type]
+            ledger=ImportLedger(
+                self.config.database_path,
+                retry_base_seconds=1,
+                retry_max_seconds=2,
+            ),
+            importer=LibraryImporter(self.downloads, self.media),
+            huey=HueyUpdater(huey_database),
+        )
+
+        first = service.run_cycle(now=100)
+        imported_at = service.ledger.get(HASH_A)["imported_at"]
+        raw_connection = sqlite3.connect(huey_database)
+        with closing(raw_connection) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO requests (id, status, torrent_hash, external_id)
+                VALUES (2, 'queued', ?, ?)
+                """,
+                (HASH_A, HASH_A),
+            )
+        second = service.run_cycle(now=200)
+
+        raw_connection = sqlite3.connect(huey_database)
+        with closing(raw_connection) as connection, connection:
+            statuses = connection.execute(
+                "SELECT id, status FROM requests ORDER BY id"
+            ).fetchall()
+        self.assertEqual(1, first.imported)
+        self.assertEqual(1, second.reconciled)
+        self.assertEqual(imported_at, service.ledger.get(HASH_A)["imported_at"])
+        self.assertEqual(
+            [(1, "complete"), (2, "complete"), (3, "failed"), (4, "queued")],
+            statuses,
+        )
 
     def test_incomplete_torrent_is_ignored(self) -> None:
         source = self.downloads / "ebooks" / "Partial.epub"

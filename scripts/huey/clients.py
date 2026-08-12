@@ -21,6 +21,10 @@ class ServiceError(RuntimeError):
     """A deliberately sanitized integration error safe for logs and Discord."""
 
 
+MAX_TORRENT_BYTES = 16 * 1024 * 1024
+TORRENT_CHUNK_BYTES = 64 * 1024
+
+
 def _base_url(value: str, service: str) -> str:
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -358,18 +362,53 @@ class ProwlarrClient(JsonClient):
                     headers=headers,
                     timeout=self.timeout,
                     allow_redirects=False,
+                    stream=True,
                 )
             except requests.RequestException as error:
                 raise ServiceError("Prowlarr could not retrieve the selected torrent.") from error
             if response.status_code in {301, 302, 303, 307, 308}:
                 location = response.headers.get("Location", "")
+                response.close()
                 if not location:
                     raise ServiceError("Prowlarr returned an invalid download redirect.")
                 download_url = urljoin(download_url, location)
                 continue
-            if response.status_code not in range(200, 300) or not response.content:
+            if response.status_code not in range(200, 300):
+                response.close()
                 raise ServiceError("Prowlarr could not retrieve the selected torrent.")
-            return bytes(response.content)
+            try:
+                content_length = response.headers.get("Content-Length")
+                if content_length is not None:
+                    try:
+                        declared_size = int(content_length)
+                    except (TypeError, ValueError) as error:
+                        raise ServiceError(
+                            "Prowlarr returned an invalid torrent response."
+                        ) from error
+                    if declared_size < 0:
+                        raise ServiceError("Prowlarr returned an invalid torrent response.")
+                    if declared_size > MAX_TORRENT_BYTES:
+                        raise ServiceError("Prowlarr torrent download is too large.")
+
+                chunks: list[bytes] = []
+                received = 0
+                for chunk in response.iter_content(chunk_size=TORRENT_CHUNK_BYTES):
+                    if not chunk:
+                        continue
+                    chunk_bytes = bytes(chunk)
+                    received += len(chunk_bytes)
+                    if received > MAX_TORRENT_BYTES:
+                        raise ServiceError("Prowlarr torrent download is too large.")
+                    chunks.append(chunk_bytes)
+                if not chunks:
+                    raise ServiceError("Prowlarr could not retrieve the selected torrent.")
+                return b"".join(chunks)
+            except requests.RequestException as error:
+                raise ServiceError(
+                    "Prowlarr could not retrieve the selected torrent."
+                ) from error
+            finally:
+                response.close()
         raise ServiceError("Prowlarr returned too many download redirects.")
 
 
@@ -386,6 +425,10 @@ class QBittorrentClient(JsonClient):
         if not username or not password:
             raise ServiceError("qBittorrent credentials are not configured.")
         super().__init__("qBittorrent", base_url, session=session, timeout=timeout)
+        # Give qBittorrent an explicit same-origin CSRF context for Web API
+        # compatibility. The normalized base URL is already credential- and
+        # query-free, so it is safe to attach to every call.
+        self.headers["Referer"] = self.base_url
         self.username = username
         self.password = password
         self._authenticated = False
@@ -403,24 +446,79 @@ class QBittorrentClient(JsonClient):
             raise ServiceError("qBittorrent authentication failed.")
         self._authenticated = True
 
-    def _ensure_category(self, category: str) -> None:
+    def _authenticated_request(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        expected: Iterable[int] = range(200, 300),
+        retry_after_reauthentication: bool,
+        **kwargs: Any,
+    ) -> Any:
+        """Make one authenticated request with an explicit safe-retry policy.
+
+        qBittorrent reports expired cookie sessions as HTTP 403. Repeating
+        createCategory and addTags is safe because both operations are
+        idempotent. The torrent-add POST is deliberately never replayed: even
+        though a 403 normally means it was rejected before mutation, avoiding
+        an automatic second add preserves at-most-once submission if a proxy
+        or future qBittorrent version behaves unexpectedly.
+        """
+
+        self.login()
+        expected_statuses = set(expected)
         response = self._request(
+            method,
+            endpoint,
+            expected=expected_statuses | {403},
+            parse_json=False,
+            **kwargs,
+        )
+        if response.status_code != 403:
+            return response
+
+        self._authenticated = False
+        if not retry_after_reauthentication:
+            raise ServiceError(
+                "qBittorrent session expired before the request was accepted; "
+                "the torrent was not retried."
+            )
+
+        self.login()
+        response = self._request(
+            method,
+            endpoint,
+            expected=expected_statuses | {403},
+            parse_json=False,
+            **kwargs,
+        )
+        if response.status_code == 403:
+            self._authenticated = False
+            raise ServiceError("qBittorrent authentication expired.")
+        return response
+
+    def _ensure_category(self, category: str) -> None:
+        response = self._authenticated_request(
             "POST",
             "/api/v2/torrents/createCategory",
             expected={200, 409},
+            retry_after_reauthentication=True,
             data={"category": category},
-            parse_json=False,
         )
         if response.status_code not in {200, 409}:  # Defensive for simple test doubles.
             raise ServiceError("qBittorrent could not prepare the request category.")
 
     def _submit(self, *, category: str, data: Mapping[str, Any], files: Any = None) -> None:
-        self.login()
         self._ensure_category(category)
-        kwargs: dict[str, Any] = {"data": dict(data), "parse_json": False}
+        kwargs: dict[str, Any] = {"data": dict(data)}
         if files is not None:
             kwargs["files"] = files
-        response = self._request("POST", "/api/v2/torrents/add", **kwargs)
+        response = self._authenticated_request(
+            "POST",
+            "/api/v2/torrents/add",
+            retry_after_reauthentication=False,
+            **kwargs,
+        )
         if not response.text.strip().lower().startswith("ok"):
             raise ServiceError("qBittorrent did not accept the selected torrent.")
 
@@ -447,10 +545,9 @@ class QBittorrentClient(JsonClient):
     def add_tags(self, torrent_hash: str, tags: str) -> None:
         if not re.fullmatch(r"[a-fA-F0-9]{40}(?:[a-fA-F0-9]{24})?", torrent_hash):
             raise ServiceError("Selected result has an invalid torrent identity.")
-        self.login()
-        self._request(
+        self._authenticated_request(
             "POST",
             "/api/v2/torrents/addTags",
+            retry_after_reauthentication=True,
             data={"hashes": torrent_hash.lower(), "tags": tags},
-            parse_json=False,
         )

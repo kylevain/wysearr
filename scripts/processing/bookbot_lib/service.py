@@ -377,17 +377,42 @@ class BookBotService:
         if torrent_hash is None:
             return False
         row = self.ledger.get(torrent_hash)
-        if row is None or row["status"] in {"imported", "deleted", "rejected"}:
+        if row is None or row["status"] in {
+            "deleted",
+            "rejected",
+            "failed",
+            "copied_failed",
+        }:
             return False
         destination_raw = row["destination_path"]
         if not destination_raw:
             return False
         destination = Path(str(destination_raw))
-        if not destination.exists() or destination.is_symlink():
-            return False
         source_category = str(row["source_category"])
         if source_category not in CATEGORY_SPECS:
             return False
+        spec = CATEGORY_SPECS[source_category]
+        torrent_category = str(torrent.get("category") or "")
+        if (
+            str(row["imported_category"]) != spec.imported_name
+            or torrent_category != spec.imported_name
+        ):
+            return False
+        try:
+            self.importer.validate_import_destination(destination, spec)
+        except Exception as exc:
+            LOGGER.warning(
+                "Imported destination reconciliation skipped hash=%s: %s",
+                torrent_hash[:12],
+                exc,
+            )
+            return False
+
+        tags = str(torrent.get("tags") or "")
+        if row["status"] == "imported":
+            # A later duplicate Huey request can share this retained torrent.
+            # Re-running the guarded update is safe and does not extend retention.
+            return self.huey.complete(torrent_hash, destination, tags)
         self.ledger.mark_imported(
             torrent_hash,
             source_category,
@@ -395,11 +420,7 @@ class BookBotService:
             destination,
             timestamp,
         )
-        self.huey.complete(
-            torrent_hash,
-            destination,
-            str(torrent.get("tags") or ""),
-        )
+        self.huey.complete(torrent_hash, destination, tags)
         return True
 
     @staticmethod

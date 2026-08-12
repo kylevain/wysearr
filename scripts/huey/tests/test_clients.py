@@ -10,6 +10,7 @@ sys.path.insert(0, str(HUEY_ROOT))
 
 from clients import (
     LidarrClient,
+    MAX_TORRENT_BYTES,
     ProwlarrClient,
     QBittorrentClient,
     RadarrClient,
@@ -19,17 +20,35 @@ from clients import (
 
 
 class FakeResponse:
-    def __init__(self, status=200, json_value=None, text="Ok.", content=b"", headers=None):
+    def __init__(
+        self,
+        status=200,
+        json_value=None,
+        text="Ok.",
+        content=b"",
+        headers=None,
+        chunks=None,
+    ):
         self.status_code = status
         self._json = json_value
         self.text = text
         self.content = content
         self.headers = dict(headers or {})
+        self.chunks = list(chunks) if chunks is not None else [content]
+        self.iterated = False
+        self.closed = False
 
     def json(self):
         if isinstance(self._json, Exception):
             raise self._json
         return self._json
+
+    def iter_content(self, chunk_size):
+        self.iterated = True
+        yield from self.chunks
+
+    def close(self):
+        self.closed = True
 
 
 class FakeSession:
@@ -163,10 +182,13 @@ class ProwlarrClientTests(unittest.TestCase):
         self.assertEqual(call[2]["headers"]["X-Api-Key"], "key")
 
     def test_download_returns_bytes(self):
-        session = FakeSession([FakeResponse(content=b"torrent bytes")])
+        response = FakeResponse(content=b"torrent bytes")
+        session = FakeSession([response])
         client = ProwlarrClient("http://prowlarr:9696", "key", session=session)
         self.assertEqual(client.download_torrent("/api/v1/download/1"), b"torrent bytes")
         self.assertEqual(session.calls[0][2]["headers"]["X-Api-Key"], "key")
+        self.assertTrue(session.calls[0][2]["stream"])
+        self.assertTrue(response.closed)
 
     def test_api_key_is_not_forwarded_to_external_download_host(self):
         session = FakeSession([FakeResponse(content=b"torrent bytes")])
@@ -193,6 +215,31 @@ class ProwlarrClientTests(unittest.TestCase):
         self.assertFalse(session.calls[0][2]["allow_redirects"])
         self.assertFalse(session.calls[1][2]["allow_redirects"])
 
+    def test_declared_oversized_torrent_is_rejected_without_reading_body(self):
+        response = FakeResponse(
+            headers={"Content-Length": str(MAX_TORRENT_BYTES + 1)},
+            chunks=[b"should not be read"],
+        )
+        session = FakeSession([response])
+        client = ProwlarrClient("http://prowlarr:9696", "key", session=session)
+        with self.assertRaisesRegex(ServiceError, "too large"):
+            client.download_torrent("/api/v1/download/1")
+        self.assertFalse(response.iterated)
+        self.assertTrue(response.closed)
+
+    def test_streamed_torrent_is_bounded_when_length_is_missing_or_wrong(self):
+        one_mebibyte = b"x" * (1024 * 1024)
+        response = FakeResponse(
+            headers={"Content-Length": "1"},
+            chunks=[one_mebibyte] * 17,
+        )
+        session = FakeSession([response])
+        client = ProwlarrClient("http://prowlarr:9696", "key", session=session)
+        with self.assertRaisesRegex(ServiceError, "too large"):
+            client.download_torrent("/api/v1/download/1")
+        self.assertTrue(response.iterated)
+        self.assertTrue(response.closed)
+
 
 class QBittorrentClientTests(unittest.TestCase):
     def test_cookie_login_category_and_magnet_submission(self):
@@ -207,6 +254,12 @@ class QBittorrentClientTests(unittest.TestCase):
         )
         self.assertEqual(
             session.calls[0][2]["data"], {"username": "huey", "password": "password"}
+        )
+        self.assertTrue(
+            all(
+                call[2]["headers"]["Referer"] == "http://qbittorrent:8080/"
+                for call in session.calls
+            )
         )
         self.assertEqual(session.calls[2][2]["data"]["category"], "huey-ebooks")
 
@@ -234,6 +287,45 @@ class QBittorrentClientTests(unittest.TestCase):
             session.calls[-1][2]["data"],
             {"hashes": torrent_hash, "tags": "huey-42"},
         )
+
+    def test_expired_session_reauthenticates_during_safe_add_preflight(self):
+        session = FakeSession(
+            [
+                FakeResponse(),
+                FakeResponse(status=403),
+                FakeResponse(),
+                FakeResponse(status=409),
+                FakeResponse(),
+            ]
+        )
+        client = QBittorrentClient("http://qbittorrent:8080", "u", "p", session=session)
+        client.add_magnet("magnet:?xt=urn:btih:abc", "huey-ebooks")
+        endpoints = [call[1].rsplit("/", 1)[-1] for call in session.calls]
+        self.assertEqual(
+            endpoints,
+            ["login", "createCategory", "login", "createCategory", "add"],
+        )
+        self.assertEqual(endpoints.count("add"), 1)
+
+    def test_expired_session_does_not_replay_torrent_add(self):
+        session = FakeSession(
+            [FakeResponse(), FakeResponse(), FakeResponse(status=403)]
+        )
+        client = QBittorrentClient("http://qbittorrent:8080", "u", "p", session=session)
+        with self.assertRaisesRegex(ServiceError, "not retried"):
+            client.add_magnet("magnet:?xt=urn:btih:abc", "huey-ebooks")
+        endpoints = [call[1].rsplit("/", 1)[-1] for call in session.calls]
+        self.assertEqual(endpoints.count("add"), 1)
+        self.assertEqual(endpoints.count("login"), 1)
+
+    def test_expired_session_retries_idempotent_tag_update_once(self):
+        session = FakeSession(
+            [FakeResponse(), FakeResponse(status=403), FakeResponse(), FakeResponse()]
+        )
+        client = QBittorrentClient("http://qbittorrent:8080", "u", "p", session=session)
+        client.add_tags("a" * 40, "huey-42")
+        endpoints = [call[1].rsplit("/", 1)[-1] for call in session.calls]
+        self.assertEqual(endpoints, ["login", "addTags", "login", "addTags"])
 
 
 if __name__ == "__main__":

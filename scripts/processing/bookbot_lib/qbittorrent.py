@@ -27,7 +27,12 @@ class QbittorrentClient:
         self.verify_tls = verify_tls
         self.session = session or requests.Session()
         self.session.trust_env = False
-        self.session.headers.update({"User-Agent": "WyseARR-BookBot/1"})
+        self.session.headers.update(
+            {
+                "User-Agent": "WyseARR-BookBot/1",
+                "Referer": f"{self.base_url}/",
+            }
+        )
         self._authenticated = False
 
     def close(self) -> None:

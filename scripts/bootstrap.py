@@ -58,6 +58,8 @@ QBITTORRENT_PREFERENCES = {
     "max_ratio_enabled": False,
     "max_seeding_time_enabled": False,
 }
+QBITTORRENT_AUTH_FAILURE_LIMIT = 5
+QBITTORRENT_ROTATION_GUARD_LIMIT = 1000
 
 API_KEY_CONFIGS = {
     "PROWLARR_API_KEY": "prowlarr",
@@ -75,13 +77,31 @@ class ArrService:
     default_port: int
     category: str
     api_versions: tuple[str, ...]
+    category_fields: tuple[str, ...]
+    imported_category_fields: tuple[str, ...]
 
 
 ARR_SERVICES = (
-    ArrService("Sonarr", "SONARR_PORT", 8989, "tv", ("v3", "v1")),
-    ArrService("Radarr", "RADARR_PORT", 7878, "movies", ("v3", "v1")),
-    ArrService("Lidarr", "LIDARR_PORT", 8686, "music", ("v1", "v3")),
-    ArrService("Whisparr", "WHISPARR_PORT", 6969, "spicy", ("v3", "v1")),
+    ArrService(
+        "Sonarr", "SONARR_PORT", 8989, "tv", ("v3", "v1"),
+        ("category", "tvCategory"),
+        ("postImportCategory", "tvImportedCategory"),
+    ),
+    ArrService(
+        "Radarr", "RADARR_PORT", 7878, "movies", ("v3", "v1"),
+        ("category", "movieCategory"),
+        ("postImportCategory", "movieImportedCategory"),
+    ),
+    ArrService(
+        "Lidarr", "LIDARR_PORT", 8686, "music", ("v1", "v3"),
+        ("category", "musicCategory"),
+        ("postImportCategory", "musicImportedCategory"),
+    ),
+    ArrService(
+        "Whisparr", "WHISPARR_PORT", 6969, "spicy", ("v3", "v1"),
+        ("category", "tvCategory"),
+        ("postImportCategory", "tvImportedCategory"),
+    ),
 )
 
 
@@ -571,6 +591,60 @@ def authenticate_qbittorrent(
     raise BootstrapError("qBittorrent did not accept the persisted WebUI credentials")
 
 
+def restart_qbittorrent_with_rotation_guard(
+    client: Any,
+    base_url: str,
+    username: str,
+    password: str,
+    *,
+    timeout: float,
+    retries: int,
+    runner: Callable[..., Any] = subprocess.run,
+    client_factory: Callable[..., Any] = QbittorrentClient,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """Clear stale-client IP bans while a new shared password is propagated."""
+
+    client.set_preferences(
+        {"web_ui_max_auth_fail_count": QBITTORRENT_ROTATION_GUARD_LIMIT}
+    )
+    try:
+        result = runner(
+            ["docker", "restart", "qbittorrent"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        try:
+            client.set_preferences(
+                {"web_ui_max_auth_fail_count": QBITTORRENT_AUTH_FAILURE_LIMIT}
+            )
+        except Exception:
+            pass
+        raise BootstrapError("Unable to restart qBittorrent for credential repair") from exc
+    if result.returncode != 0:
+        try:
+            client.set_preferences(
+                {"web_ui_max_auth_fail_count": QBITTORRENT_AUTH_FAILURE_LIMIT}
+            )
+        except Exception:
+            pass
+        raise BootstrapError("Unable to restart qBittorrent for credential repair")
+
+    deadline = time.monotonic() + max(60.0, timeout * retries)
+    while time.monotonic() < deadline:
+        candidate = client_factory(base_url, timeout=timeout, retries=retries)
+        try:
+            if candidate.login(username, password):
+                return candidate
+        except BootstrapError:
+            pass
+        sleep(2)
+    raise BootstrapError("qBittorrent did not recover after credential repair restart")
+
+
 def configure_qbittorrent(client: Any) -> tuple[int, int]:
     current_preferences = client.preferences()
     desired_preferences = dict(QBITTORRENT_PREFERENCES)
@@ -626,6 +700,19 @@ def get_provider_field(resource: Mapping[str, Any], name: str) -> Any:
     return None if field is None else field.get("value")
 
 
+def set_provider_field_alias(
+    resource: dict[str, Any], names: Sequence[str], value: Any
+) -> str:
+    fields = _field_map(resource)
+    for name in names:
+        if name.casefold() in fields:
+            fields[name.casefold()]["value"] = value
+            return name
+    raise BootstrapError(
+        f"Provider schema is missing required field {' or '.join(names)}"
+    )
+
+
 def build_arr_download_client_payload(
     resource: Mapping[str, Any],
     service: ArrService,
@@ -638,9 +725,11 @@ def build_arr_download_client_payload(
     set_provider_field(payload, "useSsl", False, required=False)
     set_provider_field(payload, "username", username)
     set_provider_field(payload, "password", password)
-    set_provider_field(payload, "category", service.category)
-    set_provider_field(
-        payload, "postImportCategory", f"{service.category}-imported"
+    set_provider_field_alias(payload, service.category_fields, service.category)
+    set_provider_field_alias(
+        payload,
+        service.imported_category_fields,
+        f"{service.category}-imported",
     )
     if "removeCompletedDownloads" in payload:
         payload["removeCompletedDownloads"] = False
@@ -662,8 +751,17 @@ def _arr_payload_needs_update(
         "username",
         "category",
         "postImportCategory",
+        "tvCategory",
+        "tvImportedCategory",
+        "movieCategory",
+        "movieImportedCategory",
+        "musicCategory",
+        "musicImportedCategory",
     )
+    desired_fields = _field_map(desired)
     for name in managed_fields:
+        if name.casefold() not in desired_fields:
+            continue
         if get_provider_field(current, name) != get_provider_field(desired, name):
             return True
     current_password = get_provider_field(current, "password")
@@ -1239,7 +1337,7 @@ def configure_bazarr(
 def bootstrap(
     root: Path,
     *,
-    timeout: float = 10.0,
+    timeout: float = 30.0,
     retries: int = 3,
     reporter: Reporter | None = None,
 ) -> None:
@@ -1258,8 +1356,9 @@ def bootstrap(
     qbit_username = environment["QBITTORRENT_USERNAME"]
     qbit_password = environment["QBITTORRENT_PASSWORD"]
     bind_address = environment.get("WYSEARR_BIND_ADDRESS", "192.168.4.86")
+    qbit_base_url = f"http://{bind_address}:{qbit_port}"
     qbit = authenticate_qbittorrent(
-        f"http://{bind_address}:{qbit_port}",
+        qbit_base_url,
         qbit_username,
         qbit_password,
         timeout=timeout,
@@ -1271,14 +1370,27 @@ def bootstrap(
         f"({preference_changes} preference and {category_changes} category updates)."
     )
 
-    arr_updates = configure_arr_services(
-        environment,
-        api_keys,
+    qbit = restart_qbittorrent_with_rotation_guard(
+        qbit,
+        qbit_base_url,
         qbit_username,
         qbit_password,
         timeout=timeout,
         retries=retries,
     )
+    try:
+        arr_updates = configure_arr_services(
+            environment,
+            api_keys,
+            qbit_username,
+            qbit_password,
+            timeout=timeout,
+            retries=retries,
+        )
+    finally:
+        qbit.set_preferences(
+            {"web_ui_max_auth_fail_count": QBITTORRENT_AUTH_FAILURE_LIMIT}
+        )
     reporter.info(
         f"ARR qBittorrent integrations verified ({arr_updates} repaired)."
     )
@@ -1317,7 +1429,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Project root (normally auto-detected from this script)",
     )
-    parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--retries", type=int, default=3)
     return parser.parse_args(argv)
 

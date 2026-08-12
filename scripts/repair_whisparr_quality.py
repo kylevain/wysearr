@@ -10,6 +10,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -91,7 +92,7 @@ def repair() -> Path | None:
     if endpoint_works():
         return None
 
-    with sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True) as connection:
+    with closing(sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True)) as connection:
         stale = connection.execute(
             "SELECT COUNT(*) FROM QualityDefinitions WHERE Quality = 23"
         ).fetchone()[0]
@@ -109,8 +110,8 @@ def repair() -> Path | None:
 
     run_compose("stop", "whisparr")
     try:
-        with sqlite3.connect(DATABASE) as connection:
-            with sqlite3.connect(backup_path) as destination:
+        with closing(sqlite3.connect(DATABASE)) as connection, connection:
+            with closing(sqlite3.connect(backup_path)) as destination, destination:
                 connection.backup(destination)
             backup_path.chmod(0o600)
 

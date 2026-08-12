@@ -9,6 +9,7 @@ import json
 import shutil
 import sqlite3
 import subprocess
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,8 +39,8 @@ def sha256(path: Path) -> str:
 def sqlite_backup(source: Path, destination: Path, *, anchor: Path = BACKUP_ROOT) -> None:
     private_mkdir(destination.parent, anchor=anchor)
     source_uri = f"file:{source}?mode=ro"
-    with sqlite3.connect(source_uri, uri=True, timeout=30) as src:
-        with sqlite3.connect(destination) as dst:
+    with closing(sqlite3.connect(source_uri, uri=True, timeout=30)) as src:
+        with closing(sqlite3.connect(destination)) as dst, dst:
             src.backup(dst)
             result = dst.execute("PRAGMA integrity_check").fetchone()[0]
             if result != "ok":

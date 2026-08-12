@@ -7,7 +7,13 @@ from unittest.mock import Mock
 HUEY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HUEY_ROOT))
 
-from acquisition import PROWLARR_CATEGORIES, DirectAcquirer, magnet_info_hash, torrent_info_hash
+from acquisition import (
+    PROWLARR_CATEGORIES,
+    DirectAcquirer,
+    UnsupportedTorrentVersion,
+    magnet_info_hash,
+    torrent_info_hash,
+)
 from matching import normalize_text, select_arr_candidate, select_release
 
 
@@ -100,7 +106,9 @@ class DirectAcquirerTests(unittest.TestCase):
         self.qbittorrent.add_tags.assert_called_once_with(info_hash, "huey-42")
 
     def test_torrent_download_is_forwarded_as_bytes(self):
-        info_hash = "b" * 40
+        info = b"d4:name14:Chrono Triggere"
+        torrent = b"d4:info" + info + b"e"
+        info_hash = __import__("hashlib").sha1(info).hexdigest()
         self.prowlarr.search.return_value = [
             {
                 "title": "Chrono Trigger SNES USA ROM",
@@ -110,13 +118,69 @@ class DirectAcquirerTests(unittest.TestCase):
                 "downloadUrl": "https://prowlarr.invalid/download?secret=redacted",
             }
         ]
-        self.prowlarr.download_torrent.return_value = b"torrent"
+        self.prowlarr.download_torrent.return_value = torrent
         response = self.acquirer.submit("roms", "Chrono Trigger", request_id=43)
         self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["external_id"], info_hash)
         self.qbittorrent.add_torrent.assert_called_once_with(
-            b"torrent", "roms", "huey-43"
+            torrent, "roms", "huey-43"
         )
         self.qbittorrent.add_tags.assert_called_once_with(info_hash, "huey-43")
+
+    def test_malformed_torrent_never_falls_back_to_supplied_hash(self):
+        self.prowlarr.search.return_value = [
+            {
+                "title": "Chrono Trigger SNES USA ROM",
+                "seeders": 40,
+                "infoHash": "b" * 40,
+                "downloadUrl": "https://prowlarr.invalid/download/2",
+            }
+        ]
+        self.prowlarr.download_torrent.return_value = b"not bencoded metainfo"
+        response = self.acquirer.submit("roms", "Chrono Trigger", request_id=44)
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertIn("payload identity", response["message"])
+        self.qbittorrent.add_torrent.assert_not_called()
+        self.qbittorrent.add_tags.assert_not_called()
+
+    def test_present_but_malformed_supplied_hash_is_rejected(self):
+        info = b"d4:name14:Chrono Triggere"
+        torrent = b"d4:info" + info + b"e"
+        self.prowlarr.search.return_value = [
+            {
+                "title": "Chrono Trigger SNES USA ROM",
+                "seeders": 40,
+                "infoHash": "not-a-valid-info-hash",
+                "downloadUrl": "https://prowlarr.invalid/download/invalid-hash",
+            }
+        ]
+        self.prowlarr.download_torrent.return_value = torrent
+        response = self.acquirer.submit("roms", "Chrono Trigger", request_id=46)
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertIn("invalid torrent identity", response["message"])
+        self.prowlarr.download_torrent.assert_not_called()
+        self.qbittorrent.add_torrent.assert_not_called()
+        self.qbittorrent.add_tags.assert_not_called()
+
+    def test_v2_or_hybrid_torrent_is_explicitly_rejected(self):
+        info = b"d12:meta versioni2e4:name4:teste"
+        torrent = b"d4:info" + info + b"e"
+        self.prowlarr.search.return_value = [
+            {
+                "title": "Chrono Trigger SNES USA ROM",
+                "seeders": 40,
+                "infoHash": "c" * 64,
+                "downloadUrl": "https://prowlarr.invalid/download/3",
+            }
+        ]
+        self.prowlarr.download_torrent.return_value = torrent
+        response = self.acquirer.submit("roms", "Chrono Trigger", request_id=45)
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertIn("BitTorrent v2 or hybrid", response["message"])
+        self.qbittorrent.add_torrent.assert_not_called()
+        self.qbittorrent.add_tags.assert_not_called()
+        with self.assertRaises(UnsupportedTorrentVersion):
+            torrent_info_hash(torrent)
 
     def test_ambiguous_results_never_submit(self):
         self.prowlarr.search.return_value = [
@@ -160,6 +224,25 @@ class DirectAcquirerTests(unittest.TestCase):
         response = self.acquirer.submit("ebooks", "The Hobbit", "JRR Tolkien")
         self.assertEqual(response["status"], "needs_selection")
         self.qbittorrent.add_magnet.assert_not_called()
+
+    def test_v2_or_hybrid_magnet_is_explicitly_rejected(self):
+        v1_hash = "a" * 40
+        v2_hash = "b" * 64
+        self.prowlarr.search.return_value = [
+            {
+                "title": "The Hobbit JRR Tolkien EPUB",
+                "seeders": 20,
+                "infoHash": v1_hash,
+                "magnetUrl": (
+                    f"magnet:?xt=urn:btih:{v1_hash}&xt=urn:btmh:1220{v2_hash}"
+                ),
+            }
+        ]
+        response = self.acquirer.submit("ebooks", "The Hobbit", "JRR Tolkien")
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertIn("BitTorrent v2 or hybrid", response["message"])
+        self.qbittorrent.add_magnet.assert_not_called()
+        self.qbittorrent.add_tags.assert_not_called()
 
     def test_mismatched_result_and_magnet_hash_never_submit(self):
         self.prowlarr.search.return_value = [

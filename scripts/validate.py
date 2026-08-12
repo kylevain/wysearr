@@ -13,6 +13,7 @@ import sys
 import tempfile
 import urllib.parse
 import urllib.request
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -66,6 +67,7 @@ def request_json(url: str, *, api_key: str | None = None, timeout: int = 15) -> 
 def qbit_opener(base_url: str, username: str, password: str) -> urllib.request.OpenerDirector:
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    opener.addheaders = [("Referer", f"{base_url.rstrip('/')}/")]
     body = urllib.parse.urlencode({"username": username, "password": password}).encode()
     request = urllib.request.Request(f"{base_url}/api/v2/auth/login", data=body)
     with opener.open(request, timeout=15) as response:
@@ -73,6 +75,65 @@ def qbit_opener(base_url: str, username: str, password: str) -> urllib.request.O
     if result != "Ok.":
         raise RuntimeError("qBittorrent authentication rejected")
     return opener
+
+
+def provider_fields(resource: dict[str, object]) -> dict[str, object]:
+    fields = resource.get("fields")
+    if not isinstance(fields, list):
+        return {}
+    return {
+        str(field.get("name", "")).casefold(): field.get("value")
+        for field in fields
+        if isinstance(field, dict) and field.get("name")
+    }
+
+
+def arr_download_client_accepted(
+    resource: dict[str, object],
+    *,
+    username: str,
+    category: str,
+    category_fields: tuple[str, ...],
+    imported_fields: tuple[str, ...],
+) -> bool:
+    fields = provider_fields(resource)
+
+    def first(names: tuple[str, ...]) -> object:
+        return next(
+            (fields[name.casefold()] for name in names if name.casefold() in fields),
+            None,
+        )
+
+    try:
+        port_ok = int(fields.get("port", -1)) == 8080
+    except (TypeError, ValueError):
+        port_ok = False
+    return bool(
+        resource.get("enable")
+        and str(resource.get("implementation", "")).casefold() == "qbittorrent"
+        and str(fields.get("host", "")).casefold() == "qbittorrent"
+        and port_ok
+        and fields.get("usessl") is False
+        and fields.get("username") == username
+        and first(category_fields) == category
+        and first(imported_fields) == f"{category}-imported"
+        and resource.get("removeCompletedDownloads") is False
+    )
+
+
+def post_json_ok(url: str, payload: object, *, api_key: str, timeout: int = 15) -> None:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Api-Key": api_key,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        response.read()
 
 
 def container_check(service: str) -> Check:
@@ -218,12 +279,12 @@ def validate() -> list[Check]:
         checks.append(Check("prowlarr:api", False, type(error).__name__))
 
     arr_specs = (
-        ("sonarr", "SONARR", "8989", "v3", "/media/tv"),
-        ("radarr", "RADARR", "7878", "v3", "/media/movies"),
-        ("lidarr", "LIDARR", "8686", "v1", "/media/music"),
-        ("whisparr", "WHISPARR", "6969", "v3", "/media/spicy"),
+        ("sonarr", "SONARR", "8989", "v3", "/media/tv", "tv", ("category", "tvCategory"), ("postImportCategory", "tvImportedCategory")),
+        ("radarr", "RADARR", "7878", "v3", "/media/movies", "movies", ("category", "movieCategory"), ("postImportCategory", "movieImportedCategory")),
+        ("lidarr", "LIDARR", "8686", "v1", "/media/music", "music", ("category", "musicCategory"), ("postImportCategory", "musicImportedCategory")),
+        ("whisparr", "WHISPARR", "6969", "v3", "/media/spicy", "spicy", ("category", "tvCategory"), ("postImportCategory", "tvImportedCategory")),
     )
-    for name, prefix, default_port, api_version, root_path in arr_specs:
+    for name, prefix, default_port, api_version, root_path, category, category_fields, imported_fields in arr_specs:
         try:
             base = f"http://{bind_address}:{env.get(prefix + '_PORT', default_port)}"
             key = env.get(prefix + "_API_KEY", "")
@@ -232,10 +293,32 @@ def validate() -> list[Check]:
             clients = request_json(f"{base}/api/{api_version}/downloadclient", api_key=key)
             indexers = request_json(f"{base}/api/{api_version}/indexer", api_key=key)
             root_ok = any(item.get("path") == root_path and item.get("accessible", True) for item in roots)
-            client_ok = any(item.get("enable") and item.get("implementation") == "QBittorrent" for item in clients)
+            accepted_clients = [
+                item
+                for item in clients
+                if arr_download_client_accepted(
+                    item,
+                    username=env.get("QBITTORRENT_USERNAME", "admin"),
+                    category=category,
+                    category_fields=category_fields,
+                    imported_fields=imported_fields,
+                )
+            ]
+            client_ok = False
+            for client in accepted_clients:
+                try:
+                    post_json_ok(
+                        f"{base}/api/{api_version}/downloadclient/test",
+                        client,
+                        api_key=key,
+                    )
+                    client_ok = True
+                    break
+                except Exception:
+                    continue
             checks.append(Check(f"{name}:api", bool(status.get("version")), f"version={status.get('version')}"))
             checks.append(Check(f"{name}:root", root_ok, root_path))
-            checks.append(Check(f"{name}:download-client", client_ok, "qBittorrent enabled" if client_ok else "qBittorrent unavailable"))
+            checks.append(Check(f"{name}:download-client", client_ok, "configuration and live test passed" if client_ok else "configuration or live test failed"))
             enabled_indexers = sum(bool(item.get("enable", True)) for item in indexers)
             checks.append(Check(f"{name}:indexers", enabled_indexers > 0, f"enabled={enabled_indexers}"))
             if name == "whisparr":
@@ -275,7 +358,7 @@ def validate() -> list[Check]:
 
     try:
         database = STACK_ROOT / "state" / "huey" / "huey.db"
-        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
             integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
             columns = {row[1] for row in connection.execute("PRAGMA table_info(requests)")}
             indexes = list(connection.execute("PRAGMA index_list(requests)"))
@@ -287,7 +370,7 @@ def validate() -> list[Check]:
 
     try:
         database = STACK_ROOT / "config" / "bookbot" / "bookbot.db"
-        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
             integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
             tables = {
                 row[0]

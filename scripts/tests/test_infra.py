@@ -2,6 +2,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 
@@ -19,11 +20,11 @@ class BackupTests(unittest.TestCase):
             root = Path(directory)
             source = root / "source.db"
             destination = root / "backup" / "source.db"
-            with sqlite3.connect(source) as connection:
+            with closing(sqlite3.connect(source)) as connection, connection:
                 connection.execute("CREATE TABLE example (value TEXT)")
                 connection.execute("INSERT INTO example VALUES ('kept')")
             backup.sqlite_backup(source, destination, anchor=root)
-            with sqlite3.connect(destination) as connection:
+            with closing(sqlite3.connect(destination)) as connection:
                 self.assertEqual(connection.execute("SELECT value FROM example").fetchone()[0], "kept")
                 self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
             self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
@@ -110,6 +111,39 @@ class ValidationTests(unittest.TestCase):
             validate.bazarr_acceptance(settings, profiles, status),
             (False, True, False),
         )
+
+    def test_arr_download_client_acceptance_requires_managed_contract(self):
+        resource = {
+            "enable": True,
+            "implementation": "QBittorrent",
+            "removeCompletedDownloads": False,
+            "fields": [
+                {"name": "host", "value": "qbittorrent"},
+                {"name": "port", "value": 8080},
+                {"name": "useSsl", "value": False},
+                {"name": "username", "value": "admin"},
+                {"name": "movieCategory", "value": "movies"},
+                {"name": "movieImportedCategory", "value": "movies-imported"},
+            ],
+        }
+        arguments = {
+            "username": "admin",
+            "category": "movies",
+            "category_fields": ("category", "movieCategory"),
+            "imported_fields": ("postImportCategory", "movieImportedCategory"),
+        }
+        self.assertTrue(validate.arr_download_client_accepted(resource, **arguments))
+        for field, bad_value in (
+            ("host", "localhost"),
+            ("port", 9999),
+            ("movieCategory", "wrong"),
+            ("movieImportedCategory", "wrong-imported"),
+        ):
+            changed = {**resource, "fields": [dict(item) for item in resource["fields"]]}
+            next(item for item in changed["fields"] if item["name"] == field)["value"] = bad_value
+            self.assertFalse(validate.arr_download_client_accepted(changed, **arguments))
+        changed = dict(resource, removeCompletedDownloads=True)
+        self.assertFalse(validate.arr_download_client_accepted(changed, **arguments))
 
 
 if __name__ == "__main__":

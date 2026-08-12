@@ -30,6 +30,10 @@ INFO_HASH = re.compile(r"^[a-fA-F0-9]{40}(?:[a-fA-F0-9]{24})?$")
 LOGGER = logging.getLogger("huey.acquisition")
 
 
+class UnsupportedTorrentVersion(ValueError):
+    """The payload uses an info-hash scheme Huey cannot correlate safely."""
+
+
 def normalize_info_hash(value: object) -> str | None:
     text = str(value or "").strip()
     if INFO_HASH.fullmatch(text):
@@ -44,7 +48,18 @@ def normalize_info_hash(value: object) -> str | None:
 
 
 def magnet_info_hash(magnet: str) -> str | None:
-    for value in parse_qs(urlparse(magnet).query).get("xt", []):
+    exact_topics = parse_qs(urlparse(magnet).query).get("xt", [])
+    if any(
+        value.rpartition(":")[0].casefold().endswith("urn:btmh")
+        for value in exact_topics
+    ):
+        # A hybrid magnet can expose both btih and btmh topics. Reject both
+        # pure-v2 and hybrid sources rather than assuming which hash qBittorrent
+        # will expose through its Web API for downstream correlation.
+        raise UnsupportedTorrentVersion(
+            "BitTorrent v2 and hybrid magnets are not supported"
+        )
+    for value in exact_topics:
         prefix, separator, candidate = value.rpartition(":")
         if separator and prefix.casefold().endswith("urn:btih"):
             normalized = normalize_info_hash(candidate)
@@ -82,25 +97,76 @@ def _bencode_end(data: bytes, position: int, depth: int = 0) -> int:
     return end
 
 
+def _bencoded_string(data: bytes, position: int) -> tuple[bytes, int]:
+    colon = data.find(b":", position)
+    if colon < 0:
+        raise ValueError("invalid bencoded string")
+    length_bytes = data[position:colon]
+    if not length_bytes or not length_bytes.isdigit():
+        raise ValueError("invalid bencoded string length")
+    if len(length_bytes) > 1 and length_bytes.startswith(b"0"):
+        raise ValueError("noncanonical bencoded string length")
+    length = int(length_bytes)
+    end = colon + 1 + length
+    if end > len(data):
+        raise ValueError("invalid bencoded string length")
+    return data[colon + 1 : end], end
+
+
+def _bencoded_dictionary(
+    data: bytes, position: int
+) -> tuple[list[tuple[bytes, int, int]], int]:
+    if data[position : position + 1] != b"d":
+        raise ValueError("expected bencoded dictionary")
+    items: list[tuple[bytes, int, int]] = []
+    cursor = position + 1
+    previous_key: bytes | None = None
+    while cursor < len(data) and data[cursor : cursor + 1] != b"e":
+        key, value_start = _bencoded_string(data, cursor)
+        if previous_key is not None and key <= previous_key:
+            raise ValueError("noncanonical bencoded dictionary")
+        value_end = _bencode_end(data, value_start)
+        items.append((key, value_start, value_end))
+        previous_key = key
+        cursor = value_end
+    if cursor >= len(data):
+        raise ValueError("unterminated bencoded dictionary")
+    return items, cursor + 1
+
+
 def torrent_info_hash(data: bytes) -> str | None:
-    if not data.startswith(b"d"):
-        return None
-    cursor = 1
+    """Derive qBittorrent's v1 identity from the exact bencoded info bytes.
+
+    BitTorrent v2 uses a SHA-256 identity, while hybrid torrent identity
+    exposure varies between APIs. Until Huey can correlate both forms against
+    qBittorrent with certainty, the BEP 52 ``meta version`` marker is rejected
+    instead of guessing an identity or trusting Prowlarr metadata.
+    """
+
     try:
-        while cursor < len(data) and data[cursor : cursor + 1] != b"e":
-            key_end = _bencode_end(data, cursor)
-            colon = data.find(b":", cursor, key_end)
-            if colon < 0:
-                return None
-            key = data[colon + 1 : key_end]
-            value_start = key_end
-            value_end = _bencode_end(data, value_start)
-            if key == b"info":
-                return hashlib.sha1(data[value_start:value_end]).hexdigest()
-            cursor = value_end
-    except (ValueError, TypeError):
+        top_level, payload_end = _bencoded_dictionary(data, 0)
+        if payload_end != len(data):
+            return None
+        info_values = [item for item in top_level if item[0] == b"info"]
+        if len(info_values) != 1:
+            return None
+        _, info_start, info_end = info_values[0]
+        info_items, parsed_info_end = _bencoded_dictionary(data, info_start)
+        if parsed_info_end != info_end:
+            return None
+        meta_versions = [item for item in info_items if item[0] == b"meta version"]
+        if meta_versions:
+            _, version_start, version_end = meta_versions[0]
+            if data[version_start:version_end] == b"i2e":
+                raise UnsupportedTorrentVersion(
+                    "BitTorrent v2 and hybrid payloads are not supported"
+                )
+            return None
+        return hashlib.sha1(data[info_start:info_end]).hexdigest()
+    except UnsupportedTorrentVersion:
+        raise
+    except (IndexError, ValueError, TypeError):
         return None
-    return None
 
 
 class DirectAcquirer:
@@ -181,14 +247,52 @@ class DirectAcquirer:
         if not magnet and download_url.startswith("magnet:"):
             magnet = download_url
 
-        supplied_info_hash = normalize_info_hash(selected.get("infoHash"))
+        raw_supplied_info_hash = selected.get("infoHash")
+        supplied_info_hash = normalize_info_hash(raw_supplied_info_hash)
+        if (
+            raw_supplied_info_hash is not None
+            and str(raw_supplied_info_hash).strip()
+            and not supplied_info_hash
+        ):
+            return result(
+                "needs_selection",
+                "The release provides an invalid torrent identity. Try a different release.",
+                service="prowlarr",
+                external_title=selected_title,
+            )
         submitted_info_hash: str | None = None
         torrent: bytes | None = None
         if magnet:
-            submitted_info_hash = magnet_info_hash(magnet)
+            try:
+                submitted_info_hash = magnet_info_hash(magnet)
+            except UnsupportedTorrentVersion:
+                return result(
+                    "needs_selection",
+                    "This release uses an unsupported BitTorrent v2 or hybrid torrent. "
+                    "Try a BitTorrent v1 release.",
+                    service="prowlarr",
+                    external_title=selected_title,
+                )
         elif download_url:
             torrent = self.prowlarr.download_torrent(download_url)
-            submitted_info_hash = torrent_info_hash(torrent)
+            try:
+                submitted_info_hash = torrent_info_hash(torrent)
+            except UnsupportedTorrentVersion:
+                return result(
+                    "needs_selection",
+                    "This release uses an unsupported BitTorrent v2 or hybrid torrent. "
+                    "Try a BitTorrent v1 release.",
+                    service="prowlarr",
+                    external_title=selected_title,
+                )
+            if not submitted_info_hash:
+                return result(
+                    "needs_selection",
+                    "The downloaded torrent has no verifiable payload identity. "
+                    "Try a different release.",
+                    service="prowlarr",
+                    external_title=selected_title,
+                )
         if (
             supplied_info_hash
             and submitted_info_hash
@@ -200,7 +304,9 @@ class DirectAcquirer:
                 service="prowlarr",
                 external_title=selected_title,
             )
-        info_hash = submitted_info_hash or supplied_info_hash
+        # Prowlarr's infoHash is useful only as a consistency check. The
+        # submitted source must independently prove the correlation identity.
+        info_hash = submitted_info_hash
         if not info_hash:
             return result(
                 "needs_selection",

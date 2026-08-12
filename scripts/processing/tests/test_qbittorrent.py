@@ -70,6 +70,9 @@ class QbittorrentClientTests(unittest.TestCase):
         self.assertEqual("operator", session.posts[0][1]["data"]["username"])
         self.assertEqual("secret", session.posts[0][1]["data"]["password"])
         self.assertFalse(session.trust_env)
+        self.assertEqual(
+            "http://qbittorrent:8080/", session.headers.get("Referer")
+        )
 
     def test_failed_login_does_not_echo_credentials(self) -> None:
         session = FakeSession()

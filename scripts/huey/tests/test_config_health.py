@@ -13,7 +13,7 @@ sys.path.insert(0, str(HUEY_ROOT))
 from config import ChannelConfigError, validate_channel_config
 from healthcheck import is_ready
 from database import RequestStore
-from huey import reconcile_notifications
+from huey import reconcile_notifications, validate_discord_channels
 
 
 REQUESTS = {
@@ -94,6 +94,23 @@ class FakeChannel:
         self.sent.append(message)
 
 
+class FakePermissions:
+    def __init__(self, *, view=True, send=True, history=True):
+        self.view_channel = view
+        self.send_messages = send
+        self.read_message_history = history
+
+
+class PermissionChannel(FakeChannel):
+    def __init__(self, permissions=None):
+        super().__init__()
+        self.guild = type("Guild", (), {"me": object()})()
+        self.permissions = permissions or FakePermissions()
+
+    def permissions_for(self, _member):
+        return self.permissions
+
+
 class FakeClient:
     def __init__(self, channels):
         self.channels = channels
@@ -169,6 +186,33 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         config = validate_channel_config({"requests": REQUESTS})
         self.assertEqual(await self.reconcile(FakeClient({}), config), 0)
         self.assertEqual(len(self.store.pending_notifications()), 1)
+
+
+class DiscordChannelValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_all_request_and_status_channels_are_verified(self):
+        config = validate_channel_config(
+            {"requests": REQUESTS, "activity": {"request-status": 20}}
+        )
+        client = FakeClient(
+            {channel_id: PermissionChannel() for channel_id in (*REQUESTS.values(), 20)}
+        )
+        await validate_discord_channels(client, config)
+
+    async def test_missing_or_unwritable_channel_is_rejected(self):
+        config = validate_channel_config(
+            {"requests": REQUESTS, "activity": {"request-status": 20}}
+        )
+        channels = {
+            channel_id: PermissionChannel()
+            for channel_id in (*REQUESTS.values(), 20)
+        }
+        channels[2] = PermissionChannel(FakePermissions(send=False))
+        with self.assertRaisesRegex(RuntimeError, "send_messages"):
+            await validate_discord_channels(FakeClient(channels), config)
+        channels[2] = PermissionChannel()
+        del channels[3]
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            await validate_discord_channels(FakeClient(channels), config)
 
 
 if __name__ == "__main__":

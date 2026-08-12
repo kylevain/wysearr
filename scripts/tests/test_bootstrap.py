@@ -6,6 +6,7 @@ import os
 import stat
 import tempfile
 import unittest
+from unittest import mock
 import urllib.error
 from pathlib import Path
 
@@ -290,6 +291,29 @@ class FakeArrApi:
 
 
 class ArrTests(unittest.TestCase):
+    def test_rotation_guard_restarts_and_reauthenticates(self):
+        original = mock.Mock()
+        ready = mock.Mock()
+        ready.login.return_value = True
+        runner = mock.Mock(return_value=mock.Mock(returncode=0))
+        result = bootstrap.restart_qbittorrent_with_rotation_guard(
+            original,
+            "http://qbit.invalid",
+            "admin",
+            "secret",
+            timeout=1,
+            retries=1,
+            runner=runner,
+            client_factory=lambda *args, **kwargs: ready,
+            sleep=lambda _: None,
+        )
+        self.assertIs(result, ready)
+        original.set_preferences.assert_called_once_with(
+            {"web_ui_max_auth_fail_count": bootstrap.QBITTORRENT_ROTATION_GUARD_LIMIT}
+        )
+        runner.assert_called_once()
+        ready.login.assert_called_once_with("admin", "secret")
+
     def test_download_client_repair_payload_and_mask_aware_idempotency(self):
         api = FakeArrApi()
         service = bootstrap.ARR_SERVICES[0]
@@ -335,6 +359,39 @@ class ArrTests(unittest.TestCase):
             )
             self.assertEqual(
                 bootstrap.get_provider_field(payload, "postImportCategory"),
+                f"{service.category}-imported",
+            )
+
+    def test_current_media_specific_category_field_mappings(self):
+        expected_fields = {
+            "Sonarr": ("tvCategory", "tvImportedCategory"),
+            "Radarr": ("movieCategory", "movieImportedCategory"),
+            "Lidarr": ("musicCategory", "musicImportedCategory"),
+            "Whisparr": ("tvCategory", "tvImportedCategory"),
+        }
+        for service in bootstrap.ARR_SERVICES:
+            category_field, imported_field = expected_fields[service.name]
+            resource = provider_resource()
+            resource["fields"] = [
+                field
+                for field in resource["fields"]
+                if field["name"] not in {"category", "postImportCategory"}
+            ]
+            resource["fields"].extend(
+                [
+                    {"name": category_field, "value": "old"},
+                    {"name": imported_field, "value": "old-imported"},
+                ]
+            )
+            payload = bootstrap.build_arr_download_client_payload(
+                resource, service, "admin", "secret"
+            )
+            self.assertEqual(
+                bootstrap.get_provider_field(payload, category_field),
+                service.category,
+            )
+            self.assertEqual(
+                bootstrap.get_provider_field(payload, imported_field),
                 f"{service.category}-imported",
             )
 

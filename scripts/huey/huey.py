@@ -78,6 +78,41 @@ async def _discord_channel(client: Any, channel_id: str) -> Any | None:
         return None
 
 
+async def validate_discord_channels(
+    client: Any, channel_config: ChannelConfig
+) -> None:
+    """Require every operational channel to be visible and writable by Huey."""
+
+    channel_ids = set(channel_config.request_channels)
+    if channel_config.request_status_channel:
+        channel_ids.add(channel_config.request_status_channel)
+    for channel_id in sorted(channel_ids, key=int):
+        channel = await _discord_channel(client, channel_id)
+        if channel is None or not hasattr(channel, "send"):
+            raise RuntimeError(f"Discord channel {channel_id} is unavailable")
+        guild = getattr(channel, "guild", None)
+        member = getattr(guild, "me", None)
+        if member is None and guild is not None and getattr(client, "user", None):
+            get_member = getattr(guild, "get_member", None)
+            if callable(get_member):
+                member = get_member(client.user.id)
+        permissions_for = getattr(channel, "permissions_for", None)
+        if member is None or not callable(permissions_for):
+            raise RuntimeError(
+                f"Discord permissions cannot be verified for channel {channel_id}"
+            )
+        permissions = permissions_for(member)
+        required = ["view_channel", "send_messages"]
+        if channel_id in channel_config.request_channels:
+            required.append("read_message_history")
+        missing = [name for name in required if not getattr(permissions, name, False)]
+        if missing:
+            raise RuntimeError(
+                f"Discord channel {channel_id} lacks required bot permissions: "
+                + ", ".join(missing)
+            )
+
+
 async def reconcile_notifications(
     client: Any,
     channel_config: ChannelConfig,
@@ -168,6 +203,13 @@ def build_client(
     @client.event
     async def on_ready():
         nonlocal reconcile_task
+        try:
+            await validate_discord_channels(client, channel_config)
+        except RuntimeError as error:
+            remove_ready_marker(ready_path)
+            LOGGER.error("Huey Discord channel validation failed: %s", error)
+            await client.close()
+            return
         write_ready_marker(ready_path)
         LOGGER.info("Huey is ready as %s; watching %d channel(s)", client.user, len(channel_config.request_channels))
         if reconcile_task is None or reconcile_task.done():
