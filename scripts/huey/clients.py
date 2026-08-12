@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 from urllib.parse import urljoin, urlparse
@@ -21,6 +23,7 @@ class ServiceError(RuntimeError):
     """A deliberately sanitized integration error safe for logs and Discord."""
 
 
+LOGGER = logging.getLogger("huey.clients")
 MAX_TORRENT_BYTES = 16 * 1024 * 1024
 TORRENT_CHUNK_BYTES = 64 * 1024
 
@@ -351,9 +354,19 @@ class ProwlarrClient(JsonClient):
         *,
         session: requests.Session | Any | None = None,
         timeout: float = 30,
+        search_connect_timeout: float = 5,
+        search_read_timeout: float = 90,
+        search_attempts: int = 2,
+        search_retry_delay: float = 1,
     ):
         if not api_key:
             raise ServiceError("Prowlarr API key is not configured.")
+        if search_connect_timeout <= 0 or search_read_timeout <= 0:
+            raise ValueError("Prowlarr search timeouts must be positive")
+        if search_attempts < 1 or search_attempts > 3:
+            raise ValueError("Prowlarr search attempts must be between 1 and 3")
+        if search_retry_delay < 0:
+            raise ValueError("Prowlarr search retry delay cannot be negative")
         super().__init__(
             "prowlarr",
             base_url,
@@ -361,13 +374,71 @@ class ProwlarrClient(JsonClient):
             timeout=timeout,
             headers={"X-Api-Key": api_key, "Accept": "application/json"},
         )
+        self.search_timeout = (search_connect_timeout, search_read_timeout)
+        self.search_attempts = search_attempts
+        self.search_retry_delay = search_retry_delay
 
     def search(self, query: str, categories: Iterable[int]) -> list[Mapping[str, Any]]:
-        value = self._request(
-            "GET",
-            "/api/v1/search",
-            params={"query": query, "type": "search", "categories": list(categories), "limit": 100},
-        )
+        # Prowlarr waits synchronously for every applicable indexer before its
+        # aggregate search response is complete. Keep the connect budget short,
+        # but allow the read to exceed an individual indexer's timeout. This GET
+        # is idempotent, so one bounded transient retry is safe; downloads and
+        # qBittorrent mutations deliberately do not use this retry path.
+        url = urljoin(self.base_url, "api/v1/search")
+        params = {
+            "query": query,
+            "type": "search",
+            "categories": list(categories),
+            "limit": 100,
+        }
+        response: Any | None = None
+        for attempt in range(1, self.search_attempts + 1):
+            try:
+                response = self.session.request(
+                    "GET",
+                    url,
+                    headers=dict(self.headers),
+                    params=params,
+                    timeout=self.search_timeout,
+                )
+            except requests.Timeout as error:
+                if attempt < self.search_attempts:
+                    LOGGER.warning(
+                        "Prowlarr search attempt %d/%d timed out; retrying",
+                        attempt,
+                        self.search_attempts,
+                    )
+                    if self.search_retry_delay:
+                        time.sleep(self.search_retry_delay)
+                    continue
+                raise ServiceError(
+                    "Prowlarr search timed out while waiting for indexers."
+                ) from error
+            except requests.ConnectionError as error:
+                if attempt < self.search_attempts:
+                    LOGGER.warning(
+                        "Prowlarr search attempt %d/%d could not connect; retrying",
+                        attempt,
+                        self.search_attempts,
+                    )
+                    if self.search_retry_delay:
+                        time.sleep(self.search_retry_delay)
+                    continue
+                raise ServiceError("Prowlarr is unavailable.") from error
+            except requests.RequestException as error:
+                raise ServiceError("Prowlarr is unavailable.") from error
+            break
+
+        if response is None:  # Defensive; the bounded loop always returns or raises.
+            raise ServiceError("Prowlarr is unavailable.")
+        if response.status_code not in range(200, 300):
+            raise ServiceError(
+                f"Prowlarr rejected the search (HTTP {response.status_code})."
+            )
+        try:
+            value = response.json()
+        except (TypeError, ValueError) as error:
+            raise ServiceError("Prowlarr returned an invalid search response.") from error
         if not isinstance(value, list):
             raise ServiceError("Prowlarr returned an invalid search response.")
         return value

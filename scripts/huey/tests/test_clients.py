@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import requests
 
@@ -234,6 +235,82 @@ class ProwlarrClientTests(unittest.TestCase):
         self.assertEqual(call[2]["params"]["categories"], [7020, 7000])
         self.assertEqual(call[2]["headers"]["X-Api-Key"], "key")
 
+    def test_search_preserves_a_configured_base_path(self):
+        session = FakeSession([FakeResponse(json_value=[])])
+        client = ProwlarrClient(
+            "https://services.invalid/prowlarr", "key", session=session
+        )
+        client.search("Dune", (7020, 7000))
+        self.assertEqual(
+            session.calls[0][1],
+            "https://services.invalid/prowlarr/api/v1/search",
+        )
+
+    def test_search_retries_timeout_with_extended_read_budget(self):
+        class TimeoutThenSuccessSession(FakeSession):
+            def request(self, method, url, **kwargs):
+                self.calls.append((method, url, kwargs))
+                if len(self.calls) == 1:
+                    raise requests.ReadTimeout("slow indexer query=private&apikey=secret")
+                return FakeResponse(json_value=[])
+
+        session = TimeoutThenSuccessSession()
+        client = ProwlarrClient(
+            "http://prowlarr:9696",
+            "key",
+            session=session,
+            search_retry_delay=1,
+        )
+        with patch("clients.time.sleep") as sleep:
+            self.assertEqual(client.search("Tourist Season", (3030, 3000)), [])
+
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+        self.assertTrue(
+            all(call[1].endswith("/api/v1/search") for call in session.calls)
+        )
+        self.assertTrue(
+            all(call[2]["timeout"] == (5, 90) for call in session.calls)
+        )
+        self.assertTrue(
+            all(call[2]["params"]["categories"] == [3030, 3000] for call in session.calls)
+        )
+        self.assertTrue(
+            all(call[2]["headers"]["X-Api-Key"] == "key" for call in session.calls)
+        )
+        sleep.assert_called_once_with(1)
+
+    def test_exhausted_search_timeouts_are_sanitized(self):
+        class AlwaysTimeoutSession(FakeSession):
+            def request(self, method, url, **kwargs):
+                self.calls.append((method, url, kwargs))
+                raise requests.ReadTimeout("query=private-title&apikey=secret")
+
+        session = AlwaysTimeoutSession()
+        client = ProwlarrClient(
+            "http://prowlarr:9696",
+            "key",
+            session=session,
+            search_retry_delay=0,
+        )
+        with self.assertRaisesRegex(ServiceError, "timed out") as caught:
+            client.search("private-title", (3030, 3000))
+        self.assertEqual(len(session.calls), 2)
+        self.assertNotIn("private-title", str(caught.exception))
+        self.assertNotIn("secret", str(caught.exception))
+
+    def test_search_authentication_failure_is_not_retried(self):
+        session = FakeSession([FakeResponse(status=401, json_value={})])
+        client = ProwlarrClient(
+            "http://prowlarr:9696",
+            "key",
+            session=session,
+            search_retry_delay=0,
+        )
+        with self.assertRaisesRegex(ServiceError, "HTTP 401"):
+            client.search("Dune", (3030, 3000))
+        self.assertEqual(len(session.calls), 1)
+
     def test_download_returns_bytes(self):
         response = FakeResponse(content=b"torrent bytes")
         session = FakeSession([response])
@@ -241,6 +318,7 @@ class ProwlarrClientTests(unittest.TestCase):
         self.assertEqual(client.download_torrent("/api/v1/download/1"), b"torrent bytes")
         self.assertEqual(session.calls[0][2]["headers"]["X-Api-Key"], "key")
         self.assertTrue(session.calls[0][2]["stream"])
+        self.assertEqual(session.calls[0][2]["timeout"], 30)
         self.assertTrue(response.closed)
 
     def test_api_key_is_not_forwarded_to_external_download_host(self):

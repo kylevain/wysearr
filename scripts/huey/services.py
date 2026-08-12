@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -21,6 +22,28 @@ def _optional_int(value: str | None, label: str) -> int | None:
         return int(value)
     except ValueError as error:
         raise ValueError(f"{label} must be an integer") from error
+
+
+def _positive_float(value: str, label: str, *, allow_zero: bool = False) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise ValueError(f"{label} must be a number") from error
+    invalid = parsed < 0 if allow_zero else parsed <= 0
+    if not math.isfinite(parsed) or invalid:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{label} must be {qualifier}")
+    return parsed
+
+
+def _bounded_int(value: str, label: str, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise ValueError(f"{label} must be an integer") from error
+    if not minimum <= parsed <= maximum:
+        raise ValueError(f"{label} must be between {minimum} and {maximum}")
+    return parsed
 
 
 class ServiceRegistry:
@@ -66,6 +89,25 @@ class ServiceRegistry:
         prowlarr = ProwlarrClient(
             self._env("PROWLARR_URL", "http://prowlarr:9696"),
             self._env("PROWLARR_API_KEY"),
+            search_connect_timeout=_positive_float(
+                self._env("PROWLARR_SEARCH_CONNECT_TIMEOUT_SECONDS", "5"),
+                "PROWLARR_SEARCH_CONNECT_TIMEOUT_SECONDS",
+            ),
+            search_read_timeout=_positive_float(
+                self._env("PROWLARR_SEARCH_READ_TIMEOUT_SECONDS", "90"),
+                "PROWLARR_SEARCH_READ_TIMEOUT_SECONDS",
+            ),
+            search_attempts=_bounded_int(
+                self._env("PROWLARR_SEARCH_ATTEMPTS", "2"),
+                "PROWLARR_SEARCH_ATTEMPTS",
+                1,
+                3,
+            ),
+            search_retry_delay=_positive_float(
+                self._env("PROWLARR_SEARCH_RETRY_DELAY_SECONDS", "1"),
+                "PROWLARR_SEARCH_RETRY_DELAY_SECONDS",
+                allow_zero=True,
+            ),
         )
         username = self._env("QBITTORRENT_USERNAME") or self._env("QBIT_USERNAME")
         password = self._raw_env("QBITTORRENT_PASSWORD") or self._raw_env("QBIT_PASSWORD")

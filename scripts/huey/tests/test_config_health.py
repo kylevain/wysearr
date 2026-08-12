@@ -14,6 +14,7 @@ from config import ChannelConfigError, validate_channel_config
 from clients import ServiceError
 from healthcheck import is_ready
 from database import RequestStore
+from services import ServiceRegistry
 from huey import (
     notification_loop,
     reconcile_arr_requests,
@@ -76,6 +77,40 @@ class HealthAndImportTests(unittest.TestCase):
     def test_huey_module_is_import_safe(self):
         module = importlib.import_module("huey")
         self.assertTrue(callable(module.main))
+
+
+class ServiceRegistryTests(unittest.TestCase):
+    def test_direct_client_uses_configured_prowlarr_search_budget(self):
+        services = ServiceRegistry(
+            {
+                "PROWLARR_URL": "http://prowlarr:9696",
+                "PROWLARR_API_KEY": "key",
+                "PROWLARR_SEARCH_CONNECT_TIMEOUT_SECONDS": "4.5",
+                "PROWLARR_SEARCH_READ_TIMEOUT_SECONDS": "95",
+                "PROWLARR_SEARCH_ATTEMPTS": "2",
+                "PROWLARR_SEARCH_RETRY_DELAY_SECONDS": "0.5",
+                "QBITTORRENT_USERNAME": "user",
+                "QBITTORRENT_PASSWORD": "password",
+            }
+        )
+
+        direct = services.direct()
+
+        self.assertEqual(direct.prowlarr.search_timeout, (4.5, 95.0))
+        self.assertEqual(direct.prowlarr.search_attempts, 2)
+        self.assertEqual(direct.prowlarr.search_retry_delay, 0.5)
+
+    def test_invalid_prowlarr_search_budget_fails_before_network_use(self):
+        services = ServiceRegistry(
+            {
+                "PROWLARR_API_KEY": "key",
+                "PROWLARR_SEARCH_READ_TIMEOUT_SECONDS": "0",
+                "QBITTORRENT_USERNAME": "user",
+                "QBITTORRENT_PASSWORD": "password",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            services.direct()
 
 
 class FakeMessage:
