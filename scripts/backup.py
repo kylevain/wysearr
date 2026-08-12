@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Create a local, secret-safe runtime checkpoint without copying media."""
+"""Create a private local runtime checkpoint without copying media payloads."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 from contextlib import closing
 from datetime import datetime, timezone
@@ -16,6 +18,11 @@ from pathlib import Path
 
 STACK_ROOT = Path(__file__).resolve().parents[1]
 BACKUP_ROOT = STACK_ROOT / "backups"
+QBITTORRENT_RESUME_RELATIVE = Path("config/qbittorrent/qBittorrent/BT_backup")
+MAX_QBITTORRENT_RESUME_FILES = 20_000
+MAX_QBITTORRENT_RESUME_FILE_BYTES = 32 * 1024 * 1024
+MAX_QBITTORRENT_RESUME_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 
 
 def private_mkdir(path: Path, *, anchor: Path = BACKUP_ROOT) -> None:
@@ -42,6 +49,7 @@ def sqlite_backup(source: Path, destination: Path, *, anchor: Path = BACKUP_ROOT
     with closing(sqlite3.connect(source_uri, uri=True, timeout=30)) as src:
         with closing(sqlite3.connect(destination)) as dst, dst:
             src.backup(dst)
+            dst.execute("PRAGMA journal_mode=DELETE")
             result = dst.execute("PRAGMA integrity_check").fetchone()[0]
             if result != "ok":
                 raise RuntimeError(f"SQLite backup validation failed for {source}")
@@ -52,6 +60,109 @@ def copy_private(source: Path, destination: Path, *, anchor: Path = BACKUP_ROOT)
     private_mkdir(destination.parent, anchor=anchor)
     shutil.copy2(source, destination)
     destination.chmod(0o600)
+
+
+def copy_stable_bounded_private(
+    source: Path,
+    destination: Path,
+    *,
+    maximum_bytes: int,
+    anchor: Path = BACKUP_ROOT,
+) -> int:
+    """Copy one regular file without following links and reject an unstable read."""
+    private_mkdir(destination.parent, anchor=anchor)
+    before = source.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"checkpoint source is not a regular file: {source}")
+    if before.st_size > maximum_bytes:
+        raise RuntimeError(f"checkpoint source exceeds its size limit: {source}")
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    destination_created = False
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (before.st_dev, before.st_ino):
+            raise RuntimeError(f"checkpoint source changed before it was read: {source}")
+        if opened.st_size > maximum_bytes:
+            raise RuntimeError(f"checkpoint source exceeds its size limit: {source}")
+
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            with destination.open("xb") as output:
+                destination_created = True
+                copied_bytes = 0
+                while True:
+                    block = stream.read(
+                        min(1024 * 1024, maximum_bytes + 1 - copied_bytes)
+                    )
+                    if not block:
+                        break
+                    copied_bytes += len(block)
+                    if copied_bytes > maximum_bytes:
+                        raise RuntimeError(
+                            f"checkpoint source exceeds its size limit: {source}"
+                        )
+                    output.write(block)
+                output.flush()
+                os.fsync(output.fileno())
+            after = os.fstat(descriptor)
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(opened, field) != getattr(after, field) for field in stable_fields):
+            destination.unlink(missing_ok=True)
+            raise RuntimeError(f"checkpoint source changed while it was read: {source}")
+    except Exception:
+        if destination_created:
+            destination.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(descriptor)
+
+    destination.chmod(0o600)
+    return opened.st_size
+
+
+def copy_qbittorrent_resume_state(
+    output: Path,
+    copied: list[dict[str, str]],
+    *,
+    stack_root: Path = STACK_ROOT,
+) -> None:
+    """Copy bounded qBittorrent session metadata, never torrent payload paths."""
+    source_root = stack_root / QBITTORRENT_RESUME_RELATIVE
+    if not source_root.exists():
+        return
+    current = stack_root
+    for component in QBITTORRENT_RESUME_RELATIVE.parts:
+        current = current / component
+        if current.is_symlink():
+            raise RuntimeError(
+                f"qBittorrent resume source contains a symbolic link: {current}"
+            )
+    if source_root.is_symlink() or not source_root.is_dir():
+        raise RuntimeError(f"qBittorrent resume source is not a directory: {source_root}")
+
+    entries = sorted(source_root.iterdir(), key=lambda path: path.name)
+    if len(entries) > MAX_QBITTORRENT_RESUME_FILES:
+        raise RuntimeError("qBittorrent resume state exceeds the checkpoint file-count limit")
+
+    total_bytes = 0
+    for source in entries:
+        relative = source.relative_to(stack_root)
+        destination = output / relative
+        copied_bytes = copy_stable_bounded_private(
+            source,
+            destination,
+            maximum_bytes=MAX_QBITTORRENT_RESUME_FILE_BYTES,
+            anchor=output,
+        )
+        total_bytes += copied_bytes
+        if total_bytes > MAX_QBITTORRENT_RESUME_TOTAL_BYTES:
+            destination.unlink(missing_ok=True)
+            raise RuntimeError("qBittorrent resume state exceeds the checkpoint byte limit")
+        copied.append({"path": str(relative), "sha256": sha256(destination)})
 
 
 def git_head() -> str | None:
@@ -102,22 +213,114 @@ def create_backup(output: Path) -> dict[str, object]:
             copy_private(source, destination, anchor=output)
             copied.append({"path": str(relative), "sha256": sha256(destination)})
 
+    copy_qbittorrent_resume_state(output, copied, stack_root=STACK_ROOT)
+
     manifest = {
+        "format_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "git_head": git_head(),
+        "boundary": {
+            "includes": "selected configuration, SQLite-safe databases, and bounded qBittorrent resume metadata",
+            "excludes": [
+                "state/torrents/** download payloads",
+                "/mnt/media/** library media",
+            ],
+        },
         "files": copied,
     }
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     manifest_path.chmod(0o600)
+    verify_backup(output)
+    return manifest
+
+
+def _manifest_target(checkpoint: Path, raw_path: object) -> tuple[str, Path]:
+    if not isinstance(raw_path, str) or not raw_path:
+        raise RuntimeError("checkpoint manifest contains an invalid path")
+    relative = Path(raw_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError(f"checkpoint manifest contains an unsafe path: {raw_path}")
+    candidate = checkpoint / relative
+    current = checkpoint
+    for component in relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise RuntimeError(f"checkpoint contains a symbolic link: {raw_path}")
+    resolved = candidate.resolve()
+    if checkpoint != resolved and checkpoint not in resolved.parents:
+        raise RuntimeError(f"checkpoint path escapes its directory: {raw_path}")
+    return raw_path, candidate
+
+
+def verify_backup(checkpoint: Path) -> dict[str, object]:
+    checkpoint = checkpoint.resolve()
+    manifest_path = checkpoint / "manifest.json"
+    if not checkpoint.is_dir() or manifest_path.is_symlink() or not manifest_path.is_file():
+        raise RuntimeError(f"checkpoint manifest is missing: {checkpoint}")
+    if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
+        raise RuntimeError("checkpoint manifest exceeds its size limit")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
+        raise RuntimeError("checkpoint manifest has an invalid structure")
+    if manifest.get("format_version", 0) not in (0, 1):
+        raise RuntimeError("checkpoint manifest uses an unsupported format")
+
+    declared: set[str] = set()
+    for entry in manifest["files"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("sha256"), str):
+            raise RuntimeError("checkpoint manifest contains an invalid file record")
+        raw_path, target = _manifest_target(checkpoint, entry.get("path"))
+        if raw_path in declared:
+            raise RuntimeError(f"checkpoint manifest repeats a path: {raw_path}")
+        declared.add(raw_path)
+        if not target.is_file() or target.is_symlink():
+            raise RuntimeError(f"checkpoint file is missing or unsafe: {raw_path}")
+        if sha256(target) != entry["sha256"]:
+            raise RuntimeError(f"checkpoint hash mismatch: {raw_path}")
+        if target.suffix == ".db":
+            with closing(
+                sqlite3.connect(f"file:{target}?mode=ro&immutable=1", uri=True)
+            ) as connection:
+                result = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            if result != "ok":
+                raise RuntimeError(f"checkpoint SQLite integrity check failed: {raw_path}")
+
+    actual: set[str] = set()
+    for target in checkpoint.rglob("*"):
+        if target.is_symlink():
+            raise RuntimeError(
+                f"checkpoint contains a symbolic link: {target.relative_to(checkpoint)}"
+            )
+        if target == manifest_path:
+            continue
+        if target.is_file():
+            actual.add(str(target.relative_to(checkpoint)))
+        elif not target.is_dir():
+            raise RuntimeError(
+                f"checkpoint contains an unsupported file type: {target.relative_to(checkpoint)}"
+            )
+    if actual != declared:
+        raise RuntimeError("checkpoint contents do not match the manifest")
     return manifest
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path)
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument("--output", type=Path)
+    operation.add_argument("--verify", type=Path, metavar="CHECKPOINT")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
+
+    if args.verify:
+        manifest = verify_backup(args.verify)
+        if not args.quiet:
+            print(
+                f"PASS: runtime checkpoint verified at {args.verify.resolve()} "
+                f"({len(manifest['files'])} files)"
+            )
+        return 0
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output = (args.output or (BACKUP_ROOT / timestamp)).resolve()

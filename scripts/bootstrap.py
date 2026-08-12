@@ -109,10 +109,17 @@ ARR_SERVICES = (
 class IndexerSpec:
     name: str
     definition: str
-    base_url: str
+    base_url: str | None
 
 
 PUBLIC_INDEXERS = (
+    # Music-focused public source with a browse feed that Lidarr can validate.
+    IndexerSpec("MixtapeTorrent", "mixtapetorrent", None),
+    # These credential-free adult sources give Whisparr a real category-6000
+    # path. Their dynamic URL providers are left for Prowlarr to resolve.
+    IndexerSpec("Sukebei Nyaa", "sukebeinyaasi", None),
+    IndexerSpec("PornRips", "pornrips", None),
+    IndexerSpec("PornoTorrent", "pornotorrent", None),
     IndexerSpec("Nyaa.si", "nyaasi", "https://nyaa.si/"),
     IndexerSpec("LimeTorrents", "limetorrents", "https://www.limetorrents.fun/"),
     IndexerSpec(
@@ -949,10 +956,11 @@ def build_indexer_payload(
     payload["name"] = spec.name
     payload["enable"] = True
     payload["appProfileId"] = app_profile_id
-    payload["priority"] = 25
+    payload["priority"] = 20
     if "downloadClientId" in payload:
         payload["downloadClientId"] = 0
-    set_provider_field(payload, "baseUrl", spec.base_url)
+    if spec.base_url:
+        set_provider_field(payload, "baseUrl", spec.base_url)
     return payload
 
 
@@ -1009,6 +1017,8 @@ def configure_prowlarr_indexers(
     *,
     reporter: Reporter | Any | None = None,
     secret_values: Iterable[str] = (),
+    mutation_pause_seconds: float = 0,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> list[str]:
     reporter = reporter or Reporter()
     schemas_raw = client.get_json("/api/v1/indexer/schema")
@@ -1041,10 +1051,12 @@ def configure_prowlarr_indexers(
         try:
             desired = build_indexer_payload(source, spec, profile_id)
             client.post_json("/api/v1/indexer/test", desired, retry=True)
+            changed = False
             if installed is None:
                 client.post_json(
                     "/api/v1/indexer?forceSave=true", desired, retry=False
                 )
+                changed = True
             elif _indexer_managed_state(installed) != _indexer_managed_state(
                 desired
             ):
@@ -1056,6 +1068,12 @@ def configure_prowlarr_indexers(
                 client.put_json(
                     f"/api/v1/indexer/{resource_id}?forceSave=true", desired
                 )
+                changed = True
+            if changed and mutation_pause_seconds > 0:
+                # Prowlarr immediately fans mutations out to every ARR. Pace
+                # them so downstream live tests do not trip public-indexer or
+                # local Torznab rate limits during bootstrap.
+                sleep(mutation_pause_seconds)
         except (ApiError, ApiTransportError) as exc:
             reporter.warning(
                 f"{spec.name} test failed; indexer skipped: "
@@ -1092,7 +1110,10 @@ def configure_prowlarr(
     )
     validate_prowlarr_applications(client)
     successful = configure_prowlarr_indexers(
-        client, reporter=reporter, secret_values=secret_values
+        client,
+        reporter=reporter,
+        secret_values=secret_values,
+        mutation_pause_seconds=15,
     )
     # Adding/updating an indexer initiates application synchronization.  A
     # second reachability pass makes sync failure a bootstrap failure instead

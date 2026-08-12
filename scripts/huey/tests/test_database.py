@@ -157,6 +157,63 @@ class DatabaseTests(unittest.TestCase):
         request, _ = self.store.create_request(**self.request_values())
         self.assertFalse(self.store.mark_notified(request["id"], "not terminal"))
 
+    def test_queued_arr_requests_exclude_direct_and_terminal_requests(self):
+        self.store.initialize()
+        queued_arr, _ = self.store.create_request(**self.request_values("arr"))
+        direct, _ = self.store.create_request(**self.request_values("direct"))
+        terminal, _ = self.store.create_request(**self.request_values("terminal"))
+        self.store.transition(
+            queued_arr["id"],
+            "queued",
+            "Queued in Radarr",
+            service="radarr",
+            external_id="44",
+        )
+        self.store.transition(
+            direct["id"],
+            "queued",
+            "Queued in qBittorrent",
+            service="qbittorrent",
+            external_id="hash",
+        )
+        self.store.transition(
+            terminal["id"],
+            "completed",
+            "Already imported",
+            service="sonarr",
+            external_id="33",
+        )
+
+        rows = self.store.queued_arr_requests()
+        self.assertEqual([row["id"] for row in rows], [queued_arr["id"]])
+
+    def test_arr_completion_transition_is_atomic_and_idempotent(self):
+        self.store.initialize()
+        request, _ = self.store.create_request(**self.request_values())
+        self.store.transition(
+            request["id"],
+            "queued",
+            "Queued in Lidarr",
+            service="lidarr",
+            external_id="55",
+            external_title="Massive Attack",
+        )
+
+        self.assertTrue(
+            self.store.mark_arr_completed(request["id"], "Lidarr reports imported media")
+        )
+        self.assertFalse(
+            self.store.mark_arr_completed(request["id"], "Duplicate completion")
+        )
+        saved = self.store.get_request(request["id"])
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["external_id"], "55")
+        self.assertEqual(saved["external_title"], "Massive Attack")
+        events = self.store.events_for(request["id"])
+        self.assertEqual(
+            [event["event_type"] for event in events].count("arr_completed"), 1
+        )
+
     def test_initialize_fails_interrupted_request_for_safe_reconciliation(self):
         self.store.initialize()
         request, _ = self.store.create_request(**self.request_values())

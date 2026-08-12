@@ -240,6 +240,44 @@ class ArrClient(JsonClient):
             json={"name": self.spec.search_command, self.spec.command_ids_field: ids},
         )
 
+    @staticmethod
+    def _positive_statistic(value: Any) -> bool:
+        """Accept only an explicit positive numeric file statistic."""
+
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+    def has_imported_media(self, entity_id: str | int) -> bool:
+        """Read one ARR entity and conservatively detect an imported media file.
+
+        A missing entity, authentication problem, or unavailable ARR instance is
+        surfaced as :class:`ServiceError`; callers must not turn those failures
+        into a terminal request state.
+        """
+
+        try:
+            internal_id = int(entity_id)
+        except (TypeError, ValueError) as error:
+            raise ServiceError(f"{self.service} request has an invalid entity ID.") from error
+        if internal_id <= 0:
+            raise ServiceError(f"{self.service} request has an invalid entity ID.")
+
+        entity = self._request(
+            "GET", self._api(f"{self.spec.entity}/{internal_id}")
+        )
+        if not isinstance(entity, Mapping):
+            raise ServiceError(f"{self.service} returned an invalid entity response.")
+
+        if self.service == "radarr":
+            return entity.get("hasFile") is True
+
+        statistics = entity.get("statistics")
+        if not isinstance(statistics, Mapping):
+            return False
+        count_field = "episodeFileCount" if self.service == "sonarr" else "trackFileCount"
+        return self._positive_statistic(
+            statistics.get(count_field)
+        ) or self._positive_statistic(statistics.get("sizeOnDisk"))
+
     def submit(self, title: str) -> dict[str, str | None]:
         candidates = self.lookup(title)
         selected = select_arr_candidate(title, candidates)
@@ -278,12 +316,14 @@ class ArrClient(JsonClient):
             entity_id = int(added["id"])
 
         self._trigger_search(entity_id)
-        external_id = selected.get(self.spec.external_id_field) or entity_id
         return result(
             "queued",
             f"Queued {selected_title} in {self.service.title()} and started a search.",
             service=self.service,
-            external_id=external_id,
+            # The local entity ID is required for later read-only completion
+            # reconciliation. Provider IDs from lookup results cannot address
+            # an entity through the ARR instance API.
+            external_id=entity_id,
             external_title=selected_title,
         )
 

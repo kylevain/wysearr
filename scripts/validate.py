@@ -273,7 +273,26 @@ def validate() -> list[Check]:
         required_apps = {"Sonarr", "Radarr", "Lidarr", "Whisparr"}
         checks.append(Check("prowlarr:api", bool(status.get("version")), f"version={status.get('version')}"))
         enabled_indexers = sum(bool(item.get("enable")) for item in indexers)
-        checks.append(Check("prowlarr:indexers", enabled_indexers > 0, f"enabled={enabled_indexers}"))
+        live_indexer = False
+        for indexer in indexers:
+            if not indexer.get("enable"):
+                continue
+            try:
+                post_json_ok(
+                    f"{prowlarr_url}/api/v1/indexer/test",
+                    indexer,
+                    api_key=prowlarr_key,
+                    timeout=60,
+                )
+                live_indexer = True
+                break
+            except Exception:
+                continue
+        checks.append(Check(
+            "prowlarr:indexers",
+            enabled_indexers > 0 and live_indexer,
+            f"enabled={enabled_indexers} live_test={live_indexer}",
+        ))
         checks.append(Check("prowlarr:applications", required_apps <= app_names, f"configured={len(app_names)}"))
     except Exception as error:
         checks.append(Check("prowlarr:api", False, type(error).__name__))
@@ -320,7 +339,26 @@ def validate() -> list[Check]:
             checks.append(Check(f"{name}:root", root_ok, root_path))
             checks.append(Check(f"{name}:download-client", client_ok, "configuration and live test passed" if client_ok else "configuration or live test failed"))
             enabled_indexers = sum(bool(item.get("enable", True)) for item in indexers)
-            checks.append(Check(f"{name}:indexers", enabled_indexers > 0, f"enabled={enabled_indexers}"))
+            live_indexer = False
+            for indexer in indexers:
+                if not indexer.get("enable", True):
+                    continue
+                try:
+                    post_json_ok(
+                        f"{base}/api/{api_version}/indexer/test",
+                        indexer,
+                        api_key=key,
+                        timeout=60,
+                    )
+                    live_indexer = True
+                    break
+                except Exception:
+                    continue
+            checks.append(Check(
+                f"{name}:indexers",
+                enabled_indexers > 0 and live_indexer,
+                f"enabled={enabled_indexers} live_test={live_indexer}",
+            ))
             if name == "whisparr":
                 qualities = request_json(f"{base}/api/v3/qualityprofile", api_key=key)
                 checks.append(Check("whisparr:quality-profiles", bool(qualities), f"configured={len(qualities)}"))

@@ -88,6 +88,36 @@ def filter_quality_23(value: object) -> object:
     return value
 
 
+def create_validated_rollback_copy(
+    connection: sqlite3.Connection, backup_path: Path
+) -> None:
+    """Create and integrity-check the rollback DB before touching live rows."""
+    with closing(sqlite3.connect(backup_path)) as destination, destination:
+        connection.backup(destination)
+        destination.execute("PRAGMA journal_mode=DELETE")
+        backup_path.chmod(0o600)
+        if destination.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RuntimeError("Whisparr rollback copy failed its integrity check")
+
+
+def repair_database(database: Path, backup_path: Path) -> None:
+    with closing(sqlite3.connect(database)) as connection:
+        create_validated_rollback_copy(connection, backup_path)
+
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DELETE FROM QualityDefinitions WHERE Quality = 23")
+        profiles = connection.execute("SELECT Id, Items FROM QualityProfiles").fetchall()
+        for profile_id, raw_items in profiles:
+            items = filter_quality_23(json.loads(raw_items))
+            connection.execute(
+                "UPDATE QualityProfiles SET Items = ? WHERE Id = ?",
+                (json.dumps(items, indent=2), profile_id),
+            )
+        connection.commit()
+        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RuntimeError("Whisparr DB failed integrity check after repair")
+
+
 def repair() -> Path | None:
     if endpoint_works():
         return None
@@ -110,23 +140,7 @@ def repair() -> Path | None:
 
     run_compose("stop", "whisparr")
     try:
-        with closing(sqlite3.connect(DATABASE)) as connection, connection:
-            with closing(sqlite3.connect(backup_path)) as destination, destination:
-                connection.backup(destination)
-            backup_path.chmod(0o600)
-
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DELETE FROM QualityDefinitions WHERE Quality = 23")
-            profiles = connection.execute("SELECT Id, Items FROM QualityProfiles").fetchall()
-            for profile_id, raw_items in profiles:
-                items = filter_quality_23(json.loads(raw_items))
-                connection.execute(
-                    "UPDATE QualityProfiles SET Items = ? WHERE Id = ?",
-                    (json.dumps(items, indent=2), profile_id),
-                )
-            connection.commit()
-            if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                raise RuntimeError("Whisparr DB failed integrity check after repair")
+        repair_database(DATABASE, backup_path)
     finally:
         start_whisparr()
 

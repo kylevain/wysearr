@@ -15,11 +15,13 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from .clients import ServiceError
     from .config import ChannelConfig, load_channel_config
     from .database import RequestStore
     from .orchestrator import RequestProcessor
     from .services import ServiceRegistry
 except ImportError:  # Direct execution from /app/scripts/huey/huey.py.
+    from clients import ServiceError
     from config import ChannelConfig, load_channel_config
     from database import RequestStore
     from orchestrator import RequestProcessor
@@ -164,15 +166,64 @@ async def reconcile_notifications(
     return delivered_count
 
 
+def reconcile_arr_requests(store: RequestStore, services: Any) -> int:
+    """Complete queued ARR requests only after an explicit imported-file signal."""
+
+    completed_count = 0
+    for request in store.queued_arr_requests():
+        service = str(request.get("service") or "")
+        try:
+            client = services.arr(service)
+            if not client.has_imported_media(request.get("external_id")):
+                continue
+        except ServiceError as error:
+            # A 404 is deliberately treated like any other service failure: the
+            # entity may have been removed, but that does not prove the request
+            # completed or failed.
+            LOGGER.warning(
+                "ARR reconciliation deferred for request %s via %s (%s)",
+                request["id"],
+                service,
+                type(error).__name__,
+            )
+            continue
+        except Exception as error:
+            # Isolate one malformed row or client failure so other queued
+            # requests and terminal notifications still get reconciled.
+            LOGGER.warning(
+                "ARR reconciliation could not inspect request %s via %s (%s)",
+                request["id"],
+                service,
+                type(error).__name__,
+            )
+            continue
+
+        message = f"{service.title()} reports imported media for its queued entity"
+        if store.mark_arr_completed(request["id"], message):
+            completed_count += 1
+            LOGGER.info(
+                "ARR request %s completed after imported media was detected",
+                request["id"],
+            )
+    return completed_count
+
+
 async def notification_loop(
     client: Any,
     channel_config: ChannelConfig,
     store: RequestStore,
+    services: Any,
     interval_seconds: float = 30,
 ) -> None:
-    """Reconcile BookBot terminal updates for the lifetime of the Discord client."""
+    """Reconcile acquisition state and notifications for the Discord client lifetime."""
 
     while not client.is_closed():
+        try:
+            await asyncio.to_thread(reconcile_arr_requests, store, services)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.error("ARR completion reconciliation failed (%s)", type(error).__name__)
         try:
             await reconcile_notifications(client, channel_config, store)
         except asyncio.CancelledError:
@@ -214,7 +265,13 @@ def build_client(
         LOGGER.info("Huey is ready as %s; watching %d channel(s)", client.user, len(channel_config.request_channels))
         if reconcile_task is None or reconcile_task.done():
             reconcile_task = asyncio.create_task(
-                notification_loop(client, channel_config, processor.store, reconcile_seconds),
+                notification_loop(
+                    client,
+                    channel_config,
+                    processor.store,
+                    processor.services,
+                    reconcile_seconds,
+                ),
                 name="huey-completion-reconciliation",
             )
 

@@ -82,7 +82,7 @@ class ArrClientTests(unittest.TestCase):
         response = client.submit("Arrival")
 
         self.assertEqual(response["status"], "queued")
-        self.assertEqual(response["external_id"], "329865")
+        self.assertEqual(response["external_id"], "44")
         self.assertEqual([call[0] for call in session.calls], ["GET", "GET", "GET", "POST", "POST"])
         lookup = session.calls[0]
         self.assertTrue(lookup[1].endswith("/api/v3/movie/lookup"))
@@ -169,6 +169,59 @@ class ArrClientTests(unittest.TestCase):
         self.assertEqual(
             session.calls[-1][2]["json"], {"name": "ArtistSearch", "artistId": 55}
         )
+
+    def test_radarr_completion_requires_explicit_has_file(self):
+        for entity, expected in (
+            ({"id": 44, "hasFile": False}, False),
+            ({"id": 44, "hasFile": True}, True),
+            ({"id": 44, "movieFile": {"id": 8}}, False),
+        ):
+            with self.subTest(entity=entity):
+                session = FakeSession([FakeResponse(json_value=entity)])
+                client = RadarrClient("http://radarr:7878", "key", session=session)
+                self.assertIs(client.has_imported_media("44"), expected)
+                self.assertTrue(session.calls[0][1].endswith("/api/v3/movie/44"))
+                self.assertEqual(session.calls[0][0], "GET")
+
+    def test_sonarr_completion_uses_episode_count_or_size(self):
+        for statistics, expected in (
+            ({"episodeFileCount": 0, "sizeOnDisk": 0}, False),
+            ({"episodeFileCount": 1, "sizeOnDisk": 0}, True),
+            ({"episodeFileCount": 0, "sizeOnDisk": 2048}, True),
+            ({"episodeFileCount": "1", "sizeOnDisk": "2048"}, False),
+        ):
+            with self.subTest(statistics=statistics):
+                session = FakeSession(
+                    [FakeResponse(json_value={"id": 33, "statistics": statistics})]
+                )
+                client = SonarrClient("http://sonarr:8989", "key", session=session)
+                self.assertIs(client.has_imported_media(33), expected)
+                self.assertTrue(session.calls[0][1].endswith("/api/v3/series/33"))
+
+    def test_lidarr_completion_uses_track_count_or_size(self):
+        for statistics, expected in (
+            ({"trackFileCount": 0, "sizeOnDisk": 0}, False),
+            ({"trackFileCount": 7, "sizeOnDisk": 0}, True),
+            ({"trackFileCount": 0, "sizeOnDisk": 4096}, True),
+        ):
+            with self.subTest(statistics=statistics):
+                session = FakeSession(
+                    [FakeResponse(json_value={"id": 55, "statistics": statistics})]
+                )
+                client = LidarrClient("http://lidarr:8686", "key", session=session)
+                self.assertIs(client.has_imported_media(55), expected)
+                self.assertTrue(session.calls[0][1].endswith("/api/v1/artist/55"))
+
+    def test_completion_probe_rejects_invalid_entity_and_response(self):
+        client = RadarrClient(
+            "http://radarr:7878",
+            "key",
+            session=FakeSession([FakeResponse(json_value=[])]),
+        )
+        with self.assertRaisesRegex(ServiceError, "invalid entity ID"):
+            client.has_imported_media("not-an-id")
+        with self.assertRaisesRegex(ServiceError, "invalid entity response"):
+            client.has_imported_media(44)
 
 
 class ProwlarrClientTests(unittest.TestCase):

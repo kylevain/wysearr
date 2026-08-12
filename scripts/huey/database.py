@@ -328,6 +328,45 @@ class RequestStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def queued_arr_requests(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return queued requests whose ARR entity may now contain imported media."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE status = 'queued'
+                  AND service IN ('sonarr', 'radarr', 'lidarr')
+                ORDER BY updated_at, id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_arr_completed(self, request_id: int, message: str) -> bool:
+        """Atomically complete a still-queued ARR request and append one event."""
+
+        if not message or not message.strip():
+            raise ValueError("ARR completion requires an event message")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE requests
+                SET status = 'completed', updated_at = CURRENT_TIMESTAMP, error = NULL
+                WHERE id = ? AND status = 'queued'
+                  AND service IN ('sonarr', 'radarr', 'lidarr')
+                """,
+                (request_id,),
+            )
+            if cursor.rowcount != 1:
+                return False
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (request_id, "arr_completed", message.strip()[:2000]),
+            )
+            return True
+
     def mark_notified(self, request_id: int, message: str) -> bool:
         """Atomically mark a terminal request notified exactly once."""
 

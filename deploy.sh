@@ -81,7 +81,10 @@ if [ ! -w state/huey ] || { [ -e state/huey/huey.db ] && [ ! -w state/huey/huey.
 fi
 
 docker compose config --quiet
-python3 scripts/backup.py --quiet
+deployment_id="$(date -u +%Y%m%d-%H%M%S)-$$"
+python3 scripts/backup.py \
+    --output "$stack_root/backups/pre-deploy-$deployment_id" \
+    --quiet
 
 docker compose pull --ignore-buildable
 docker compose build --pull bookbot huey
@@ -110,6 +113,9 @@ docker compose up -d --build --remove-orphans bookbot huey
 wait_for_health 300 bookbot huey
 
 python3 scripts/validate.py
+python3 scripts/backup.py \
+    --output "$stack_root/backups/post-deploy-$deployment_id" \
+    --quiet
 
 echo "PASS: WyseARR production stack deployed and validated"
 docker compose ps

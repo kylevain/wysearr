@@ -4,16 +4,22 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 HUEY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HUEY_ROOT))
 
 from config import ChannelConfigError, validate_channel_config
+from clients import ServiceError
 from healthcheck import is_ready
 from database import RequestStore
-from huey import reconcile_notifications, validate_discord_channels
+from huey import (
+    notification_loop,
+    reconcile_arr_requests,
+    reconcile_notifications,
+    validate_discord_channels,
+)
 
 
 REQUESTS = {
@@ -124,6 +130,28 @@ class FakeClient:
         return self.channels[channel_id]
 
 
+class FakeArrCompletionClient:
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.entity_ids = []
+
+    def has_imported_media(self, entity_id):
+        self.entity_ids.append(entity_id)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
+class FakeServices:
+    def __init__(self, clients):
+        self.clients = clients
+        self.requested = []
+
+    def arr(self, service):
+        self.requested.append(service)
+        return self.clients[service]
+
+
 class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -186,6 +214,89 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         config = validate_channel_config({"requests": REQUESTS})
         self.assertEqual(await self.reconcile(FakeClient({}), config), 0)
         self.assertEqual(len(self.store.pending_notifications()), 1)
+
+    async def test_arr_completion_transitions_once_then_notifier_delivers(self):
+        self.store.transition(
+            self.request["id"],
+            "queued",
+            "Queued in Radarr",
+            service="radarr",
+            external_id="44",
+            external_title="Arrival",
+        )
+        arr_client = FakeArrCompletionClient(True)
+        services = FakeServices({"radarr": arr_client})
+
+        self.assertEqual(reconcile_arr_requests(self.store, services), 1)
+        self.assertEqual(reconcile_arr_requests(self.store, services), 0)
+        self.assertEqual(arr_client.entity_ids, ["44"])
+        events = self.store.events_for(self.request["id"])
+        self.assertEqual(
+            [event["event_type"] for event in events].count("arr_completed"), 1
+        )
+
+        original_message = FakeMessage()
+        client = FakeClient({2: FakeChannel(original_message)})
+        config = validate_channel_config({"requests": REQUESTS})
+        self.assertEqual(await self.reconcile(client, config), 1)
+        self.assertIn("now available", original_message.replies[0])
+
+    async def test_arr_without_files_remains_queued(self):
+        self.store.transition(
+            self.request["id"],
+            "queued",
+            "Queued in Sonarr",
+            service="sonarr",
+            external_id="33",
+        )
+        arr_client = FakeArrCompletionClient(False)
+        services = FakeServices({"sonarr": arr_client})
+
+        self.assertEqual(reconcile_arr_requests(self.store, services), 0)
+        self.assertEqual(self.store.get_request(self.request["id"])["status"], "queued")
+        self.assertEqual(arr_client.entity_ids, ["33"])
+
+    async def test_arr_probe_error_or_missing_entity_remains_queued(self):
+        self.store.transition(
+            self.request["id"],
+            "queued",
+            "Queued in Lidarr",
+            service="lidarr",
+            external_id="55",
+        )
+        services = FakeServices(
+            {"lidarr": FakeArrCompletionClient(ServiceError("lidarr rejected the request"))}
+        )
+
+        with self.assertLogs("huey", level="WARNING") as logs:
+            self.assertEqual(reconcile_arr_requests(self.store, services), 0)
+        self.assertEqual(self.store.get_request(self.request["id"])["status"], "queued")
+        self.assertTrue(any("deferred" in line for line in logs.output))
+
+    async def test_notification_loop_probes_arr_before_terminal_notifications(self):
+        client = Mock()
+        client.is_closed.return_value = False
+        config = validate_channel_config({"requests": REQUESTS})
+        order = []
+
+        def reconcile_arr(_store, _services):
+            order.append("arr")
+
+        async def reconcile_discord(_client, _config, _store):
+            order.append("notifications")
+
+        async def stop_after_cycle(_seconds):
+            raise asyncio.CancelledError
+
+        with (
+            patch("huey.reconcile_arr_requests", side_effect=reconcile_arr),
+            patch("huey.reconcile_notifications", side_effect=reconcile_discord),
+            patch("huey.asyncio.to_thread", new=AsyncMock(side_effect=lambda fn, *args: fn(*args))),
+            patch("huey.asyncio.sleep", side_effect=stop_after_cycle),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await notification_loop(client, config, self.store, object(), 30)
+        self.assertEqual(order, ["arr", "notifications"])
 
 
 class DiscordChannelValidationTests(unittest.IsolatedAsyncioTestCase):

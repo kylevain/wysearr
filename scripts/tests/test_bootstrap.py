@@ -48,7 +48,7 @@ def indexer_schema(spec):
         "supportsRss": True,
         "supportsSearch": True,
         "appProfileId": 1,
-        "priority": 25,
+        "priority": 20,
         "fields": [{"name": "baseUrl", "value": "https://old.invalid/"}],
     }
 
@@ -459,7 +459,9 @@ class ProwlarrTests(unittest.TestCase):
         self.assertEqual(
             bootstrap.get_provider_field(created, "baseUrl"), "https://nyaa.si/"
         )
-        self.assertEqual(len(reporter.warnings), 3)
+        self.assertEqual(
+            len(reporter.warnings), len(bootstrap.PUBLIC_INDEXERS) - 1
+        )
         self.assertNotIn("never-print-this", " ".join(reporter.warnings))
         self.assertIn("[redacted]", " ".join(reporter.warnings))
 
