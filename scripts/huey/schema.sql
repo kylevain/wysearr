@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     discord_user_id TEXT NOT NULL,
     discord_username TEXT NOT NULL,
     channel_id TEXT NOT NULL,
@@ -9,7 +10,12 @@ CREATE TABLE IF NOT EXISTS requests (
     raw_request TEXT NOT NULL,
     title TEXT,
     author TEXT,
-    status TEXT NOT NULL DEFAULT 'new'
+    status TEXT NOT NULL DEFAULT 'new',
+    service TEXT,
+    external_id TEXT,
+    external_title TEXT,
+    error TEXT,
+    notified_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
