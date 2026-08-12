@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import re
 from typing import Any, Mapping
+from urllib.parse import parse_qs, urlparse
 
 try:
     from .clients import ProwlarrClient, QBittorrentClient, ServiceError
@@ -21,6 +25,80 @@ PROWLARR_CATEGORIES = {
     "roms": (4050, 1000, 8000),
     "sheet-music": (7010, 7000),
 }
+INFO_HASH = re.compile(r"^[a-fA-F0-9]{40}(?:[a-fA-F0-9]{24})?$")
+
+
+def normalize_info_hash(value: object) -> str | None:
+    text = str(value or "").strip()
+    if INFO_HASH.fullmatch(text):
+        return text.lower()
+    if len(text) == 32:
+        try:
+            decoded = base64.b32decode(text.upper())
+        except (ValueError, TypeError):
+            return None
+        return decoded.hex() if len(decoded) == 20 else None
+    return None
+
+
+def magnet_info_hash(magnet: str) -> str | None:
+    for value in parse_qs(urlparse(magnet).query).get("xt", []):
+        prefix, separator, candidate = value.rpartition(":")
+        if separator and prefix.casefold().endswith("urn:btih"):
+            normalized = normalize_info_hash(candidate)
+            if normalized:
+                return normalized
+    return None
+
+
+def _bencode_end(data: bytes, position: int, depth: int = 0) -> int:
+    if depth > 100 or position >= len(data):
+        raise ValueError("invalid bencoded torrent")
+    marker = data[position : position + 1]
+    if marker == b"i":
+        end = data.find(b"e", position + 1)
+        if end < 0:
+            raise ValueError("invalid bencoded integer")
+        int(data[position + 1 : end])
+        return end + 1
+    if marker in {b"l", b"d"}:
+        cursor = position + 1
+        while cursor < len(data) and data[cursor : cursor + 1] != b"e":
+            cursor = _bencode_end(data, cursor, depth + 1)
+            if marker == b"d":
+                cursor = _bencode_end(data, cursor, depth + 1)
+        if cursor >= len(data):
+            raise ValueError("unterminated bencoded container")
+        return cursor + 1
+    colon = data.find(b":", position)
+    if colon < 0:
+        raise ValueError("invalid bencoded string")
+    length = int(data[position:colon])
+    end = colon + 1 + length
+    if length < 0 or end > len(data):
+        raise ValueError("invalid bencoded string length")
+    return end
+
+
+def torrent_info_hash(data: bytes) -> str | None:
+    if not data.startswith(b"d"):
+        return None
+    cursor = 1
+    try:
+        while cursor < len(data) and data[cursor : cursor + 1] != b"e":
+            key_end = _bencode_end(data, cursor)
+            colon = data.find(b":", cursor, key_end)
+            if colon < 0:
+                return None
+            key = data[colon + 1 : key_end]
+            value_start = key_end
+            value_end = _bencode_end(data, value_start)
+            if key == b"info":
+                return hashlib.sha1(data[value_start:value_end]).hexdigest()
+            cursor = value_end
+    except (ValueError, TypeError):
+        return None
+    return None
 
 
 class DirectAcquirer:
@@ -101,10 +179,37 @@ class DirectAcquirer:
         if not magnet and download_url.startswith("magnet:"):
             magnet = download_url
 
+        supplied_info_hash = normalize_info_hash(selected.get("infoHash"))
+        submitted_info_hash: str | None = None
+        torrent: bytes | None = None
         if magnet:
-            self.qbittorrent.add_magnet(magnet, category, tags)
+            submitted_info_hash = magnet_info_hash(magnet)
         elif download_url:
             torrent = self.prowlarr.download_torrent(download_url)
+            submitted_info_hash = torrent_info_hash(torrent)
+        if (
+            supplied_info_hash
+            and submitted_info_hash
+            and supplied_info_hash != submitted_info_hash
+        ):
+            return result(
+                "needs_selection",
+                "The release identity does not match its download source. Try a different release.",
+                service="prowlarr",
+                external_title=selected_title,
+            )
+        info_hash = submitted_info_hash or supplied_info_hash
+        if not info_hash:
+            return result(
+                "needs_selection",
+                "The best match has no stable torrent identity. Try a different or more specific release.",
+                service="prowlarr",
+                external_title=selected_title,
+            )
+
+        if magnet:
+            self.qbittorrent.add_magnet(magnet, category, tags)
+        elif torrent is not None:
             self.qbittorrent.add_torrent(torrent, category, tags)
         else:
             return result(
@@ -114,16 +219,12 @@ class DirectAcquirer:
                 external_title=selected_title,
             )
 
-        external_id = (
-            selected.get("infoHash")
-            or selected.get("guid")
-            or selected.get("indexerId")
-            or selected_title
-        )
+        if tags:
+            self.qbittorrent.add_tags(info_hash, tags)
         return result(
             "queued",
             f"Queued {selected_title} in qBittorrent.",
             service="qbittorrent",
-            external_id=external_id,
+            external_id=info_hash,
             external_title=selected_title,
         )

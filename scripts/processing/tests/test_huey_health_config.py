@@ -77,6 +77,33 @@ class HueyUpdaterTests(unittest.TestCase):
         self.assertEqual("failed", event[0])
         self.assertIn("unsupported payload", event[1])
 
+    def test_completion_updates_all_tags_and_matching_hash_requests(self) -> None:
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            connection.execute(
+                "INSERT INTO requests (id, status, torrent_hash) VALUES (44, 'downloading', ?)",
+                (HASH,),
+            )
+            connection.execute(
+                "INSERT INTO requests (id, status, torrent_hash) VALUES (45, 'downloading', NULL)"
+            )
+        destination = Path("/media/ebooks/Books/Shared")
+        self.assertTrue(
+            HueyUpdater(self.database).complete(
+                HASH, destination, "huey-42, huey-45"
+            )
+        )
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            rows = connection.execute(
+                "SELECT id, status FROM requests WHERE id IN (42,44,45) ORDER BY id"
+            ).fetchall()
+            event_ids = connection.execute(
+                "SELECT request_id FROM events WHERE event_type='completed' ORDER BY request_id"
+            ).fetchall()
+        self.assertEqual(rows, [(42, "complete"), (44, "complete"), (45, "complete")])
+        self.assertEqual(event_ids, [(42,), (44,), (45,)])
+
     def test_missing_or_incompatible_database_is_non_blocking(self) -> None:
         self.assertFalse(HueyUpdater(None).complete(HASH, Path("/media/book")))
         incompatible = Path(self.temporary.name) / "incompatible.db"

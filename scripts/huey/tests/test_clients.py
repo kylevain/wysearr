@@ -19,11 +19,12 @@ from clients import (
 
 
 class FakeResponse:
-    def __init__(self, status=200, json_value=None, text="Ok.", content=b""):
+    def __init__(self, status=200, json_value=None, text="Ok.", content=b"", headers=None):
         self.status_code = status
         self._json = json_value
         self.text = text
         self.content = content
+        self.headers = dict(headers or {})
 
     def json(self):
         if isinstance(self._json, Exception):
@@ -173,6 +174,25 @@ class ProwlarrClientTests(unittest.TestCase):
         client.download_torrent("https://downloads.invalid/release.torrent")
         self.assertNotIn("X-Api-Key", session.calls[0][2]["headers"])
 
+    def test_cross_origin_redirect_strips_api_key_and_disables_automatic_redirects(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    status=302,
+                    headers={"Location": "https://downloads.invalid/release.torrent"},
+                ),
+                FakeResponse(content=b"torrent bytes"),
+            ]
+        )
+        client = ProwlarrClient("http://prowlarr:9696", "key", session=session)
+        self.assertEqual(
+            client.download_torrent("/api/v1/download/1"), b"torrent bytes"
+        )
+        self.assertEqual(session.calls[0][2]["headers"]["X-Api-Key"], "key")
+        self.assertNotIn("X-Api-Key", session.calls[1][2]["headers"])
+        self.assertFalse(session.calls[0][2]["allow_redirects"])
+        self.assertFalse(session.calls[1][2]["allow_redirects"])
+
 
 class QBittorrentClientTests(unittest.TestCase):
     def test_cookie_login_category_and_magnet_submission(self):
@@ -203,6 +223,17 @@ class QBittorrentClientTests(unittest.TestCase):
         with self.assertRaisesRegex(ServiceError, "authentication"):
             client.add_magnet("magnet:?xt=urn:btih:abc", "huey-ebooks")
         self.assertEqual(len(session.calls), 1)
+
+    def test_add_tags_authenticates_and_targets_exact_hash(self):
+        session = FakeSession([FakeResponse(), FakeResponse()])
+        client = QBittorrentClient("http://qbittorrent:8080", "u", "p", session=session)
+        torrent_hash = "a" * 40
+        client.add_tags(torrent_hash, "huey-42")
+        self.assertTrue(session.calls[-1][1].endswith("/api/v2/torrents/addTags"))
+        self.assertEqual(
+            session.calls[-1][2]["data"],
+            {"hashes": torrent_hash, "tags": "huey-42"},
+        )
 
 
 if __name__ == "__main__":

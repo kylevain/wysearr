@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 LOGGER = logging.getLogger(__name__)
-HUEY_TAG = re.compile(r"(?:^|[,\s])huey[-:](\d+)(?:$|[,\s])", re.IGNORECASE)
+HUEY_TAG = re.compile(r"(?:^|[,\s])huey[-:](\d+)(?=$|[,\s])", re.IGNORECASE)
 HASH_COLUMNS = ("torrent_hash", "download_hash", "external_id")
 
 
@@ -85,27 +85,30 @@ class HueyUpdater:
             if not request_columns or "id" not in request_columns:
                 return False
 
-            request_id = self._request_id_from_tags(tags)
-            if request_id is None:
-                hash_column = next(
-                    (column for column in HASH_COLUMNS if column in request_columns),
-                    None,
+            request_ids = set(self._request_ids_from_tags(tags))
+            hash_column = next(
+                (column for column in HASH_COLUMNS if column in request_columns),
+                None,
+            )
+            if hash_column is not None:
+                request_ids.update(
+                    int(row[0])
+                    for row in connection.execute(
+                        f"SELECT id FROM requests WHERE lower({hash_column}) = lower(?)",
+                        (torrent_hash,),
+                    ).fetchall()
                 )
-                if hash_column is None:
-                    return False
-                row = connection.execute(
-                    f"SELECT id FROM requests WHERE {hash_column} = ? ORDER BY id DESC LIMIT 1",
-                    (torrent_hash,),
-                ).fetchone()
-                if row is None:
-                    return False
-                request_id = int(row[0])
-            else:
-                row = connection.execute(
-                    "SELECT id FROM requests WHERE id = ?", (request_id,)
-                ).fetchone()
-                if row is None:
-                    return False
+            if not request_ids:
+                return False
+            existing_ids = {
+                int(row[0])
+                for row in connection.execute(
+                    f"SELECT id FROM requests WHERE id IN ({','.join('?' for _ in request_ids)})",
+                    tuple(sorted(request_ids)),
+                ).fetchall()
+            }
+            if not existing_ids:
+                return False
 
             assignments: list[str] = []
             values: list[object] = []
@@ -128,33 +131,27 @@ class HueyUpdater:
                 values.append(error)
             if "updated_at" in request_columns:
                 assignments.append("updated_at = CURRENT_TIMESTAMP")
-            if assignments:
-                values.append(request_id)
-                connection.execute(
-                    f"UPDATE requests SET {', '.join(assignments)} WHERE id = ?",
-                    values,
-                )
-
             event_columns = {
                 str(row[1])
                 for row in connection.execute("PRAGMA table_info(events)").fetchall()
             }
             required = {"request_id", "event_type", "message"}
-            if required.issubset(event_columns):
-                connection.execute(
-                    """
-                    INSERT INTO events (request_id, event_type, message)
-                    VALUES (?, ?, ?)
-                    """,
-                    (
-                        request_id,
-                        event_type,
-                        message[:2000],
-                    ),
-                )
+            for request_id in sorted(existing_ids):
+                if assignments:
+                    connection.execute(
+                        f"UPDATE requests SET {', '.join(assignments)} WHERE id = ?",
+                        (*values, request_id),
+                    )
+                if required.issubset(event_columns):
+                    connection.execute(
+                        """
+                        INSERT INTO events (request_id, event_type, message)
+                        VALUES (?, ?, ?)
+                        """,
+                        (request_id, event_type, message[:2000]),
+                    )
             return True
 
     @staticmethod
-    def _request_id_from_tags(tags: str) -> int | None:
-        match = HUEY_TAG.search(tags or "")
-        return int(match.group(1)) if match else None
+    def _request_ids_from_tags(tags: str) -> tuple[int, ...]:
+        return tuple(int(value) for value in HUEY_TAG.findall(tags or ""))

@@ -7,8 +7,8 @@ from unittest.mock import Mock
 HUEY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HUEY_ROOT))
 
-from acquisition import PROWLARR_CATEGORIES, DirectAcquirer
-from matching import normalize_text, select_release
+from acquisition import PROWLARR_CATEGORIES, DirectAcquirer, magnet_info_hash, torrent_info_hash
+from matching import normalize_text, select_arr_candidate, select_release
 
 
 class MatchingTests(unittest.TestCase):
@@ -43,6 +43,26 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(low.reason, "low_confidence")
         self.assertEqual(empty.reason, "no_results")
 
+    def test_arr_duplicate_exact_titles_require_a_year(self):
+        candidates = [
+            {"title": "King Kong", "year": 1933, "tmdbId": 244},
+            {"title": "King Kong", "year": 2005, "tmdbId": 254},
+        ]
+        self.assertIsNone(select_arr_candidate("King Kong", candidates))
+        self.assertEqual(
+            select_arr_candidate("King Kong 2005", candidates)["tmdbId"], 254
+        )
+
+    def test_arr_query_year_rejects_wrong_year_even_when_title_is_exact(self):
+        candidates = [
+            {"title": "The Thing", "year": 1982, "tmdbId": 1091},
+            {"title": "The Thing", "year": 2011, "tmdbId": 60935},
+        ]
+        self.assertEqual(
+            select_arr_candidate("The Thing 1982", reversed(candidates))["tmdbId"],
+            1091,
+        )
+
 
 class DirectAcquirerTests(unittest.TestCase):
     def setUp(self):
@@ -58,30 +78,35 @@ class DirectAcquirerTests(unittest.TestCase):
         self.assertEqual(PROWLARR_CATEGORIES["sheet-music"], (7010, 7000))
 
     def test_magnet_is_submitted_with_media_category(self):
+        info_hash = "a" * 40
         self.prowlarr.search.return_value = [
             {
                 "title": "The Hobbit JRR Tolkien EPUB",
                 "seeders": 20,
                 "guid": "g1",
-                "magnetUrl": "magnet:?xt=urn:btih:safe",
+                "infoHash": info_hash,
+                "magnetUrl": f"magnet:?xt=urn:btih:{info_hash}",
             }
         ]
         response = self.acquirer.submit("ebooks", "The Hobbit", "JRR Tolkien", 42)
         self.assertEqual(response["status"], "queued")
-        self.assertEqual(response["external_id"], "g1")
+        self.assertEqual(response["external_id"], info_hash)
         self.prowlarr.search.assert_called_once_with(
             "The Hobbit JRR Tolkien", (7020, 7000)
         )
         self.qbittorrent.add_magnet.assert_called_once_with(
-            "magnet:?xt=urn:btih:safe", "ebooks", "huey-42"
+            f"magnet:?xt=urn:btih:{info_hash}", "ebooks", "huey-42"
         )
+        self.qbittorrent.add_tags.assert_called_once_with(info_hash, "huey-42")
 
     def test_torrent_download_is_forwarded_as_bytes(self):
+        info_hash = "b" * 40
         self.prowlarr.search.return_value = [
             {
                 "title": "Chrono Trigger SNES USA ROM",
                 "seeders": 40,
                 "guid": "g2",
+                "infoHash": info_hash,
                 "downloadUrl": "https://prowlarr.invalid/download?secret=redacted",
             }
         ]
@@ -91,6 +116,7 @@ class DirectAcquirerTests(unittest.TestCase):
         self.qbittorrent.add_torrent.assert_called_once_with(
             b"torrent", "roms", "huey-43"
         )
+        self.qbittorrent.add_tags.assert_called_once_with(info_hash, "huey-43")
 
     def test_ambiguous_results_never_submit(self):
         self.prowlarr.search.return_value = [
@@ -122,6 +148,41 @@ class DirectAcquirerTests(unittest.TestCase):
         ]
         response = self.acquirer.submit("ebooks", "The Hobbit", "JRR Tolkien")
         self.assertEqual(response["status"], "needs_selection")
+
+    def test_missing_stable_identity_never_submits(self):
+        self.prowlarr.search.return_value = [
+            {
+                "title": "The Hobbit JRR Tolkien EPUB",
+                "seeders": 20,
+                "magnetUrl": "magnet:?dn=missing-hash",
+            }
+        ]
+        response = self.acquirer.submit("ebooks", "The Hobbit", "JRR Tolkien")
+        self.assertEqual(response["status"], "needs_selection")
+        self.qbittorrent.add_magnet.assert_not_called()
+
+    def test_mismatched_result_and_magnet_hash_never_submit(self):
+        self.prowlarr.search.return_value = [
+            {
+                "title": "The Hobbit JRR Tolkien EPUB",
+                "seeders": 20,
+                "infoHash": "a" * 40,
+                "magnetUrl": f"magnet:?xt=urn:btih:{'b' * 40}",
+            }
+        ]
+        response = self.acquirer.submit("ebooks", "The Hobbit", "JRR Tolkien")
+        self.assertEqual(response["status"], "needs_selection")
+        self.qbittorrent.add_magnet.assert_not_called()
+        self.qbittorrent.add_tags.assert_not_called()
+
+    def test_info_hash_helpers_support_magnet_and_torrent_file(self):
+        info = b"d4:name4:teste"
+        torrent = b"d4:info" + info + b"e"
+        expected = __import__("hashlib").sha1(info).hexdigest()
+        self.assertEqual(torrent_info_hash(torrent), expected)
+        self.assertEqual(
+            magnet_info_hash(f"magnet:?xt=urn:btih:{expected.upper()}"), expected
+        )
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 from urllib.parse import urljoin, urlparse
@@ -339,19 +340,37 @@ class ProwlarrClient(JsonClient):
         if parsed.username or parsed.password:
             raise ServiceError("Prowlarr result has an invalid download source.")
         base = urlparse(self.base_url)
-        headers = self.headers if (parsed.scheme, parsed.netloc) == (base.scheme, base.netloc) else {}
-        try:
-            response = self.session.request(
-                "GET",
-                download_url,
-                headers=headers,
-                timeout=self.timeout,
-            )
-        except requests.RequestException as error:
-            raise ServiceError("Prowlarr could not retrieve the selected torrent.") from error
-        if response.status_code not in range(200, 300) or not response.content:
-            raise ServiceError("Prowlarr could not retrieve the selected torrent.")
-        return bytes(response.content)
+        for _redirect in range(4):
+            parsed = urlparse(download_url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.username
+                or parsed.password
+            ):
+                raise ServiceError("Prowlarr result has an invalid download source.")
+            same_origin = (parsed.scheme, parsed.netloc) == (base.scheme, base.netloc)
+            headers = self.headers if same_origin else {}
+            try:
+                response = self.session.request(
+                    "GET",
+                    download_url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                )
+            except requests.RequestException as error:
+                raise ServiceError("Prowlarr could not retrieve the selected torrent.") from error
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("Location", "")
+                if not location:
+                    raise ServiceError("Prowlarr returned an invalid download redirect.")
+                download_url = urljoin(download_url, location)
+                continue
+            if response.status_code not in range(200, 300) or not response.content:
+                raise ServiceError("Prowlarr could not retrieve the selected torrent.")
+            return bytes(response.content)
+        raise ServiceError("Prowlarr returned too many download redirects.")
 
 
 class QBittorrentClient(JsonClient):
@@ -423,4 +442,15 @@ class QBittorrentClient(JsonClient):
             category=category,
             data=data,
             files={"torrents": ("huey-request.torrent", torrent, "application/x-bittorrent")},
+        )
+
+    def add_tags(self, torrent_hash: str, tags: str) -> None:
+        if not re.fullmatch(r"[a-fA-F0-9]{40}(?:[a-fA-F0-9]{24})?", torrent_hash):
+            raise ServiceError("Selected result has an invalid torrent identity.")
+        self.login()
+        self._request(
+            "POST",
+            "/api/v2/torrents/addTags",
+            data={"hashes": torrent_hash.lower(), "tags": tags},
+            parse_json=False,
         )

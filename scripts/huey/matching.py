@@ -158,24 +158,54 @@ def select_arr_candidate(title: str, items: Iterable[Mapping[str, Any]]) -> Mapp
             or ""
         )
 
-    scored = [
-        (
-            title_similarity(title, candidate_title(item)),
-            normalize_text(candidate_title(item)),
-            str(
-                item.get("tvdbId")
-                or item.get("tmdbId")
-                or item.get("foreignArtistId")
-                or item.get("id")
-                or ""
-            ),
-            item,
+    year_match = re.search(r"\b((?:18|19|20|21)\d{2})\b", title)
+    wanted_year = int(year_match.group(1)) if year_match else None
+    wanted_title = (
+        " ".join((title[: year_match.start()] + " " + title[year_match.end() :]).split())
+        if year_match
+        else title
+    )
+
+    def candidate_year(item: Mapping[str, Any]) -> int | None:
+        raw = item.get("year")
+        if raw not in {None, "", 0, "0"}:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                pass
+        for field in ("firstAired", "premiereDate", "inCinemas", "digitalRelease"):
+            match = re.match(r"((?:18|19|20|21)\d{2})", str(item.get(field) or ""))
+            if match:
+                return int(match.group(1))
+        return None
+
+    scored = []
+    for item in items:
+        item_year = candidate_year(item)
+        similarity = title_similarity(wanted_title, candidate_title(item))
+        if wanted_year is not None:
+            if item_year is not None and item_year != wanted_year:
+                continue
+            if item_year is None:
+                similarity = max(0.0, similarity - 0.15)
+        scored.append(
+            (
+                similarity,
+                normalize_text(candidate_title(item)),
+                item_year or 0,
+                str(
+                    item.get("tvdbId")
+                    or item.get("tmdbId")
+                    or item.get("foreignArtistId")
+                    or item.get("id")
+                    or ""
+                ),
+                item,
+            )
         )
-        for item in items
-    ]
-    scored.sort(key=lambda value: (-value[0], value[1], value[2]))
+    scored.sort(key=lambda value: (-value[0], value[1], value[2], value[3]))
     if not scored or scored[0][0] < 0.62:
         return None
-    if len(scored) > 1 and scored[0][0] < 1.0 and scored[0][0] - scored[1][0] < 0.05:
+    if len(scored) > 1 and scored[0][0] - scored[1][0] < 0.05:
         return None
-    return scored[0][3]
+    return scored[0][4]
