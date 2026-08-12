@@ -5,7 +5,12 @@ from typing import Any
 
 import requests
 
-from bookbot_lib.errors import ConfigurationError, QbittorrentError
+from bookbot_lib.errors import (
+    ConfigurationError,
+    QbittorrentAuthenticationError,
+    QbittorrentError,
+    QbittorrentUnavailableError,
+)
 from bookbot_lib.qbittorrent import QbittorrentClient
 
 
@@ -78,9 +83,35 @@ class QbittorrentClientTests(unittest.TestCase):
         session = FakeSession()
         session.login_responses = [FakeResponse(status_code=403, text="Fails.")]
         client = self.make_client(session)
-        with self.assertRaises(QbittorrentError) as caught:
+        with self.assertRaises(QbittorrentAuthenticationError) as caught:
             client.application_version()
         self.assertNotIn("secret", str(caught.exception))
+
+    def test_login_connection_failure_is_retryable_unavailability(self) -> None:
+        class UnavailableSession(FakeSession):
+            def post(self, url: str, **kwargs: Any) -> FakeResponse:
+                raise requests.exceptions.ConnectionError("connection refused")
+
+        client = self.make_client(UnavailableSession())
+        with self.assertRaises(QbittorrentUnavailableError):
+            client.application_version()
+
+    def test_server_error_is_retryable_unavailability(self) -> None:
+        session = FakeSession()
+        session.login_responses = [FakeResponse(status_code=503)]
+        client = self.make_client(session)
+        with self.assertRaises(QbittorrentUnavailableError):
+            client.application_version()
+
+    def test_tls_configuration_failure_is_not_retryable_unavailability(self) -> None:
+        class InvalidTlsSession(FakeSession):
+            def post(self, url: str, **kwargs: Any) -> FakeResponse:
+                raise requests.exceptions.SSLError("certificate verify failed")
+
+        client = self.make_client(InvalidTlsSession())
+        with self.assertRaises(QbittorrentError) as caught:
+            client.application_version()
+        self.assertNotIsInstance(caught.exception, QbittorrentUnavailableError)
 
     def test_403_reauthenticates_once(self) -> None:
         session = FakeSession()

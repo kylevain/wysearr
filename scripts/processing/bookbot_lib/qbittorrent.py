@@ -7,7 +7,19 @@ from typing import Any
 
 import requests
 
-from .errors import ConfigurationError, QbittorrentError
+from .errors import (
+    ConfigurationError,
+    QbittorrentAuthenticationError,
+    QbittorrentError,
+    QbittorrentUnavailableError,
+)
+
+
+TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429})
+
+
+def _is_transient_status(status_code: int) -> bool:
+    return status_code in TRANSIENT_HTTP_STATUSES or status_code >= 500
 
 
 class QbittorrentClient:
@@ -46,11 +58,32 @@ class QbittorrentClient:
                 timeout=self.timeout_seconds,
                 verify=self.verify_tls,
             )
+        except requests.exceptions.SSLError as exc:
+            raise QbittorrentError(
+                f"qBittorrent login TLS validation failed: {exc}"
+            ) from exc
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as exc:
+            raise QbittorrentUnavailableError(
+                f"qBittorrent login request failed: {exc}"
+            ) from exc
         except requests.RequestException as exc:
             raise QbittorrentError(f"qBittorrent login request failed: {exc}") from exc
-        if response.status_code != 200 or response.text.strip() != "Ok.":
-            raise QbittorrentError(
+        if _is_transient_status(response.status_code):
+            raise QbittorrentUnavailableError(
+                f"qBittorrent login endpoint returned HTTP {response.status_code}"
+            )
+        if response.status_code in {401, 403} or (
+            response.status_code == 200 and response.text.strip() != "Ok."
+        ):
+            raise QbittorrentAuthenticationError(
                 f"qBittorrent authentication failed with HTTP {response.status_code}"
+            )
+        if response.status_code != 200:
+            raise QbittorrentError(
+                f"qBittorrent login endpoint returned HTTP {response.status_code}"
             )
         self._authenticated = True
 
@@ -74,6 +107,17 @@ class QbittorrentClient:
                 timeout=self.timeout_seconds,
                 verify=self.verify_tls,
             )
+        except requests.exceptions.SSLError as exc:
+            raise QbittorrentError(
+                f"qBittorrent API TLS validation failed: {exc}"
+            ) from exc
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as exc:
+            raise QbittorrentUnavailableError(
+                f"qBittorrent API request failed: {exc}"
+            ) from exc
         except requests.RequestException as exc:
             raise QbittorrentError(f"qBittorrent API request failed: {exc}") from exc
         if response.status_code == 403 and retry_auth:
@@ -85,6 +129,10 @@ class QbittorrentClient:
                 params=params,
                 data=data,
                 retry_auth=False,
+            )
+        if _is_transient_status(response.status_code):
+            raise QbittorrentUnavailableError(
+                f"qBittorrent API {endpoint} returned HTTP {response.status_code}"
             )
         try:
             response.raise_for_status()

@@ -13,13 +13,18 @@ import threading
 from pathlib import Path
 
 from bookbot_lib.config import BookBotConfig
-from bookbot_lib.errors import ConfigurationError
+from bookbot_lib.errors import (
+    ConfigurationError,
+    QbittorrentError,
+    QbittorrentUnavailableError,
+)
 from bookbot_lib.health import check_health_marker, write_health_marker
 from bookbot_lib.service import BookBotService
 
 
 LOGGER = logging.getLogger("bookbot")
 STOP = threading.Event()
+STARTUP_RETRY_SECONDS = 5
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -93,6 +98,26 @@ def install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, stop)
 
 
+def wait_for_startup_validation(
+    service: BookBotService,
+    *,
+    stop_event: threading.Event = STOP,
+    retry_seconds: int = STARTUP_RETRY_SECONDS,
+) -> dict[str, object] | None:
+    """Wait through transient qBittorrent outages, but propagate permanent errors."""
+    while not stop_event.is_set():
+        try:
+            return service.validate()
+        except QbittorrentUnavailableError as exc:
+            LOGGER.warning(
+                "qBittorrent unavailable during startup; retrying in %d seconds: %s",
+                retry_seconds,
+                exc,
+            )
+            stop_event.wait(retry_seconds)
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     configure_logging()
@@ -112,12 +137,17 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        validation = service.validate()
+        if args.validate:
+            validation = service.validate()
+        else:
+            install_signal_handlers()
+            validation = wait_for_startup_validation(service)
+            if validation is None:
+                return 0
         if args.validate:
             print(json.dumps({"status": "ok", **validation}, sort_keys=True))
             return 0
 
-        install_signal_handlers()
         single_cycle = args.once or args.dry_run
         while not STOP.is_set():
             try:
@@ -139,6 +169,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             STOP.wait(config.poll_seconds)
         return 0
+    except (ConfigurationError, QbittorrentError) as exc:
+        LOGGER.error("BookBot startup validation failed: %s", exc)
+        return 2
     finally:
         service.close()
 

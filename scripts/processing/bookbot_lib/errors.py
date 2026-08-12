@@ -13,6 +13,14 @@ class QbittorrentError(BookBotError):
     """A qBittorrent API request failed."""
 
 
+class QbittorrentAuthenticationError(QbittorrentError):
+    """qBittorrent rejected the configured credentials."""
+
+
+class QbittorrentUnavailableError(QbittorrentError):
+    """qBittorrent is temporarily unreachable or unable to serve requests."""
+
+
 class ImportErrorBase(BookBotError):
     """Base class for payload import failures."""
 
