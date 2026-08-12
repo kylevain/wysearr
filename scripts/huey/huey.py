@@ -7,6 +7,7 @@ from pathlib import Path
 import discord
 import yaml
 from parser import parse_request
+from handlers import HANDLERS
 
 ROOT = Path("/app")
 CONFIG = ROOT / "config" / "channels.yml"
@@ -112,9 +113,17 @@ async def on_message(message):
 
     request_id = record_request(message, media_type)
 
+    result = HANDLERS.get(media_type, lambda x: {
+        "message": "No handler configured"
+    })({
+        "id": request_id,
+        "content": message.content
+    })
+
     await message.reply(
         f"Request received #{request_id}\n"
-        f"Type: {media_type}"
+        f"Type: {media_type}\n"
+        f"{result['message']}"
     )
 
 
