@@ -409,6 +409,7 @@ class DirectAcquirer:
                     service="qbittorrent",
                     external_id=info_hash,
                     external_title=selected_title,
+                    manual_intervention=True,
                 )
             if tags:
                 try:

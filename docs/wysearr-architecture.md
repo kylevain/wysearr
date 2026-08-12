@@ -34,13 +34,19 @@ already in the expected category is correlated rather than added again. An
 imported-category record is not called complete until BookBot verifies its safe
 import ledger; another category requires administrator review.
 
-Huey immediately records the message and reports whether it was queued, needs a
-more specific request, or failed. The user does not operate qBittorrent or move
-files. Huey replies to the original message and mirrors the lifecycle update to
-`#request-status`. When an ARR or BookBot confirms an import, or BookBot rejects
-one, Huey sends the terminal result through those same available routes and
-records one logical notification state. ARR API failures remain queued for a
-later reconciliation pass rather than being guessed terminal.
+Huey immediately records the message and acknowledges it as a reply to the
+original Discord message only. The user does not operate qBittorrent or move
+files. Accepted, rejected, completed, and failed request states go to
+`#request-status`; queued acquisitions and download lifecycle updates go to
+`#download-queue`. ARR API failures remain queued for a later reconciliation
+pass rather than being guessed terminal.
+
+When an ARR or BookBot confirms a new DAS import, Huey publishes the new item to
+`#recent-additions` and the completed request state to `#request-status` as two
+distinct events. An import failure sends the failed request state to
+`#request-status` and the operator-facing failure or manual-action notice to
+`#import-errors`. Runtime and service health issues alone may use
+`#system-health`. Lifecycle events are not copied back into request channels.
 
 For movies and TV, completion currently proves that Sonarr or Radarr reports an
 imported media file on the DAS. No Plex scan is yet requested or accepted as
@@ -49,11 +55,10 @@ Plex library manually until that integration is authorized. For direct media,
 completion proves BookBot's validated, atomic copy to the configured DAS path;
 it does not prove that the downstream library application has indexed the item.
 
-`#download-queue`, `#recent-additions`, `#automation-admin`, `#import-errors`,
-and `#system-health` are reserved inventory entries, not active Huey feeds.
-Normal internal download, rename, import, retention, and subtitle events
-therefore do not create Discord chatter. Operators use the service UIs, logs,
-and production validator for those views.
+Huey is the sole Discord notification producer. Native Discord integrations in
+Radarr, Sonarr, Lidarr, and Bazarr remain disabled so lifecycle events cannot
+bypass Huey's routing or be emitted twice. `#automation-admin` is not part of the
+lifecycle route set.
 
 Music and adult-library requests currently use their Lidarr and Whisparr Web
 UIs because no Discord channels are assigned to those media types.
@@ -61,8 +66,9 @@ UIs because no Discord channels are assigned to those media types.
 Bazarr manages subtitles for Sonarr and Radarr with the default English profile.
 A matching embedded English subtitle satisfies that profile, so the absence of
 an external `.srt` file is not a failure. External subtitle availability is
-content- and provider-dependent, and Bazarr does not post subtitle events to
-Discord.
+content- and provider-dependent. Bazarr does not post routine subtitle events to
+Discord; only a routed runtime or service health issue belongs in
+`#system-health`.
 
 ## Data placement
 

@@ -18,12 +18,13 @@ Post one request per message in the matching Discord request channel:
 | `#roms` | `Game Title platform` | Prowlarr, qBittorrent, BookBot |
 | `#sheet-music` | `Work Title composer instrument` | Prowlarr, qBittorrent, BookBot |
 
-Huey replies with a request number and persists every state change. If an exact,
-safe match cannot be selected, it asks for a more specific title instead of
-guessing. When close direct-media matches have useful metadata, that response
-shows at most three sanitized release titles with safe format/size distinctions;
-it never includes download URLs, torrent identities, credentials, or provider
-IDs.
+Huey acknowledges a request by replying to its original Discord message with a
+request number, and it persists every state change. No unthreaded acknowledgement
+is added to an intake channel. If an exact, safe match cannot be selected, Huey
+asks for a more specific title instead of guessing. When close direct-media
+matches have useful metadata, that response shows at most three sanitized release
+titles with safe format/size distinctions; it never includes download URLs,
+torrent identities, credentials, or provider IDs.
 
 Separate messages for the same exact active or completed target reuse its
 canonical request number. The identity normalizes case and whitespace but keeps
@@ -32,11 +33,22 @@ distinct; failed or selection-needed requests remain retryable. Huey also checks
 existing ARR state and exact qBittorrent hashes before starting work, and fails
 closed when an existing torrent belongs to a different media category.
 
-Acknowledgements and terminal results are delivered best-effort as a
-reply to the original request and mirrored to `#request-status`. Huey is the
-only Discord notification producer; one successful terminal route marks that
-request notified so transient delivery failure cannot create an endless retry
-loop.
+Huey routes Discord events by purpose:
+
+| Event | Destination |
+| --- | --- |
+| Request acknowledgement | Reply to the original request message only |
+| Accepted, rejected, completed, or failed request | `#request-status` |
+| Queued acquisition, active download, or download lifecycle event | `#download-queue` |
+| Newly imported DAS library item | `#recent-additions` |
+| Import failure or manual intervention required | `#import-errors` |
+| Service or runtime health issue | `#system-health` |
+
+A request completion and a new library addition are distinct events with distinct
+messages; Huey does not mirror one lifecycle message into several channels. Huey
+is the sole Discord notification producer. Native Discord connections in Radarr,
+Sonarr, Lidarr, and Bazarr remain disabled so they cannot bypass this routing or
+create duplicates.
 
 For movies and TV, `complete` currently means Sonarr or Radarr confirms that it
 imported a media file to the DAS. Huey does not yet trigger or confirm a Plex
@@ -46,11 +58,9 @@ media, `complete` means BookBot safely copied the validated payload to its
 configured DAS library path; it does not confirm that Kavita, Audiobookshelf,
 or RomM has indexed it.
 
-`#download-queue`, `#recent-additions`, `#automation-admin`, `#import-errors`,
-and `#system-health` are reserved channel names and are not currently written to
-or monitored by Huey. Use the service UIs, logs, and production validator for
-those operational views. Bazarr does not post routine subtitle activity to
-Discord.
+`#automation-admin` remains outside the lifecycle route set. Bazarr does not post
+routine subtitle activity to Discord; any future Bazarr runtime health event must
+enter Huey's shared routing path and may use only `#system-health`.
 
 Music is managed through Lidarr's Web UI. Whisparr is likewise operated through
 its Web UI because neither has a configured Discord request channel.

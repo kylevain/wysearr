@@ -53,7 +53,8 @@ def result(
     service: str | None = None,
     external_id: str | int | None = None,
     external_title: str | None = None,
-) -> dict[str, str | None]:
+    manual_intervention: bool = False,
+) -> dict[str, str | bool | None]:
     if status not in RESULT_STATUSES:
         raise ValueError(f"Invalid handler result status: {status}")
     if not isinstance(message, str) or not message.strip():
@@ -64,10 +65,11 @@ def result(
         "service": service,
         "external_id": str(external_id) if external_id is not None else None,
         "external_title": external_title,
+        "manual_intervention": bool(manual_intervention),
     }
 
 
-def normalize_result(value: Any) -> dict[str, str | None]:
+def normalize_result(value: Any) -> dict[str, str | bool | None]:
     if not isinstance(value, dict):
         raise ValueError("Handler returned an invalid result")
     return result(
@@ -76,4 +78,5 @@ def normalize_result(value: Any) -> dict[str, str | None]:
         service=value.get("service"),
         external_id=value.get("external_id"),
         external_title=value.get("external_title"),
+        manual_intervention=value.get("manual_intervention") is True,
     )

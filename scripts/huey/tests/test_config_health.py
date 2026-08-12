@@ -2,6 +2,7 @@ import importlib
 import asyncio
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -16,9 +17,11 @@ from clients import ServiceError
 from handlers import HANDLERS
 from healthcheck import is_ready
 from database import RequestStore
+from orchestrator import RequestProcessor
+from results import result
 from services import ServiceRegistry
 from huey import (
-    format_completion_notification,
+    build_client,
     notification_loop,
     reconcile_arr_requests,
     reconcile_notifications,
@@ -34,6 +37,25 @@ REQUESTS = {
     "roms": 5,
     "sheet-music": 6,
 }
+
+ACTIVITY = {
+    "download-queue": 20,
+    "request-status": 21,
+    "recent-additions": 22,
+}
+
+SYSTEM = {
+    "import-errors": 30,
+    "system-health": 31,
+}
+
+
+def channel_mapping() -> dict[str, dict[str, int]]:
+    return {
+        "requests": dict(REQUESTS),
+        "activity": dict(ACTIVITY),
+        "system": dict(SYSTEM),
+    }
 
 
 def read_production_channel_map() -> dict[str, dict[str, int]]:
@@ -70,28 +92,57 @@ class ConfigTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            config.request_status_channel,
-            str(raw["activity"]["request-status"]),
+            config.lifecycle_channels,
+            {
+                route: str(raw[section][route])
+                for section, routes in (
+                    (
+                        "activity",
+                        ("download-queue", "request-status", "recent-additions"),
+                    ),
+                    ("system", ("import-errors", "system-health")),
+                )
+                for route in routes
+            },
         )
-        self.assertEqual(
-            set(vars(config)), {"request_channels", "request_status_channel"}
-        )
-        reserved_ids = {
+        lifecycle_ids = {
             str(channel_id)
             for group, channels in raw.items()
             if group in {"activity", "system"}
             for name, channel_id in channels.items()
-            if name != "request-status"
         }
-        parsed_ids = set(config.request_channels) | {config.request_status_channel}
-        self.assertTrue(reserved_ids.isdisjoint(parsed_ids))
+        self.assertEqual(len(lifecycle_ids), 6)
+        self.assertTrue(lifecycle_ids.isdisjoint(config.request_channels))
 
     def test_valid_config_inverts_request_mapping_and_reads_status(self):
-        config = validate_channel_config(
-            {"requests": REQUESTS, "activity": {"request-status": 20}}
-        )
+        config = validate_channel_config(channel_mapping())
         self.assertEqual(config.request_channels["1"], "movies-tv")
-        self.assertEqual(config.request_status_channel, "20")
+        self.assertEqual(
+            config.lifecycle_channels,
+            {
+                "download-queue": "20",
+                "request-status": "21",
+                "recent-additions": "22",
+                "import-errors": "30",
+                "system-health": "31",
+            },
+        )
+        for route, channel_id in config.lifecycle_channels.items():
+            self.assertEqual(config.channel_for(route), channel_id)
+
+    def test_all_lifecycle_routes_are_required(self):
+        for section, route in (
+            ("activity", "download-queue"),
+            ("activity", "request-status"),
+            ("activity", "recent-additions"),
+            ("system", "import-errors"),
+            ("system", "system-health"),
+        ):
+            with self.subTest(route=route):
+                raw = channel_mapping()
+                del raw[section][route]
+                with self.assertRaisesRegex(ChannelConfigError, route):
+                    validate_channel_config(raw)
 
     def test_missing_required_channel_is_rejected(self):
         with self.assertRaisesRegex(ChannelConfigError, "Missing"):
@@ -109,11 +160,18 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ChannelConfigError, "Unsupported"):
             validate_channel_config({"requests": {**REQUESTS, "unknown": 8}})
 
-    def test_status_channel_cannot_also_be_a_request_channel(self):
-        with self.assertRaisesRegex(ChannelConfigError, "separate"):
-            validate_channel_config(
-                {"requests": REQUESTS, "activity": {"request-status": 2}}
-            )
+    def test_lifecycle_channels_are_unique_from_every_other_channel(self):
+        for section, route, duplicate_id in (
+            ("activity", "request-status", REQUESTS["ebooks"]),
+            ("activity", "download-queue", ACTIVITY["request-status"]),
+            ("system", "import-errors", ACTIVITY["recent-additions"]),
+            ("system", "system-health", SYSTEM["import-errors"]),
+        ):
+            with self.subTest(route=route):
+                raw = channel_mapping()
+                raw[section][route] = duplicate_id
+                with self.assertRaisesRegex(ChannelConfigError, "more than one|separate|unique"):
+                    validate_channel_config(raw)
 
 
 class HealthAndImportTests(unittest.TestCase):
@@ -187,6 +245,18 @@ class FakeChannel:
         self.sent.append(message)
 
 
+class FailOnceChannel(FakeChannel):
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    async def send(self, message):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError("transient Discord failure")
+        await super().send(message)
+
+
 class FakePermissions:
     def __init__(self, *, view=True, send=True, history=True):
         self.view_channel = view
@@ -215,6 +285,55 @@ class FakeClient:
         if channel_id not in self.channels:
             raise LookupError("missing")
         return self.channels[channel_id]
+
+
+class FakeDiscordClient(FakeClient):
+    def __init__(self, *, intents):
+        super().__init__({})
+        self.intents = intents
+
+    def event(self, callback):
+        setattr(self, callback.__name__, callback)
+        return callback
+
+    def is_closed(self):
+        return False
+
+
+class FakeIntents:
+    message_content = False
+
+    @classmethod
+    def default(cls):
+        return cls()
+
+
+class FakeIncomingMessage(FakeMessage):
+    def __init__(self, *, message_id, channel, content):
+        super().__init__()
+        self.id = message_id
+        self.channel = channel
+        self.content = content
+        self.webhook_id = None
+        self.author = type(
+            "Author",
+            (),
+            {
+                "id": 99,
+                "bot": False,
+                "__str__": lambda _self: "reader",
+            },
+        )()
+
+
+class FailReplyIncomingMessage(FakeIncomingMessage):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reply_attempts = 0
+
+    async def reply(self, _message):
+        self.reply_attempts += 1
+        raise RuntimeError("Discord reply failed")
 
 
 class FakeArrCompletionClient:
@@ -267,55 +386,111 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         with patch("huey.asyncio.to_thread", new=direct_call):
             return await reconcile_notifications(client, config, self.store)
 
-    async def test_completion_replies_and_posts_status_once(self):
-        self.store.transition(self.request["id"], "complete", "BookBot imported media")
+    async def test_bookbot_completion_routes_status_and_addition_once_without_reply(self):
+        self.store.transition(
+            self.request["id"],
+            "complete",
+            "BookBot imported media",
+            event_type="completed",
+            service="bookbot",
+            external_title="Dune EPUB",
+        )
         original_message = FakeMessage()
         original_channel = FakeChannel(original_message)
         status_channel = FakeChannel()
-        client = FakeClient({2: original_channel, 20: status_channel})
-        config = validate_channel_config(
-            {"requests": REQUESTS, "activity": {"request-status": 20}}
+        addition_channel = FakeChannel()
+        client = FakeClient(
+            {2: original_channel, 21: status_channel, 22: addition_channel}
         )
+        config = validate_channel_config(channel_mapping())
 
-        self.assertEqual(await self.reconcile(client, config), 1)
-        self.assertEqual(await self.reconcile(client, config), 0)
-        self.assertEqual(len(original_message.replies), 1)
+        await self.reconcile(client, config)
+        await self.reconcile(client, config)
+        self.assertEqual(original_message.replies, [])
         self.assertEqual(len(status_channel.sent), 1)
-        self.assertIn("safely imported to its DAS library path", original_message.replies[0])
+        self.assertEqual(len(addition_channel.sent), 1)
+        self.assertNotEqual(status_channel.sent[0], addition_channel.sent[0])
+        combined = " ".join(status_channel.sent + addition_channel.sent)
+        self.assertIn("DAS library path", combined)
+        self.assertNotIn("Plex", combined)
         saved = self.store.get_request(self.request["id"])
         self.assertIsNotNone(saved["notified_at"])
 
-    def test_terminal_notification_sanitizes_persisted_external_title(self):
-        notification = format_completion_notification(
+    async def test_bookbot_failure_routes_status_and_import_error_without_reply(self):
+        self.store.transition(
+            self.request["id"],
+            "failed",
+            "Import failed",
+            event_type="failed",
+            service="bookbot",
+            external_title="Dune EPUB",
+            error="Retry limit reached",
+        )
+        original_message = FakeMessage()
+        status_channel = FakeChannel()
+        error_channel = FakeChannel()
+        client = FakeClient(
             {
-                "id": 8,
-                "status": "completed",
-                "service": "radarr",
-                "external_title": "Dune @everyone https://invalid/?token=secret",
-                "title": "Dune",
+                2: FakeChannel(original_message),
+                21: status_channel,
+                30: error_channel,
             }
         )
-        self.assertIn("Dune", notification)
-        self.assertNotIn("@everyone", notification)
-        self.assertNotIn("https://", notification)
-        self.assertNotIn("token", notification)
-
-    async def test_status_channel_is_fallback_when_original_is_missing(self):
-        self.store.transition(self.request["id"], "failed", "Import failed", error="Retry limit reached")
-        status_channel = FakeChannel()
-        client = FakeClient({20: status_channel})
-        config = validate_channel_config(
-            {"requests": REQUESTS, "activity": {"request-status": 20}}
-        )
-        self.assertEqual(await self.reconcile(client, config), 1)
+        config = validate_channel_config(channel_mapping())
+        await self.reconcile(client, config)
+        await self.reconcile(client, config)
+        self.assertEqual(original_message.replies, [])
         self.assertEqual(len(status_channel.sent), 1)
-        self.assertIn("Retry limit reached", status_channel.sent[0])
+        self.assertEqual(len(error_channel.sent), 1)
+        self.assertNotEqual(status_channel.sent[0], error_channel.sent[0])
+        self.assertIn("Retry limit reached", " ".join(status_channel.sent + error_channel.sent))
 
     async def test_no_delivery_route_leaves_notification_pending(self):
-        self.store.transition(self.request["id"], "complete", "BookBot imported media")
-        config = validate_channel_config({"requests": REQUESTS})
-        self.assertEqual(await self.reconcile(FakeClient({}), config), 0)
-        self.assertEqual(len(self.store.pending_notifications()), 1)
+        self.store.transition(
+            self.request["id"],
+            "complete",
+            "BookBot imported media",
+            event_type="completed",
+            service="bookbot",
+        )
+        config = validate_channel_config(channel_mapping())
+        await self.reconcile(FakeClient({}), config)
+        self.assertGreaterEqual(len(self.store.pending_notification_deliveries()), 2)
+        self.assertIsNone(self.store.get_request(self.request["id"])["notified_at"])
+
+    async def test_partial_terminal_delivery_retries_only_missing_route(self):
+        self.store.transition(
+            self.request["id"],
+            "complete",
+            "BookBot imported media",
+            event_type="completed",
+            service="bookbot",
+            external_title="Dune EPUB",
+        )
+        original_message = FakeMessage()
+        status_channel = FakeChannel()
+        addition_channel = FailOnceChannel()
+        client = FakeClient(
+            {
+                2: FakeChannel(original_message),
+                21: status_channel,
+                22: addition_channel,
+            }
+        )
+        config = validate_channel_config(channel_mapping())
+
+        await self.reconcile(client, config)
+        self.assertEqual(original_message.replies, [])
+        self.assertEqual(len(status_channel.sent), 1)
+        self.assertEqual(addition_channel.sent, [])
+        self.assertIsNone(self.store.get_request(self.request["id"])["notified_at"])
+
+        await self.reconcile(client, config)
+        await self.reconcile(client, config)
+        self.assertEqual(len(status_channel.sent), 1)
+        self.assertEqual(len(addition_channel.sent), 1)
+        self.assertEqual(addition_channel.attempts, 2)
+        self.assertIsNotNone(self.store.get_request(self.request["id"])["notified_at"])
 
     async def test_arr_completion_transitions_once_then_notifier_delivers(self):
         self.store.transition(
@@ -338,10 +513,24 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         original_message = FakeMessage()
-        client = FakeClient({2: FakeChannel(original_message)})
-        config = validate_channel_config({"requests": REQUESTS})
-        self.assertEqual(await self.reconcile(client, config), 1)
-        self.assertIn("imported to its DAS library path by Radarr", original_message.replies[0])
+        status_channel = FakeChannel()
+        addition_channel = FakeChannel()
+        client = FakeClient(
+            {
+                2: FakeChannel(original_message),
+                21: status_channel,
+                22: addition_channel,
+            }
+        )
+        config = validate_channel_config(channel_mapping())
+        await self.reconcile(client, config)
+        self.assertEqual(original_message.replies, [])
+        self.assertEqual(len(status_channel.sent), 1)
+        self.assertEqual(len(addition_channel.sent), 1)
+        self.assertIn(
+            "imported to its DAS library path by Radarr",
+            " ".join(status_channel.sent + addition_channel.sent),
+        )
 
     async def test_arr_without_files_remains_queued(self):
         self.store.transition(
@@ -378,7 +567,7 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
     async def test_notification_loop_probes_arr_before_terminal_notifications(self):
         client = Mock()
         client.is_closed.return_value = False
-        config = validate_channel_config({"requests": REQUESTS})
+        config = validate_channel_config(channel_mapping())
         order = []
 
         def reconcile_arr(_store, _services):
@@ -401,30 +590,250 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order, ["arr", "notifications"])
 
 
+class DiscordAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_acknowledgements_reply_to_each_original_but_duplicate_target_has_no_lifecycle_repeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RequestStore(Path(directory) / "huey.db")
+            store.initialize()
+            dispatcher = Mock(
+                return_value=result(
+                    "queued",
+                    "Queued Dune in qBittorrent",
+                    service="qbittorrent",
+                    external_id="a" * 40,
+                    external_title="Dune EPUB",
+                )
+            )
+            processor = RequestProcessor(
+                store,
+                services={"direct": object()},
+                dispatcher=dispatcher,
+            )
+            config = validate_channel_config(channel_mapping())
+            discord_module = types.SimpleNamespace(
+                Intents=FakeIntents,
+                Client=FakeDiscordClient,
+            )
+            with patch.dict(sys.modules, {"discord": discord_module}):
+                client = build_client(config, processor, Path(directory) / "ready")
+
+            intake_channel = FakeChannel()
+            intake_channel.id = 2
+            status_channel = FakeChannel()
+            queue_channel = FakeChannel()
+            client.channels = {
+                2: intake_channel,
+                20: queue_channel,
+                21: status_channel,
+            }
+            first = FakeIncomingMessage(
+                message_id=200,
+                channel=intake_channel,
+                content="Dune by Frank Herbert",
+            )
+            duplicate = FakeIncomingMessage(
+                message_id=201,
+                channel=intake_channel,
+                content="dune by FRANK HERBERT",
+            )
+
+            async def direct_call(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with patch("huey.asyncio.to_thread", new=direct_call):
+                await client.on_message(first)
+                await reconcile_notifications(client, config, store)
+                lifecycle_counts = (len(status_channel.sent), len(queue_channel.sent))
+
+                await client.on_message(duplicate)
+                await reconcile_notifications(client, config, store)
+
+            self.assertEqual(len(first.replies), 1)
+            self.assertEqual(len(duplicate.replies), 1)
+            self.assertIn("Request #", first.replies[0])
+            self.assertIn("Request #", duplicate.replies[0])
+            self.assertEqual(dispatcher.call_count, 1)
+            self.assertEqual(lifecycle_counts, (1, 1))
+            self.assertEqual(
+                (len(status_channel.sent), len(queue_channel.sent)),
+                lifecycle_counts,
+            )
+
+    async def test_immediate_handler_terminal_result_does_not_create_import_event(self):
+        for status in ("completed", "failed"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                store = RequestStore(Path(directory) / "huey.db")
+                store.initialize()
+                dispatcher = Mock(
+                    return_value=result(
+                        status,
+                        f"Handler returned {status}",
+                        service="qbittorrent",
+                        external_id="b" * 40,
+                        external_title="Dune EPUB",
+                    )
+                )
+                processor = RequestProcessor(
+                    store,
+                    services={"direct": object()},
+                    dispatcher=dispatcher,
+                )
+                config = validate_channel_config(channel_mapping())
+                discord_module = types.SimpleNamespace(
+                    Intents=FakeIntents,
+                    Client=FakeDiscordClient,
+                )
+                with patch.dict(sys.modules, {"discord": discord_module}):
+                    client = build_client(
+                        config, processor, Path(directory) / "ready"
+                    )
+
+                intake_channel = FakeChannel()
+                intake_channel.id = 2
+                status_channel = FakeChannel()
+                queue_channel = FakeChannel()
+                addition_channel = FakeChannel()
+                error_channel = FakeChannel()
+                client.channels = {
+                    2: intake_channel,
+                    20: queue_channel,
+                    21: status_channel,
+                    22: addition_channel,
+                    30: error_channel,
+                }
+                message = FakeIncomingMessage(
+                    message_id=300,
+                    channel=intake_channel,
+                    content="Dune by Frank Herbert",
+                )
+
+                async def direct_call(function, *args, **kwargs):
+                    return function(*args, **kwargs)
+
+                with patch("huey.asyncio.to_thread", new=direct_call):
+                    await client.on_message(message)
+                    await reconcile_notifications(client, config, store)
+
+                self.assertEqual(len(message.replies), 1)
+                self.assertEqual(len(status_channel.sent), 1)
+                self.assertEqual(queue_channel.sent, [])
+                self.assertEqual(addition_channel.sent, [])
+                self.assertEqual(error_channel.sent, [])
+                self.assertIsNotNone(
+                    store.get_request(1)["notified_at"]
+                )
+
+    async def test_acknowledgement_reply_failure_still_delivers_lifecycle_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RequestStore(Path(directory) / "huey.db")
+            store.initialize()
+            dispatcher = Mock(
+                return_value=result(
+                    "queued",
+                    "Queued Dune in qBittorrent",
+                    service="qbittorrent",
+                    external_id="c" * 40,
+                    external_title="Dune EPUB",
+                )
+            )
+            processor = RequestProcessor(
+                store,
+                services={"direct": object()},
+                dispatcher=dispatcher,
+            )
+            config = validate_channel_config(channel_mapping())
+            discord_module = types.SimpleNamespace(
+                Intents=FakeIntents,
+                Client=FakeDiscordClient,
+            )
+            with patch.dict(sys.modules, {"discord": discord_module}):
+                client = build_client(config, processor, Path(directory) / "ready")
+
+            intake_channel = FakeChannel()
+            intake_channel.id = 2
+            queue_channel = FakeChannel()
+            status_channel = FakeChannel()
+            addition_channel = FakeChannel()
+            error_channel = FakeChannel()
+            client.channels = {
+                2: intake_channel,
+                20: queue_channel,
+                21: status_channel,
+                22: addition_channel,
+                30: error_channel,
+            }
+            message = FailReplyIncomingMessage(
+                message_id=400,
+                channel=intake_channel,
+                content="Dune by Frank Herbert",
+            )
+
+            async def direct_call(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with patch("huey.asyncio.to_thread", new=direct_call):
+                await client.on_message(message)
+                await reconcile_notifications(client, config, store)
+
+            self.assertEqual(message.reply_attempts, 1)
+            self.assertEqual(intake_channel.sent, [])
+            self.assertEqual(len(status_channel.sent), 1)
+            self.assertEqual(len(queue_channel.sent), 1)
+            self.assertEqual(addition_channel.sent, [])
+            self.assertEqual(error_channel.sent, [])
+            event_types = [event["event_type"] for event in store.events_for(1)]
+            self.assertEqual(event_types.count("notification_failed"), 1)
+
+
 class DiscordChannelValidationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_all_request_and_status_channels_are_verified(self):
-        config = validate_channel_config(
-            {"requests": REQUESTS, "activity": {"request-status": 20}}
-        )
+    async def test_all_request_and_lifecycle_channels_are_verified(self):
+        config = validate_channel_config(channel_mapping())
         client = FakeClient(
-            {channel_id: PermissionChannel() for channel_id in (*REQUESTS.values(), 20)}
+            {
+                channel_id: PermissionChannel()
+                for channel_id in (
+                    *REQUESTS.values(),
+                    *ACTIVITY.values(),
+                    *SYSTEM.values(),
+                )
+            }
         )
         await validate_discord_channels(client, config)
 
     async def test_missing_or_unwritable_channel_is_rejected(self):
-        config = validate_channel_config(
-            {"requests": REQUESTS, "activity": {"request-status": 20}}
-        )
+        config = validate_channel_config(channel_mapping())
         channels = {
             channel_id: PermissionChannel()
-            for channel_id in (*REQUESTS.values(), 20)
+            for channel_id in (
+                *REQUESTS.values(),
+                *ACTIVITY.values(),
+                *SYSTEM.values(),
+            )
         }
-        channels[2] = PermissionChannel(FakePermissions(send=False))
+        channels[30] = PermissionChannel(FakePermissions(send=False))
         with self.assertRaisesRegex(RuntimeError, "send_messages"):
             await validate_discord_channels(FakeClient(channels), config)
-        channels[2] = PermissionChannel()
-        del channels[3]
+        channels[30] = PermissionChannel()
+        del channels[31]
         with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            await validate_discord_channels(FakeClient(channels), config)
+
+    async def test_history_permission_is_required_only_for_intake_channels(self):
+        config = validate_channel_config(channel_mapping())
+        channels = {
+            channel_id: PermissionChannel(
+                FakePermissions(history=channel_id in REQUESTS.values())
+            )
+            for channel_id in (
+                *REQUESTS.values(),
+                *ACTIVITY.values(),
+                *SYSTEM.values(),
+            )
+        }
+        await validate_discord_channels(FakeClient(channels), config)
+
+        channels[2] = PermissionChannel(FakePermissions(history=False))
+        with self.assertRaisesRegex(RuntimeError, "read_message_history"):
             await validate_discord_channels(FakeClient(channels), config)
 
 

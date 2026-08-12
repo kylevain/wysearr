@@ -30,8 +30,9 @@ ARR destinations are `/media/tv`, `/media/movies`, `/media/music`, and
 English language profile, and searches enabled subtitle providers when the
 profile is not already satisfied. Matching embedded English tracks count as
 available subtitles, so an external `.srt` is neither required nor evidence of
-success by itself. External matches remain content- and provider-dependent;
-Bazarr does not emit routine Discord subtitle notifications.
+success by itself. External matches remain content- and provider-dependent.
+Bazarr's native Discord notifier remains disabled, and Bazarr does not emit
+routine subtitle activity.
 
 ## Discord and direct-media flow
 
@@ -50,7 +51,7 @@ Sonarr or Radarr          Prowlarr search + conservative match
         |                         v
         +--------------> confirmed DAS import
                                   v
-                         Huey terminal notification
+                         Huey lifecycle router
 ```
 
 Huey stores request and event state in `state/huey/huey.db`. Discord
@@ -80,17 +81,27 @@ never included. Poor or low-confidence metadata retains the generic refinement
 response.
 
 Direct qBittorrent jobs carry a `huey-<request-id>` tag so BookBot can reconcile
-the terminal import with the original request. Terminal delivery is idempotently
-recorded after at least one configured Discord route succeeds; Discord itself
-does not provide an atomic exactly-once send transaction.
+the terminal import with the original request. Huey records delivery per logical
+event and destination. Discord itself does not provide an atomic exactly-once
+send transaction, so a route is marked delivered only after its send succeeds.
 
 The six configured intake channels are `#movies-tv`, `#ebooks`, `#audiobooks`,
 `#manga-comics`, `#roms`, and `#sheet-music`. Huey replies to the originating
-message and mirrors request lifecycle messages to `#request-status`. The mapped
-`#download-queue`, `#recent-additions`, `#automation-admin`, `#import-errors`,
-and `#system-health` channels are reserved and currently unwired; they are not
-alternative completion producers. Lidarr music and Whisparr adult-media
-requests remain Web-UI-only.
+message only for the request acknowledgement. It routes later events by purpose:
+
+| Event class | Discord destination |
+| --- | --- |
+| Accepted, rejected, completed, or failed request | `#request-status` |
+| Queued acquisition, active download, or download lifecycle | `#download-queue` |
+| Newly imported DAS library item | `#recent-additions` |
+| Import failure or manual intervention required | `#import-errors` |
+| Service or runtime health issue | `#system-health` |
+
+A completed request and a newly imported item are separate logical events, not
+copies of one notification. `#automation-admin` is not a lifecycle route. Huey is
+the sole Discord producer; native Discord delivery in Radarr, Sonarr, Lidarr, and
+Bazarr stays disabled to prevent bypasses and duplicates. Lidarr music and
+Whisparr adult-media requests remain Web-UI-only.
 
 An ARR terminal completion currently means Sonarr or Radarr reports imported
 media on the DAS; Huey does not yet trigger or confirm a Plex scan, so the

@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 from pathlib import Path
 from typing import Any
 
@@ -18,15 +17,15 @@ try:
     from .clients import ServiceError
     from .config import ChannelConfig, load_channel_config
     from .database import RequestStore
+    from .notifications import response_notifications, terminal_notifications
     from .orchestrator import RequestProcessor
-    from .results import safe_display_title
     from .services import ServiceRegistry
 except ImportError:  # Direct execution from /app/scripts/huey/huey.py.
     from clients import ServiceError
     from config import ChannelConfig, load_channel_config
     from database import RequestStore
+    from notifications import response_notifications, terminal_notifications
     from orchestrator import RequestProcessor
-    from results import safe_display_title
     from services import ServiceRegistry
 
 
@@ -61,24 +60,13 @@ def format_reply(media_type: str, response: dict[str, Any]) -> str:
 
 
 def format_completion_notification(request: dict[str, Any]) -> str:
-    title = safe_display_title(request.get("external_title"), request.get("title"))
-    if request["status"] in {"complete", "completed"}:
-        service = str(request.get("service") or "").casefold()
-        if service in {"sonarr", "radarr", "lidarr"}:
-            return (
-                f"✅ Request #{request['id']} complete: {title} was imported to its "
-                f"DAS library path by {service.title()}."
-            )
-        return (
-            f"✅ Request #{request['id']} complete: {title} was safely imported "
-            "to its DAS library path."
-        )
-    detail = request.get("error") or ""
-    if not detail or re.search(
-        r"(?:https?://|magnet:|api[_-]?key|token|password|secret)", detail, re.IGNORECASE
-    ):
-        detail = "The import or acquisition failed. An administrator should review Huey and BookBot logs."
-    return f"❌ Request #{request['id']} failed: {title}. {detail}"
+    """Compatibility wrapper for the request-status terminal message."""
+
+    plans = terminal_notifications(request)
+    for plan in plans:
+        if plan.route == "request-status":
+            return plan.message
+    raise ValueError("Request is not in a terminal notification state")
 
 
 async def _discord_channel(client: Any, channel_id: str) -> Any | None:
@@ -97,8 +85,7 @@ async def validate_discord_channels(
     """Require every operational channel to be visible and writable by Huey."""
 
     channel_ids = set(channel_config.request_channels)
-    if channel_config.request_status_channel:
-        channel_ids.add(channel_config.request_status_channel)
+    channel_ids.update(channel_config.lifecycle_channels.values())
     for channel_id in sorted(channel_ids, key=int):
         channel = await _discord_channel(client, channel_id)
         if channel is None or not hasattr(channel, "send"):
@@ -131,50 +118,69 @@ async def reconcile_notifications(
     channel_config: ChannelConfig,
     store: RequestStore,
 ) -> int:
-    """Deliver completion/failure notifications and persist a one-time marker."""
+    """Stage and deliver lifecycle events through their single configured routes."""
 
-    pending = await asyncio.to_thread(store.pending_notifications)
-    delivered_count = 0
-    for request in pending:
-        notification = format_completion_notification(request)
-        delivered_to: list[str] = []
+    lock = getattr(client, "_huey_notification_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        try:
+            setattr(client, "_huey_notification_lock", lock)
+        except Exception:  # pragma: no cover - discord.py clients are mutable
+            pass
 
-        original_channel = await _discord_channel(client, str(request["channel_id"]))
-        if original_channel is not None and hasattr(original_channel, "fetch_message"):
-            try:
-                original_message = await original_channel.fetch_message(int(request["message_id"]))
-                await original_message.reply(notification)
-                delivered_to.append("original request")
-            except Exception as error:
-                LOGGER.warning(
-                    "Could not reply with completion for request %s (%s)",
-                    request["id"],
-                    type(error).__name__,
+    async with lock:
+        pending_terminal = await asyncio.to_thread(store.pending_notifications)
+        terminal_ids = {int(request["id"]) for request in pending_terminal}
+        for request in pending_terminal:
+            for plan in terminal_notifications(request):
+                await asyncio.to_thread(
+                    store.enqueue_notification,
+                    int(request["id"]),
+                    plan.event_key,
+                    plan.route,
+                    plan.message,
                 )
 
-        status_channel_id = channel_config.request_status_channel
-        if status_channel_id:
-            status_channel = await _discord_channel(client, status_channel_id)
-            if status_channel is not None and hasattr(status_channel, "send"):
-                try:
-                    await status_channel.send(notification)
-                    delivered_to.append("request-status channel")
-                except Exception as error:
-                    LOGGER.warning(
-                        "Could not post completion for request %s (%s)",
-                        request["id"],
-                        type(error).__name__,
-                    )
-
-        if delivered_to:
-            marked = await asyncio.to_thread(
-                store.mark_notified,
-                request["id"],
-                "Completion notification delivered to " + " and ".join(delivered_to),
-            )
-            if marked:
+        deliveries = await asyncio.to_thread(store.pending_notification_deliveries)
+        delivered_count = 0
+        for delivery in deliveries:
+            route = str(delivery["route"])
+            channel_id = channel_config.lifecycle_channels.get(route)
+            if channel_id is None:
+                LOGGER.error(
+                    "No Discord lifecycle channel configured for route %s", route
+                )
+                continue
+            channel = await _discord_channel(client, channel_id)
+            if channel is None or not hasattr(channel, "send"):
+                LOGGER.warning(
+                    "Discord lifecycle route %s is unavailable for request %s",
+                    route,
+                    delivery["request_id"],
+                )
+                continue
+            try:
+                await channel.send(str(delivery["message"]))
+            except Exception as error:
+                LOGGER.warning(
+                    "Could not deliver %s for request %s (%s)",
+                    route,
+                    delivery["request_id"],
+                    type(error).__name__,
+                )
+                continue
+            if await asyncio.to_thread(
+                store.mark_notification_delivered, int(delivery["id"])
+            ):
                 delivered_count += 1
-    return delivered_count
+
+        for request_id in terminal_ids:
+            await asyncio.to_thread(
+                store.mark_notified_if_delivered,
+                request_id,
+                "All staged Discord lifecycle notifications delivered",
+            )
+        return delivered_count
 
 
 def reconcile_arr_requests(store: RequestStore, services: Any) -> int:
@@ -319,10 +325,8 @@ def build_client(
             return
 
         reply = format_reply(media_type, response)
-        delivered_to: list[str] = []
         try:
             await message.reply(reply)
-            delivered_to.append("original request")
         except Exception as error:
             LOGGER.warning(
                 "Could not reply to request %s (%s)",
@@ -336,32 +340,32 @@ def build_client(
                 "Could not reply to the original Discord request",
             )
 
-        status_channel_id = channel_config.request_status_channel
-        if status_channel_id and str(message.channel.id) != status_channel_id:
-            try:
-                status_channel = await _discord_channel(client, status_channel_id)
-                if status_channel is None:
-                    raise LookupError("request-status channel is unavailable")
-                await status_channel.send(reply)
-                delivered_to.append("request-status channel")
-            except Exception as error:
-                LOGGER.warning(
-                    "Could not update the request-status channel for request %s (%s)",
-                    response["request_id"],
-                    type(error).__name__,
-                )
+        try:
+            request = await asyncio.to_thread(
+                processor.store.get_request, int(response["request_id"])
+            )
+            if request is None:
+                raise LookupError("persisted request is unavailable")
+            for plan in response_notifications(media_type, response, request):
                 await asyncio.to_thread(
-                    processor.store.add_event,
-                    response["request_id"],
-                    "notification_failed",
-                    "Could not update the Discord request-status channel",
+                    processor.store.enqueue_notification,
+                    int(response["request_id"]),
+                    plan.event_key,
+                    plan.route,
+                    plan.message,
                 )
-
-        if response["status"] in {"complete", "completed", "failed"} and delivered_to:
-            await asyncio.to_thread(
-                processor.store.mark_notified,
+            await reconcile_notifications(client, channel_config, processor.store)
+        except Exception as error:
+            LOGGER.warning(
+                "Could not reconcile lifecycle notifications for request %s (%s)",
                 response["request_id"],
-                "Terminal request result delivered to " + " and ".join(delivered_to),
+                type(error).__name__,
+            )
+            await asyncio.to_thread(
+                processor.store.add_event,
+                response["request_id"],
+                "notification_failed",
+                "Could not reconcile Discord lifecycle notifications",
             )
 
     return client

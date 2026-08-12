@@ -34,3 +34,18 @@ CREATE TABLE IF NOT EXISTS delivery_aliases (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL,
+    event_key TEXT NOT NULL,
+    route TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    delivered_at TEXT,
+    FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE,
+    UNIQUE(request_id, event_key, route)
+);
+
+CREATE INDEX IF NOT EXISTS notification_deliveries_pending_idx
+    ON notification_deliveries(delivered_at, id);

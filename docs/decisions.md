@@ -31,6 +31,16 @@
   by API, database, health, and recreation validation.
 - 2026-08-11: The service UIs are for the trusted home LAN only. They must not be
   port-forwarded or otherwise published to the Internet.
+- 2026-08-12: Huey is the sole Discord notification producer. It replies to the
+  original request only for acknowledgement, then routes request state to
+  `#request-status`, acquisition/download lifecycle to `#download-queue`, new DAS
+  imports to `#recent-additions`, import failures/manual action to
+  `#import-errors`, and service/runtime health only to `#system-health`. Native
+  Discord delivery in Radarr, Sonarr, Lidarr, and Bazarr remains disabled to
+  prevent bypasses and duplicates.
+- 2026-08-12: A request completion and a newly imported library item are distinct
+  events, not mirrored copies. Completion proves import to the DAS library path;
+  it does not prove Plex or another catalog application has indexed the item.
 
 Huey, Dewey, and Louie follow the established Duck-nephew naming scheme. Huey is
 Discord intake; Dewey is the conversational library interface; Louie remains

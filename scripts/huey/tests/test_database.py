@@ -91,10 +91,14 @@ class DatabaseTests(unittest.TestCase):
             aliases = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_aliases'"
             ).fetchone()
+            outbox = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='notification_deliveries'"
+            ).fetchone()
             target_index = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND name='requests_active_target_uq'"
             ).fetchone()
         self.assertIsNotNone(aliases)
+        self.assertIsNotNone(outbox)
         self.assertIsNotNone(target_index)
 
     def test_old_schema_migration_merges_duplicates_and_preserves_events(self):
@@ -272,23 +276,106 @@ class DatabaseTests(unittest.TestCase):
                     "INSERT INTO events (request_id,event_type,message) VALUES (999,'x','x')"
                 )
 
-    def test_terminal_notification_marker_is_idempotent(self):
+    def test_notification_outbox_is_idempotent_per_event_and_route(self):
         self.store.initialize()
         request, _ = self.store.create_request(**self.request_values())
-        self.store.transition(request["id"], "complete", "Imported by BookBot")
-        self.assertEqual([row["id"] for row in self.store.pending_notifications()], [request["id"]])
-        self.assertTrue(self.store.mark_notified(request["id"], "Discord reply delivered"))
-        self.assertFalse(self.store.mark_notified(request["id"], "Duplicate delivery"))
+        self.assertTrue(
+            self.store.enqueue_notification(
+                request["id"],
+                "request_completed",
+                "request-status",
+                "Request complete",
+            )
+        )
+        self.assertFalse(
+            self.store.enqueue_notification(
+                request["id"],
+                "request_completed",
+                "request-status",
+                "Changed duplicate message must not replace the first",
+            )
+        )
+        self.assertTrue(
+            self.store.enqueue_notification(
+                request["id"],
+                "library_imported",
+                "recent-additions",
+                "New library item",
+            )
+        )
+
+        pending = self.store.pending_notification_deliveries()
+        self.assertEqual(len(pending), 2)
+        self.assertEqual(pending[0]["message"], "Request complete")
+        self.assertFalse(
+            self.store.notification_delivered(
+                request["id"], "request_completed", "request-status"
+            )
+        )
+        self.assertTrue(self.store.mark_notification_delivered(pending[0]["id"]))
+        self.assertFalse(self.store.mark_notification_delivered(pending[0]["id"]))
+        self.assertTrue(
+            self.store.notification_delivered(
+                request["id"], "request_completed", "request-status"
+            )
+        )
+        self.assertEqual(
+            [row["event_key"] for row in self.store.pending_notification_deliveries()],
+            ["library_imported"],
+        )
+
+    def test_terminal_request_is_not_notified_until_every_staged_route_succeeds(self):
+        self.store.initialize()
+        request, _ = self.store.create_request(**self.request_values())
+        self.store.transition(
+            request["id"],
+            "complete",
+            "Imported by BookBot",
+            event_type="completed",
+            service="bookbot",
+        )
+        self.store.enqueue_notification(
+            request["id"], "request_completed", "request-status", "Request complete"
+        )
+        self.store.enqueue_notification(
+            request["id"], "library_imported", "recent-additions", "New library item"
+        )
+        deliveries = self.store.pending_notification_deliveries()
+
+        self.assertFalse(
+            self.store.mark_notified_if_delivered(request["id"], "not complete")
+        )
+        self.assertTrue(self.store.mark_notification_delivered(deliveries[0]["id"]))
+        self.assertFalse(
+            self.store.mark_notified_if_delivered(request["id"], "still partial")
+        )
+        self.assertIsNone(self.store.get_request(request["id"])["notified_at"])
+
+        self.assertTrue(self.store.mark_notification_delivered(deliveries[1]["id"]))
+        self.assertTrue(
+            self.store.mark_notified_if_delivered(request["id"], "all routes delivered")
+        )
+        self.assertFalse(
+            self.store.mark_notified_if_delivered(request["id"], "duplicate marker")
+        )
         self.assertEqual(self.store.pending_notifications(), [])
         events = self.store.events_for(request["id"])
         self.assertEqual(
             [event["event_type"] for event in events].count("completion_notified"), 1
         )
 
-    def test_nonterminal_request_cannot_be_marked_completion_notified(self):
+    def test_nonterminal_request_cannot_be_marked_notified_from_delivered_outbox(self):
         self.store.initialize()
         request, _ = self.store.create_request(**self.request_values())
-        self.assertFalse(self.store.mark_notified(request["id"], "not terminal"))
+        self.store.enqueue_notification(
+            request["id"], "request_completed", "request-status", "invalid early result"
+        )
+        delivery = self.store.pending_notification_deliveries()[0]
+        self.assertTrue(self.store.mark_notification_delivered(delivery["id"]))
+        self.assertFalse(
+            self.store.mark_notified_if_delivered(request["id"], "not terminal")
+        )
+        self.assertIsNone(self.store.get_request(request["id"])["notified_at"])
 
     def test_queued_arr_requests_exclude_direct_and_terminal_requests(self):
         self.store.initialize()

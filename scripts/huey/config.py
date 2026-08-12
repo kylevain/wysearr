@@ -13,6 +13,9 @@ SUPPORTED_MEDIA_TYPES = frozenset(
 REQUIRED_MEDIA_TYPES = frozenset(
     {"movies-tv", "ebooks", "audiobooks", "manga-comics", "roms", "sheet-music"}
 )
+ACTIVITY_ROUTES = ("download-queue", "request-status", "recent-additions")
+SYSTEM_ROUTES = ("import-errors", "system-health")
+OPTIONAL_SYSTEM_CHANNELS = ("automation-admin",)
 
 
 class ChannelConfigError(ValueError):
@@ -31,7 +34,15 @@ def _channel_id(value: Any, label: str) -> str:
 @dataclass(frozen=True)
 class ChannelConfig:
     request_channels: dict[str, str]
-    request_status_channel: str | None = None
+    lifecycle_channels: dict[str, str]
+
+    def channel_for(self, route: str) -> str:
+        """Return the configured Discord channel for one lifecycle route."""
+
+        try:
+            return self.lifecycle_channels[route]
+        except KeyError as error:
+            raise ChannelConfigError(f"Unknown Discord lifecycle route: {route}") from error
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ChannelConfig":
@@ -63,22 +74,50 @@ class ChannelConfig:
                 )
             channel_map[channel_id] = media_type
 
-        activity = value.get("activity", {})
-        if activity is None:
-            activity = {}
+        activity = value.get("activity")
+        system = value.get("system")
         if not isinstance(activity, Mapping):
-            raise ChannelConfigError("`activity` must be a mapping when present")
-        status_value = activity.get("request-status")
-        status_channel = (
-            _channel_id(status_value, "activity.request-status")
-            if status_value is not None
-            else None
-        )
-        if status_channel in channel_map:
-            raise ChannelConfigError(
-                "activity.request-status must be separate from request intake channels"
-            )
-        return cls(channel_map, status_channel)
+            raise ChannelConfigError("Channel configuration requires an `activity` mapping")
+        if not isinstance(system, Mapping):
+            raise ChannelConfigError("Channel configuration requires a `system` mapping")
+
+        lifecycle_channels: dict[str, str] = {}
+        assigned = dict(channel_map)
+        for section_name, section, required_routes in (
+            ("activity", activity, ACTIVITY_ROUTES),
+            ("system", system, SYSTEM_ROUTES),
+        ):
+            missing_routes = [route for route in required_routes if route not in section]
+            if missing_routes:
+                raise ChannelConfigError(
+                    f"Missing {section_name} lifecycle channel(s): "
+                    + ", ".join(missing_routes)
+                )
+            for route in required_routes:
+                channel_id = _channel_id(section[route], f"{section_name}.{route}")
+                if channel_id in assigned:
+                    raise ChannelConfigError(
+                        f"Discord channel {channel_id} is assigned more than one role; "
+                        "request and lifecycle channels must be unique"
+                    )
+                assigned[channel_id] = route
+                lifecycle_channels[route] = channel_id
+
+        # automation-admin remains intentionally unwired, but validating its
+        # inventory entry prevents an accidental collision with an operational
+        # intake or lifecycle channel.
+        for route in OPTIONAL_SYSTEM_CHANNELS:
+            if route not in system:
+                continue
+            channel_id = _channel_id(system[route], f"system.{route}")
+            if channel_id in assigned:
+                raise ChannelConfigError(
+                    f"Discord channel {channel_id} is assigned more than one role; "
+                    "all configured channel IDs must be unique"
+                )
+            assigned[channel_id] = route
+
+        return cls(channel_map, lifecycle_channels)
 
 
 def validate_channel_config(value: Mapping[str, Any]) -> ChannelConfig:

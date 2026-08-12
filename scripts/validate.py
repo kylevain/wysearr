@@ -7,6 +7,7 @@ import argparse
 import http.cookiejar
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -33,6 +34,31 @@ SERVICES = (
 DIRECT_CATEGORIES = ("ebooks", "audiobooks", "manga-comics", "roms", "sheet-music")
 ARR_CATEGORIES = ("tv", "movies", "music", "spicy")
 BAZARR_PROVIDERS = {"embeddedsubtitles", "yifysubtitles", "subf2m"}
+REQUIRED_DISCORD_CHANNELS = {
+    "requests": frozenset(
+        {
+            "movies-tv",
+            "ebooks",
+            "audiobooks",
+            "manga-comics",
+            "roms",
+            "sheet-music",
+        }
+    ),
+    "activity": frozenset(
+        {"download-queue", "request-status", "recent-additions"}
+    ),
+    "system": frozenset({"import-errors", "system-health"}),
+}
+ARR_NOTIFICATION_DATABASES = {
+    "sonarr": Path("config/sonarr/sonarr.db"),
+    "radarr": Path("config/radarr/radarr.db"),
+    "lidarr": Path("config/lidarr/lidarr.db"),
+}
+DISCORD_WEBHOOK_MARKERS = (
+    "discord.com/api/webhooks/",
+    "discordapp.com/api/webhooks/",
+)
 
 
 @dataclass
@@ -53,6 +79,203 @@ def load_env(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip()
     return values
+
+
+def load_channel_inventory(path: Path) -> dict[str, dict[str, str]]:
+    """Parse the deliberately simple two-level Discord channel inventory."""
+
+    inventory: dict[str, dict[str, str]] = {}
+    current_section: str | None = None
+    assigned_ids: dict[str, str] = {}
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            if not line.endswith(":") or ":" in line[:-1]:
+                raise ValueError(f"invalid channel section on line {line_number}")
+            current_section = line[:-1].strip()
+            if not current_section or current_section in inventory:
+                raise ValueError(f"duplicate channel section on line {line_number}")
+            inventory[current_section] = {}
+            continue
+        if current_section is None or ":" not in line:
+            raise ValueError(f"invalid channel entry on line {line_number}")
+        name, raw_value = line.strip().split(":", 1)
+        name = name.strip()
+        value = raw_value.strip()
+        if not name or name in inventory[current_section]:
+            raise ValueError(f"duplicate channel entry on line {line_number}")
+        if not value.isdigit() or int(value) <= 0:
+            raise ValueError(
+                f"{current_section}.{name} is not a positive Discord channel ID"
+            )
+        assignment = f"{current_section}.{name}"
+        if value in assigned_ids:
+            raise ValueError(
+                f"Discord channel ID is assigned to both "
+                f"{assigned_ids[value]} and {assignment}"
+            )
+        inventory[current_section][name] = value
+        assigned_ids[value] = assignment
+    return inventory
+
+
+def channel_inventory_check(path: Path) -> Check:
+    try:
+        inventory = load_channel_inventory(path)
+        missing = [
+            f"{section}.{name}"
+            for section, required_names in REQUIRED_DISCORD_CHANNELS.items()
+            for name in sorted(required_names.difference(inventory.get(section, {})))
+        ]
+    except (OSError, UnicodeError, ValueError) as error:
+        return Check("huey:channels", False, f"invalid inventory: {error}")
+    if missing:
+        return Check(
+            "huey:channels",
+            False,
+            "missing required channel(s): " + ", ".join(missing),
+        )
+    required_count = sum(len(names) for names in REQUIRED_DISCORD_CHANNELS.values())
+    return Check(
+        "huey:channels",
+        True,
+        f"{required_count} request and lifecycle channel IDs are valid and unique",
+    )
+
+
+def huey_ready_check(path: Path) -> Check:
+    try:
+        if not path.is_file():
+            return Check("huey:discord-ready", False, "ready marker missing")
+        ready = path.read_text(encoding="utf-8").strip() == "ready"
+    except (OSError, UnicodeError) as error:
+        return Check("huey:discord-ready", False, type(error).__name__)
+    return Check(
+        "huey:discord-ready",
+        ready,
+        "ready marker valid" if ready else "ready marker content invalid",
+    )
+
+
+def _open_readonly_database(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only = ON")
+    return connection
+
+
+def _contains_discord_webhook(value: object) -> bool:
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", "replace")
+    else:
+        text = str(value or "")
+    normalized = text.casefold()
+    return any(marker in normalized for marker in DISCORD_WEBHOOK_MARKERS)
+
+
+def arr_native_discord_check(service: str, database: Path) -> Check:
+    """Ensure an ARR service has no native Discord notification connection."""
+
+    name = f"{service}:native-discord"
+    try:
+        with closing(_open_readonly_database(database)) as connection:
+            columns = {
+                str(row[1]).casefold()
+                for row in connection.execute("PRAGMA table_info(Notifications)")
+            }
+            required = {"name", "implementation", "configcontract", "settings"}
+            if not required.issubset(columns):
+                return Check(name, False, "notification schema unavailable")
+            rows = connection.execute(
+                "SELECT Name, Implementation, ConfigContract, Settings "
+                "FROM Notifications"
+            ).fetchall()
+    except (OSError, sqlite3.Error) as error:
+        return Check(name, False, type(error).__name__)
+
+    native_discord = [
+        row
+        for row in rows
+        if "discord" in str(row["Implementation"] or "").casefold()
+        or "discord" in str(row["ConfigContract"] or "").casefold()
+        or "discord" in str(row["Name"] or "").casefold()
+        or _contains_discord_webhook(row["Settings"])
+    ]
+    return Check(
+        name,
+        not native_discord,
+        "disabled" if not native_discord else f"configured={len(native_discord)}",
+    )
+
+
+def _simple_yaml_boolean(path: Path, key: str) -> bool:
+    pattern = re.compile(
+        rf"^\s*{re.escape(key)}\s*:\s*(true|false)\s*(?:#.*)?$",
+        re.IGNORECASE,
+    )
+    values = [
+        match.group(1).casefold() == "true"
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if (match := pattern.match(line))
+    ]
+    if len(values) != 1:
+        raise ValueError(f"expected exactly one {key} boolean")
+    return values[0]
+
+
+def _database_truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def bazarr_native_discord_check(database: Path, config: Path) -> Check:
+    """Ensure Bazarr cannot bypass Huey with a native Discord notification."""
+
+    name = "bazarr:native-discord"
+    try:
+        with closing(_open_readonly_database(database)) as connection:
+            columns = {
+                str(row[1]).casefold()
+                for row in connection.execute(
+                    "PRAGMA table_info(table_settings_notifier)"
+                )
+            }
+            if not {"name", "enabled", "url"}.issubset(columns):
+                return Check(name, False, "notifier schema unavailable")
+            rows = connection.execute(
+                "SELECT name, enabled, url FROM table_settings_notifier"
+            ).fetchall()
+        external_webhook_enabled = _simple_yaml_boolean(
+            config, "use_external_webhook"
+        )
+    except (OSError, UnicodeError, ValueError, sqlite3.Error) as error:
+        return Check(name, False, type(error).__name__)
+
+    enabled_discord = [
+        row
+        for row in rows
+        if _database_truthy(row["enabled"])
+        and (
+            str(row["name"] or "").strip().casefold() == "discord"
+            or _contains_discord_webhook(row["url"])
+        )
+    ]
+    ok = not enabled_discord and not external_webhook_enabled
+    return Check(
+        name,
+        ok,
+        "disabled"
+        if ok
+        else (
+            f"enabled native routes={len(enabled_discord)} "
+            f"external_webhook={external_webhook_enabled}"
+        ),
+    )
 
 
 def request_json(url: str, *, api_key: str | None = None, timeout: int = 15) -> object:
@@ -214,6 +437,10 @@ def validate() -> list[Check]:
         check=False,
     )
     checks.append(Check("compose", compose.returncode == 0, "configuration valid" if compose.returncode == 0 else "configuration invalid"))
+    checks.append(
+        channel_inventory_check(STACK_ROOT / "docs" / "huey-channels.yml")
+    )
+    checks.append(huey_ready_check(STACK_ROOT / "state" / "huey" / "ready"))
 
     media_root = Path(env.get("MEDIA_ROOT", "/mnt/media"))
     torrent_root = Path(env.get("TORRENT_ROOT", str(STACK_ROOT / "state" / "torrents")))
@@ -400,9 +627,38 @@ def validate() -> list[Check]:
             integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
             columns = {row[1] for row in connection.execute("PRAGMA table_info(requests)")}
             indexes = list(connection.execute("PRAGMA index_list(requests)"))
+            delivery_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(notification_deliveries)"
+                )
+            }
+            delivery_indexes = list(
+                connection.execute("PRAGMA index_list(notification_deliveries)")
+            )
         required_columns = {"status", "updated_at", "service", "external_id", "error"}
         unique_message = any(row[2] for row in indexes)
-        checks.append(Check("huey:database", integrity == "ok" and required_columns <= columns and unique_message, "integrity and schema valid"))
+        required_delivery_columns = {
+            "request_id",
+            "event_key",
+            "route",
+            "message",
+            "delivered_at",
+        }
+        unique_delivery = any(row[2] for row in delivery_indexes)
+        schema_ok = bool(
+            required_columns <= columns
+            and unique_message
+            and required_delivery_columns <= delivery_columns
+            and unique_delivery
+        )
+        checks.append(
+            Check(
+                "huey:database",
+                integrity == "ok" and schema_ok,
+                "integrity, request schema, and notification outbox valid",
+            )
+        )
     except Exception as error:
         checks.append(Check("huey:database", False, type(error).__name__))
 
@@ -424,6 +680,17 @@ def validate() -> list[Check]:
         ))
     except Exception as error:
         checks.append(Check("bookbot:database", False, type(error).__name__))
+
+    for service, relative_database in ARR_NOTIFICATION_DATABASES.items():
+        checks.append(
+            arr_native_discord_check(service, STACK_ROOT / relative_database)
+        )
+    checks.append(
+        bazarr_native_discord_check(
+            STACK_ROOT / "config" / "bazarr" / "db" / "bazarr.db",
+            STACK_ROOT / "config" / "bazarr" / "config" / "config.yaml",
+        )
+    )
 
     token_present = len(env.get("DISCORD_BOT_TOKEN", "")) >= 20
     checks.append(Check("huey:token", token_present, "configured" if token_present else "missing"))

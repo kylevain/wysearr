@@ -450,15 +450,129 @@ class RequestStore:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT * FROM requests
-                WHERE status IN ('complete', 'completed', 'failed')
-                  AND notified_at IS NULL
-                ORDER BY updated_at, id
+                SELECT requests.*,
+                       (
+                           SELECT events.event_type
+                           FROM events
+                           WHERE events.request_id = requests.id
+                             AND events.event_type IN (
+                                 'handler_complete', 'handler_completed',
+                                 'handler_failed', 'arr_completed',
+                                 'complete', 'completed', 'failed',
+                                 'startup_reconciled'
+                             )
+                           ORDER BY events.id DESC
+                           LIMIT 1
+                       ) AS terminal_event_type
+                FROM requests
+                WHERE requests.status IN ('complete', 'completed', 'failed')
+                  AND requests.notified_at IS NULL
+                ORDER BY requests.updated_at, requests.id
                 LIMIT ?
                 """,
                 (max(1, min(int(limit), 1000)),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def enqueue_notification(
+        self,
+        request_id: int,
+        event_key: str,
+        route: str,
+        message: str,
+    ) -> bool:
+        """Persist one logical event/route pair without duplicating it."""
+
+        if not event_key or not route or not message or not message.strip():
+            raise ValueError("Notification delivery fields cannot be empty")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO notification_deliveries (
+                    request_id, event_key, route, message
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (request_id, event_key, route, message.strip()[:2000]),
+            )
+            return cursor.rowcount == 1
+
+    def pending_notification_deliveries(
+        self, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        """Return undelivered outbox rows in stable creation order."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM notification_deliveries
+                WHERE delivered_at IS NULL
+                ORDER BY id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 2000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_notification_delivered(self, delivery_id: int) -> bool:
+        """Atomically record successful delivery of one outbox row."""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE notification_deliveries
+                SET delivered_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND delivered_at IS NULL
+                """,
+                (delivery_id,),
+            )
+            return cursor.rowcount == 1
+
+    def notification_delivered(
+        self, request_id: int, event_key: str, route: str
+    ) -> bool:
+        """Report whether an exact logical event route has been delivered."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT delivered_at FROM notification_deliveries
+                WHERE request_id = ? AND event_key = ? AND route = ?
+                """,
+                (request_id, event_key, route),
+            ).fetchone()
+        return row is not None and row["delivered_at"] is not None
+
+    def mark_notified_if_delivered(self, request_id: int, message: str) -> bool:
+        """Finalize a terminal request after every staged route has succeeded."""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE requests
+                SET notified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND notified_at IS NULL
+                  AND status IN ('complete', 'completed', 'failed')
+                  AND EXISTS (
+                      SELECT 1 FROM notification_deliveries
+                      WHERE request_id = requests.id
+                        AND event_key IN (
+                            'request_completed', 'request_failed'
+                        )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM notification_deliveries
+                      WHERE request_id = requests.id AND delivered_at IS NULL
+                  )
+                """,
+                (request_id,),
+            )
+            if cursor.rowcount != 1:
+                return False
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (request_id, "completion_notified", message[:2000]),
+            )
+            return True
 
     def queued_arr_requests(self, limit: int = 100) -> list[dict[str, Any]]:
         """Return queued requests whose ARR entity may now contain imported media."""

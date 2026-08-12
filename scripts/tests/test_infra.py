@@ -16,6 +16,24 @@ import repair_whisparr_quality
 import validate
 
 
+VALID_CHANNEL_INVENTORY = """\
+requests:
+  movies-tv: 1
+  ebooks: 2
+  audiobooks: 3
+  manga-comics: 4
+  roms: 5
+  sheet-music: 6
+activity:
+  download-queue: 7
+  request-status: 8
+  recent-additions: 9
+system:
+  import-errors: 10
+  system-health: 11
+"""
+
+
 class BackupTests(unittest.TestCase):
     def test_sqlite_backup_is_consistent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -241,6 +259,126 @@ class ValidationTests(unittest.TestCase):
             check = validate.writable_check(Path(directory), "test")
             self.assertTrue(check.ok)
             self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_channel_inventory_requires_unique_positive_request_and_lifecycle_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "channels.yml"
+            path.write_text(VALID_CHANNEL_INVENTORY, encoding="utf-8")
+            inventory = validate.load_channel_inventory(path)
+            self.assertEqual(inventory["activity"]["download-queue"], "7")
+            self.assertTrue(validate.channel_inventory_check(path).ok)
+
+            invalid_documents = (
+                VALID_CHANNEL_INVENTORY.replace("  system-health: 11\n", ""),
+                VALID_CHANNEL_INVENTORY.replace(
+                    "  system-health: 11", "  system-health: invalid"
+                ),
+                VALID_CHANNEL_INVENTORY.replace(
+                    "  system-health: 11", "  system-health: 10"
+                ),
+            )
+            for document in invalid_documents:
+                with self.subTest(document=document):
+                    path.write_text(document, encoding="utf-8")
+                    self.assertFalse(validate.channel_inventory_check(path).ok)
+
+    def test_huey_ready_marker_must_exist_and_contain_only_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "ready"
+            self.assertFalse(validate.huey_ready_check(marker).ok)
+            marker.write_text("starting\n", encoding="utf-8")
+            self.assertFalse(validate.huey_ready_check(marker).ok)
+            marker.write_text("ready\n", encoding="utf-8")
+            self.assertTrue(validate.huey_ready_check(marker).ok)
+
+    def test_arr_native_discord_check_reads_notification_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "arr.db"
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    """
+                    CREATE TABLE Notifications (
+                        Name TEXT, Implementation TEXT,
+                        ConfigContract TEXT, Settings TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO Notifications VALUES (?, ?, ?, ?)",
+                    ("Email", "Email", "EmailSettings", "{}"),
+                )
+
+            self.assertTrue(
+                validate.arr_native_discord_check("radarr", database).ok
+            )
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    "INSERT INTO Notifications VALUES (?, ?, ?, ?)",
+                    ("Lifecycle", "Discord", "DiscordSettings", "{}"),
+                )
+            self.assertFalse(
+                validate.arr_native_discord_check("radarr", database).ok
+            )
+
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute("DELETE FROM Notifications WHERE Name = 'Lifecycle'")
+                connection.execute(
+                    "INSERT INTO Notifications VALUES (?, ?, ?, ?)",
+                    (
+                        "Generic webhook",
+                        "Webhook",
+                        "WebhookSettings",
+                        '{"url":"https://discord.com/api/webhooks/1/private"}',
+                    ),
+                )
+            self.assertFalse(
+                validate.arr_native_discord_check("radarr", database).ok
+            )
+
+    def test_bazarr_native_discord_and_external_webhook_must_be_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "bazarr.db"
+            config = root / "config.yaml"
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    """
+                    CREATE TABLE table_settings_notifier (
+                        name TEXT, enabled INTEGER, url TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO table_settings_notifier VALUES (?, ?, ?)",
+                    ("Discord", 0, None),
+                )
+            config.write_text(
+                "general:\n  use_external_webhook: false\n", encoding="utf-8"
+            )
+            self.assertTrue(
+                validate.bazarr_native_discord_check(database, config).ok
+            )
+
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    "UPDATE table_settings_notifier SET enabled = 1 "
+                    "WHERE name = 'Discord'"
+                )
+            self.assertFalse(
+                validate.bazarr_native_discord_check(database, config).ok
+            )
+
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    "UPDATE table_settings_notifier SET enabled = 0 "
+                    "WHERE name = 'Discord'"
+                )
+            config.write_text(
+                "general:\n  use_external_webhook: true\n", encoding="utf-8"
+            )
+            self.assertFalse(
+                validate.bazarr_native_discord_check(database, config).ok
+            )
 
     def test_bazarr_acceptance_requires_live_integrations_english_defaults_and_all_providers(self):
         settings = {

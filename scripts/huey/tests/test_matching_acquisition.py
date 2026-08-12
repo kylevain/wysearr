@@ -435,6 +435,7 @@ class DirectAcquirerTests(unittest.TestCase):
         response = self.acquirer.submit("ebooks", "The Hobbit", "JRR Tolkien", 51)
         self.assertEqual(response["status"], "needs_selection")
         self.assertIn("outside this media category", response["message"])
+        self.assertIs(response["manual_intervention"], True)
         self.qbittorrent.add_tags.assert_not_called()
         self.qbittorrent.add_magnet.assert_not_called()
         self.qbittorrent.add_torrent.assert_not_called()

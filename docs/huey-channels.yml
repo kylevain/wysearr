@@ -7,15 +7,17 @@ requests:
   sheet-music: 1513348094413246554
 
 activity:
-  # Reserved inventory entry; Huey does not currently publish queue events.
+  # Queued acquisitions, active downloads, and download lifecycle events.
   download-queue: 1513348215255334942
-  # Huey's sole operational auxiliary channel.
+  # Accepted, rejected, completed, failed, and other terminal request states.
   request-status: 1513348792756338769
-  # Reserved inventory entry; Huey does not currently publish additions here.
+  # Newly imported media and newly available DAS library items.
   recent-additions: 1513348243956961290
 
 system:
-  # These system-channel identifiers are reserved and currently unwired.
+  # Reserved for administrative automation; not a lifecycle notification route.
   automation-admin: 1513348339020599447
+  # Service and runtime health issues only.
   system-health: 1513348377893666827
+  # Import failures and events that require manual intervention.
   import-errors: 1513348404372312294
