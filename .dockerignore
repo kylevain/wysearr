@@ -1,0 +1,10 @@
+.git
+.agents
+.codex
+.env
+backups
+config
+state
+**/__pycache__
+**/*.pyc
+**/.pytest_cache

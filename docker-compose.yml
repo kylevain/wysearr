@@ -2,6 +2,12 @@ name: wysearr
 
 x-common: &common
   restart: unless-stopped
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
   environment:
     PUID: ${PUID:-1000}
     PGID: ${PGID:-1000}
@@ -10,83 +16,142 @@ x-common: &common
 services:
   qbittorrent:
     <<: *common
-    image: lscr.io/linuxserver/qbittorrent:5.1.4
+    image: lscr.io/linuxserver/qbittorrent:5.1.4@sha256:c9990949e968e99333f47f49da7d16e81ba6e1469c8c46807a65b984c9e8b6ff
     container_name: qbittorrent
     environment:
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
       TZ: ${TZ:-Pacific/Honolulu}
-      WEBUI_PORT: ${QBITTORRENT_PORT:-8080}
+      WEBUI_PORT: 8080
     volumes:
       - ./config/qbittorrent:/config
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
     ports:
-      - "${QBITTORRENT_PORT:-8080}:8080"
-      - "6881:6881"
-      - "6881:6881/udp"
+      - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${QBITTORRENT_PORT:-8080}:8080"
+      - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:6881:6881"
+      - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:6881:6881/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/ >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   prowlarr:
     <<: *common
-    image: lscr.io/linuxserver/prowlarr:latest
+    image: lscr.io/linuxserver/prowlarr@sha256:1295cff29d10b486c0d8324d1559a552140a5932bf8b3d87e398654414f63f92
     container_name: prowlarr
     volumes:
       - ./config/prowlarr:/config
     ports:
-      - "${PROWLARR_PORT:-9696}:9696"
+      - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${PROWLARR_PORT:-9696}:9696"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9696/ping >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   sonarr:
     <<: *common
-    image: lscr.io/linuxserver/sonarr:latest
+    image: lscr.io/linuxserver/sonarr@sha256:373159ba768e23a3a1c497d9f2b936addf8fd5b1fdce7dd6a14080ac928bfda0
     container_name: sonarr
     volumes:
       - ./config/sonarr:/config
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
       - ${MEDIA_ROOT:-/mnt/media}:/media
     ports:
-      - "${SONARR_PORT:-8989}:8989"
+      - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${SONARR_PORT:-8989}:8989"
+    depends_on:
+      qbittorrent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8989/ping >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   radarr:
     <<: *common
-    image: lscr.io/linuxserver/radarr:latest
+    image: lscr.io/linuxserver/radarr@sha256:a45b5ab0f850f39edb4cc9c95bbd967b52ddc3d4574a4dfb45561177db6c88f4
     container_name: radarr
     volumes:
       - ./config/radarr:/config
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
       - ${MEDIA_ROOT:-/mnt/media}:/media
     ports:
-      - "${RADARR_PORT:-7878}:7878"
+      - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${RADARR_PORT:-7878}:7878"
+    depends_on:
+      qbittorrent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7878/ping >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   lidarr:
     <<: *common
-    image: lscr.io/linuxserver/lidarr:latest
+    image: lscr.io/linuxserver/lidarr@sha256:bfec0ec2dc351fa5928379d785b08be395886f109393b9040ed7973bd1008060
     container_name: lidarr
     volumes:
       - ./config/lidarr:/config
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
       - ${MEDIA_ROOT:-/mnt/media}:/media
     ports:
-      - "${LIDARR_PORT:-8686}:8686"
+      - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${LIDARR_PORT:-8686}:8686"
+    depends_on:
+      qbittorrent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8686/ping >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   bazarr:
     <<: *common
-    image: lscr.io/linuxserver/bazarr:latest
+    image: lscr.io/linuxserver/bazarr@sha256:e464484e7e6cff8ee189036c9ba96977ab054104ea18067ecf6171d0f3f3f8f2
     container_name: bazarr
     volumes:
       - ./config/bazarr:/config
       - ${MEDIA_ROOT:-/mnt/media}:/media
     ports:
-      - "${BAZARR_PORT:-6767}:6767"
+      - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${BAZARR_PORT:-6767}:6767"
+    depends_on:
+      sonarr:
+        condition: service_healthy
+      radarr:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6767/api/system/ping >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   whisparr:
     <<: *common
-    image: ghcr.io/hotio/whisparr:nightly
+    image: ghcr.io/hotio/whisparr@sha256:13f14e5cd86012f775cc07fe672cd279a295ef41605b8fc3ebfb47583bf50eac
     container_name: whisparr
     volumes:
       - ./config/whisparr:/config
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
       - ${MEDIA_ROOT:-/mnt/media}:/media
     ports:
-      - "${WHISPARR_PORT:-6969}:6969"
+      - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${WHISPARR_PORT:-6969}:6969"
+    depends_on:
+      qbittorrent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6969/ping >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   bookbot:
     <<: *common
@@ -94,10 +159,37 @@ services:
       context: .
       dockerfile: docker/bookbot/Dockerfile
     container_name: bookbot
+    user: "${PUID:-1000}:${PGID:-1000}"
+    init: true
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Pacific/Honolulu}
+      PYTHONUNBUFFERED: 1
+      QBITTORRENT_URL: http://qbittorrent:8080
+      QBITTORRENT_USERNAME: ${QBITTORRENT_USERNAME:-admin}
+      QBITTORRENT_PASSWORD: ${QBITTORRENT_PASSWORD}
+      BOOKBOT_DB_PATH: /config/bookbot.db
+      BOOKBOT_HEALTH_PATH: /config/bookbot-health.json
+      MEDIA_ROOT: /media
+      TORRENT_ROOT: /downloads
+      HUEY_DB_PATH: /state/huey/huey.db
+      POLL_SECONDS: ${BOOKBOT_POLL_SECONDS:-60}
+      RETENTION_DAYS: ${TORRENT_RETENTION_DAYS:-14}
     volumes:
       - ./config/bookbot:/config
+      - ./state/huey:/state/huey
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
       - ${MEDIA_ROOT:-/mnt/media}:/media
+    depends_on:
+      qbittorrent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/processing/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
 
   huey:
     <<: *common
@@ -105,7 +197,38 @@ services:
       context: .
       dockerfile: docker/huey/Dockerfile
     container_name: huey
+    user: "${PUID:-1000}:${PGID:-1000}"
+    init: true
     environment:
       DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
+      PYTHONUNBUFFERED: 1
+      PROWLARR_URL: http://prowlarr:9696
+      PROWLARR_API_KEY: ${PROWLARR_API_KEY}
+      SONARR_URL: http://sonarr:8989
+      SONARR_API_KEY: ${SONARR_API_KEY}
+      RADARR_URL: http://radarr:7878
+      RADARR_API_KEY: ${RADARR_API_KEY}
+      LIDARR_URL: http://lidarr:8686
+      LIDARR_API_KEY: ${LIDARR_API_KEY}
+      QBITTORRENT_URL: http://qbittorrent:8080
+      QBITTORRENT_USERNAME: ${QBITTORRENT_USERNAME:-admin}
+      QBITTORRENT_PASSWORD: ${QBITTORRENT_PASSWORD}
     volumes:
       - ./state/huey:/state
+    depends_on:
+      qbittorrent:
+        condition: service_healthy
+      prowlarr:
+        condition: service_healthy
+      sonarr:
+        condition: service_healthy
+      radarr:
+        condition: service_healthy
+      lidarr:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/huey/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
