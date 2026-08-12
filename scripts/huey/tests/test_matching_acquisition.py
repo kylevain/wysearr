@@ -11,10 +11,12 @@ from acquisition import (
     PROWLARR_CATEGORIES,
     DirectAcquirer,
     UnsupportedTorrentVersion,
+    ambiguity_message,
     magnet_info_hash,
     torrent_info_hash,
 )
 from matching import normalize_text, select_arr_candidate, select_release
+from results import safe_display_title
 
 
 class MatchingTests(unittest.TestCase):
@@ -69,11 +71,19 @@ class MatchingTests(unittest.TestCase):
             1091,
         )
 
+    def test_display_sanitizer_keeps_titles_but_rejects_embedded_credentials(self):
+        self.assertEqual(safe_display_title("The Secret Garden"), "The Secret Garden")
+        self.assertEqual(
+            safe_display_title("Release token=do-not-show", "Requested Book"),
+            "Requested Book",
+        )
+
 
 class DirectAcquirerTests(unittest.TestCase):
     def setUp(self):
         self.prowlarr = Mock()
         self.qbittorrent = Mock()
+        self.qbittorrent.find_torrent.return_value = None
         self.acquirer = DirectAcquirer(self.prowlarr, self.qbittorrent)
 
     def test_category_filters_match_media_policy(self):
@@ -192,6 +202,96 @@ class DirectAcquirerTests(unittest.TestCase):
         self.qbittorrent.add_magnet.assert_not_called()
         self.qbittorrent.add_torrent.assert_not_called()
 
+    def test_ambiguous_response_lists_at_most_three_safe_distinctions(self):
+        self.prowlarr.search.return_value = [
+            {
+                "title": "The Archive Jane Doe EPUB retail edition",
+                "seeders": 20,
+                "size": 2 * 1024 * 1024,
+                "guid": "a",
+            },
+            {
+                "title": "The Archive Jane Doe EPUB revised edition",
+                "seeders": 20,
+                "size": 3 * 1024 * 1024,
+                "guid": "b",
+            },
+            {
+                "title": "The Archive Jane Doe PDF illustrated edition",
+                "seeders": 20,
+                "size": 4 * 1024 * 1024,
+                "guid": "c",
+            },
+            {
+                "title": "The Archive Jane Doe MOBI anniversary edition",
+                "seeders": 20,
+                "size": 5 * 1024 * 1024,
+                "guid": "d",
+            },
+        ]
+        response = self.acquirer.submit("ebooks", "The Archive", "Jane Doe")
+        self.assertEqual(response["status"], "needs_selection")
+        candidate_lines = [
+            line for line in response["message"].splitlines() if line.startswith("- ")
+        ]
+        self.assertEqual(len(candidate_lines), 3)
+        self.assertIn("EPUB", response["message"])
+        self.assertIn("MiB", response["message"])
+        self.assertEqual(
+            sum(
+                phrase in response["message"]
+                for phrase in (
+                    "retail edition",
+                    "revised edition",
+                    "illustrated edition",
+                    "anniversary edition",
+                )
+            ),
+            3,
+        )
+        self.qbittorrent.add_magnet.assert_not_called()
+        self.qbittorrent.add_torrent.assert_not_called()
+
+    def test_ambiguous_candidate_metadata_is_sanitized(self):
+        candidates = [
+            {
+                "title": "The Archive Jane Doe EPUB @everyone",
+                "seeders": 20,
+                "guid": "safe-a",
+            },
+            {
+                "title": "The Archive Jane Doe PDF https://tracker.invalid/?token=do-not-show",
+                "seeders": 20,
+                "guid": "secret-guid",
+            },
+            {
+                "title": "The Archive Jane Doe MOBI `retail`",
+                "seeders": 20,
+                "guid": "safe-c",
+            },
+        ]
+        selection = self.acquirer.choose("ebooks", "The Archive", "Jane Doe", candidates)
+        message = ambiguity_message(
+            selection,
+            minimum_confidence=self.acquirer.minimum_confidence,
+            runner_up_gap=self.acquirer.runner_up_gap,
+        )
+        self.assertNotIn("https://", message)
+        self.assertNotIn("do-not-show", message)
+        self.assertNotIn("secret-guid", message)
+        self.assertNotIn("@everyone", message)
+        self.assertNotIn("`", message)
+        self.assertIn("＠everyone", message)
+
+    def test_low_confidence_response_does_not_dump_candidates(self):
+        self.prowlarr.search.return_value = [
+            {"title": "Unrelated private release", "seeders": 900, "guid": "hidden"}
+        ]
+        response = self.acquirer.submit("ebooks", "The Archive", "Jane Doe")
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertNotIn("Closest safe distinctions", response["message"])
+        self.assertNotIn("Unrelated private release", response["message"])
+
     def test_explicit_usenet_result_is_not_submitted_to_qbittorrent(self):
         self.prowlarr.search.return_value = [
             {
@@ -275,6 +375,107 @@ class DirectAcquirerTests(unittest.TestCase):
         self.assertEqual(response["status"], "queued")
         self.assertEqual(response["external_id"], info_hash)
         self.qbittorrent.add_magnet.assert_called_once()
+
+    def test_existing_exact_torrent_is_tagged_without_duplicate_add(self):
+        info_hash = "d" * 40
+        self.prowlarr.search.return_value = [
+            {
+                "title": "The Hobbit JRR Tolkien EPUB",
+                "seeders": 20,
+                "infoHash": info_hash,
+                "magnetUrl": f"magnet:?xt=urn:btih:{info_hash}",
+            }
+        ]
+        self.qbittorrent.find_torrent.return_value = {
+            "hash": info_hash,
+            "category": "ebooks",
+        }
+        response = self.acquirer.submit("ebooks", "The Hobbit", "JRR Tolkien", 49)
+        self.assertEqual(response["status"], "queued")
+        self.assertIn("already queued", response["message"])
+        self.assertEqual(response["external_id"], info_hash)
+        self.qbittorrent.add_tags.assert_called_once_with(info_hash, "huey-49")
+        self.qbittorrent.add_magnet.assert_not_called()
+        self.qbittorrent.add_torrent.assert_not_called()
+
+    def test_existing_imported_torrent_waits_for_bookbot_ledger_verification(self):
+        info_hash = "e" * 40
+        self.prowlarr.search.return_value = [
+            {
+                "title": "The Hobbit JRR Tolkien EPUB",
+                "seeders": 20,
+                "infoHash": info_hash,
+                "magnetUrl": f"magnet:?xt=urn:btih:{info_hash}",
+            }
+        ]
+        self.qbittorrent.find_torrent.return_value = {
+            "hash": info_hash,
+            "category": "ebooks-imported",
+        }
+        response = self.acquirer.submit("ebooks", "The Hobbit", "JRR Tolkien", 50)
+        self.assertEqual(response["status"], "queued")
+        self.assertIn("BookBot will verify", response["message"])
+        self.assertNotEqual(response["status"], "completed")
+        self.qbittorrent.add_magnet.assert_not_called()
+
+    def test_existing_torrent_in_other_category_fails_closed(self):
+        info_hash = "f" * 40
+        self.prowlarr.search.return_value = [
+            {
+                "title": "The Hobbit JRR Tolkien EPUB",
+                "seeders": 20,
+                "infoHash": info_hash,
+                "magnetUrl": f"magnet:?xt=urn:btih:{info_hash}",
+            }
+        ]
+        self.qbittorrent.find_torrent.return_value = {
+            "hash": info_hash,
+            "category": "movies",
+        }
+        response = self.acquirer.submit("ebooks", "The Hobbit", "JRR Tolkien", 51)
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertIn("outside this media category", response["message"])
+        self.qbittorrent.add_tags.assert_not_called()
+        self.qbittorrent.add_magnet.assert_not_called()
+        self.qbittorrent.add_torrent.assert_not_called()
+
+    def test_selected_indexer_title_is_sanitized_before_reply_and_persistence(self):
+        info_hash = "1" * 40
+        secret_title = "The Archive EPUB @everyone https://tracker.invalid/?token=do-not-show"
+        self.prowlarr.search.return_value = [
+            {
+                "title": secret_title,
+                "seeders": 20,
+                "infoHash": info_hash,
+                "magnetUrl": f"magnet:?xt=urn:btih:{info_hash}",
+            }
+        ]
+        response = self.acquirer.submit("ebooks", "The Archive", request_id=52)
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["external_title"], "The Archive")
+        self.assertNotIn("@everyone", response["message"])
+        self.assertNotIn("https://", response["message"])
+        self.assertNotIn("do-not-show", response["message"])
+
+    def test_existing_qbit_reply_also_uses_sanitized_selected_title(self):
+        info_hash = "2" * 40
+        self.prowlarr.search.return_value = [
+            {
+                "title": "The Archive EPUB `@everyone`",
+                "seeders": 20,
+                "infoHash": info_hash,
+                "magnetUrl": f"magnet:?xt=urn:btih:{info_hash}",
+            }
+        ]
+        self.qbittorrent.find_torrent.return_value = {
+            "hash": info_hash,
+            "category": "ebooks",
+        }
+        response = self.acquirer.submit("ebooks", "The Archive", request_id=53)
+        self.assertEqual(response["status"], "queued")
+        self.assertNotIn("@everyone", response["message"])
+        self.assertNotIn("`", response["message"])
+        self.assertIn("＠everyone", response["message"])
 
     def test_info_hash_helpers_support_magnet_and_torrent_file(self):
         info = b"d4:name4:teste"

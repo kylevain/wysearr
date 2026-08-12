@@ -97,20 +97,67 @@ class ArrClientTests(unittest.TestCase):
         command = session.calls[4][2]["json"]
         self.assertEqual(command, {"name": "MoviesSearch", "movieIds": [44]})
 
-    def test_existing_arr_item_only_triggers_search(self):
+    def test_existing_monitored_arr_item_does_not_start_duplicate_search(self):
         session = FakeSession(
             [
                 FakeResponse(json_value=[{"title": "Arrival", "tmdbId": 329865, "id": 44}]),
-                FakeResponse(json_value={"title": "Arrival", "id": 44, "monitored": True}),
+                FakeResponse(
+                    json_value={
+                        "title": "Arrival",
+                        "id": 44,
+                        "monitored": True,
+                        "hasFile": False,
+                    }
+                ),
+            ]
+        )
+        response = RadarrClient("http://radarr:7878", "key", session=session).submit("Arrival")
+        self.assertEqual(response["status"], "queued")
+        self.assertIn("already monitored", response["message"])
+        self.assertIn("no duplicate search", response["message"])
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+
+    def test_existing_imported_arr_item_returns_completed_without_mutation(self):
+        session = FakeSession(
+            [
+                FakeResponse(json_value=[{"title": "Arrival", "tmdbId": 329865, "id": 44}]),
+                FakeResponse(
+                    json_value={
+                        "title": "Arrival",
+                        "id": 44,
+                        "monitored": True,
+                        "hasFile": True,
+                    }
+                ),
+            ]
+        )
+        response = RadarrClient("http://radarr:7878", "key", session=session).submit("Arrival")
+        self.assertEqual(response["status"], "completed")
+        self.assertEqual(response["external_id"], "44")
+        self.assertIn("already has imported media", response["message"])
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+
+    def test_existing_unmonitored_arr_item_is_monitored_then_searched(self):
+        existing = {
+            "title": "Arrival",
+            "tmdbId": 329865,
+            "id": 44,
+            "monitored": False,
+            "hasFile": False,
+        }
+        session = FakeSession(
+            [
+                FakeResponse(json_value=[existing]),
+                FakeResponse(json_value=existing),
+                FakeResponse(json_value={**existing, "monitored": True}),
                 FakeResponse(json_value={"id": 9}),
             ]
         )
         response = RadarrClient("http://radarr:7878", "key", session=session).submit("Arrival")
         self.assertEqual(response["status"], "queued")
-        self.assertEqual(len(session.calls), 3)
-        self.assertEqual(session.calls[1][0], "PUT")
-        self.assertTrue(session.calls[1][2]["json"]["monitored"])
-        self.assertTrue(session.calls[2][1].endswith("/api/v3/command"))
+        self.assertIn("enabled monitoring and started a search", response["message"])
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET", "PUT", "POST"])
+        self.assertTrue(session.calls[2][2]["json"]["monitored"])
 
     def test_no_safe_arr_match_returns_needs_selection_without_add(self):
         session = FakeSession([FakeResponse(json_value=[{"title": "Unrelated", "tmdbId": 1}])])
@@ -457,6 +504,53 @@ class QBittorrentClientTests(unittest.TestCase):
         client.add_tags("a" * 40, "huey-42")
         endpoints = [call[1].rsplit("/", 1)[-1] for call in session.calls]
         self.assertEqual(endpoints, ["login", "addTags", "login", "addTags"])
+
+    def test_find_torrent_uses_exact_hash_and_is_read_only(self):
+        torrent_hash = "a" * 40
+        session = FakeSession(
+            [
+                FakeResponse(),
+                FakeResponse(
+                    json_value=[{"hash": torrent_hash.upper(), "category": "ebooks"}]
+                ),
+            ]
+        )
+        client = QBittorrentClient("http://qbittorrent:8080", "u", "p", session=session)
+        found = client.find_torrent(torrent_hash)
+        self.assertEqual(found["category"], "ebooks")
+        self.assertEqual([call[0] for call in session.calls], ["POST", "GET"])
+        self.assertEqual(session.calls[-1][2]["params"], {"hashes": torrent_hash})
+
+    def test_find_torrent_returns_none_only_for_an_empty_exact_result(self):
+        session = FakeSession([FakeResponse(), FakeResponse(json_value=[])])
+        client = QBittorrentClient("http://qbittorrent:8080", "u", "p", session=session)
+        self.assertIsNone(client.find_torrent("b" * 40))
+
+        for value in ({}, [{"hash": "not-the-requested-hash"}], ["invalid"]):
+            with self.subTest(value=value):
+                session = FakeSession([FakeResponse(), FakeResponse(json_value=value)])
+                client = QBittorrentClient(
+                    "http://qbittorrent:8080", "u", "p", session=session
+                )
+                with self.assertRaisesRegex(ServiceError, "invalid torrent response"):
+                    client.find_torrent("b" * 40)
+
+    def test_find_torrent_reauthenticates_once_after_expired_session(self):
+        torrent_hash = "c" * 40
+        session = FakeSession(
+            [
+                FakeResponse(),
+                FakeResponse(status=403),
+                FakeResponse(),
+                FakeResponse(json_value=[]),
+            ]
+        )
+        client = QBittorrentClient("http://qbittorrent:8080", "u", "p", session=session)
+        self.assertIsNone(client.find_torrent(torrent_hash))
+        self.assertEqual(
+            [call[1].rsplit("/", 1)[-1] for call in session.calls],
+            ["login", "info", "login", "info"],
+        )
 
 
 if __name__ == "__main__":

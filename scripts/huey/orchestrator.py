@@ -10,6 +10,7 @@ try:
     from .clients import ServiceError
     from .database import RequestStore
     from .handlers import dispatch
+    from .matching import request_target_key
     from .parser import RequestParseError, parse_request
     from .results import normalize_result, result
     from .services import ServiceRegistry
@@ -17,6 +18,7 @@ except ImportError:  # pragma: no cover - direct container entrypoint
     from clients import ServiceError
     from database import RequestStore
     from handlers import dispatch
+    from matching import request_target_key
     from parser import RequestParseError, parse_request
     from results import normalize_result, result
     from services import ServiceRegistry
@@ -47,16 +49,34 @@ class RequestProcessor:
         self.dispatcher = dispatcher
 
     @staticmethod
-    def _duplicate_result(record: Mapping[str, Any]) -> dict[str, Any]:
+    def _duplicate_result(
+        record: Mapping[str, Any], delivery_message_id: str | int
+    ) -> dict[str, Any]:
+        status = str(record.get("status") or "")
+        same_delivery = str(record.get("message_id")) == str(delivery_message_id)
+        if same_delivery:
+            message = (
+                f"This Discord message is already request #{record['id']} "
+                f"(status: {status})."
+            )
+        elif status in {"complete", "completed"}:
+            message = f"Previous request #{record['id']} already completed this exact target."
+        else:
+            message = (
+                f"This exact target is already tracked as request #{record['id']} "
+                f"(status: {status})."
+            )
         value = result(
             (
                 "completed"
-                if record.get("status") == "complete"
-                else record.get("status")
-                if record.get("status") in {"queued", "needs_selection", "failed", "completed"}
+                if status in {"complete", "completed"}
+                else "queued"
+                if status in {"new", "processing", "queued"}
+                else status
+                if status in {"needs_selection", "failed"}
                 else "failed"
             ),
-            f"This Discord message is already request #{record['id']} (status: {record['status']}).",
+            message,
             service=record.get("service"),
             external_id=record.get("external_id"),
             external_title=record.get("external_title"),
@@ -77,7 +97,7 @@ class RequestProcessor:
             self.store.add_event(
                 existing["id"], "duplicate_delivery", "Duplicate Discord delivery ignored"
             )
-            return self._duplicate_result(existing)
+            return self._duplicate_result(existing, message_id)
 
         content = str(delivery.get("content") or "")
         media_type = str(delivery["media_type"])
@@ -95,7 +115,7 @@ class RequestProcessor:
                 author=None,
             )
             if not created:
-                return self._duplicate_result(record)
+                return self._duplicate_result(record, message_id)
             self.store.transition(
                 record["id"],
                 "needs_selection",
@@ -116,9 +136,10 @@ class RequestProcessor:
             raw_request=content,
             title=parsed["title"],
             author=parsed["author"],
+            target_key=request_target_key(media_type, parsed),
         )
         if not created:
-            return self._duplicate_result(record)
+            return self._duplicate_result(record, message_id)
 
         request_id = record["id"]
         self.store.transition(request_id, "processing", "Dispatching request to acquisition service")

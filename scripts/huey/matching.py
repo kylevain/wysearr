@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import unicodedata
@@ -14,6 +15,37 @@ def normalize_text(value: Any) -> str:
     text = unicodedata.normalize("NFKD", str(value or ""))
     text = "".join(character for character in text if not unicodedata.combining(character))
     return " ".join(re.findall(r"[a-z0-9]+", text.casefold()))
+
+
+def normalize_identity_text(value: Any) -> str:
+    """Normalize case/spacing while preserving identity-bearing punctuation."""
+
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return " ".join(text.split())
+
+
+def request_target_key(media_type: str, parsed: Mapping[str, Any]) -> str | None:
+    """Return a conservative exact request identity, never a fuzzy match.
+
+    Kind, title, author, and edition/year tokens remain part of the boundary.
+    Normalization removes only superficial case and whitespace differences.
+    Punctuation, accents, kind, author, and edition/year terms are retained to
+    avoid merging titles which merely look similar.
+    """
+
+    normalized_title = normalize_identity_text(parsed.get("title"))
+    if not normalized_title:
+        return None
+    return "v1:" + json.dumps(
+        [
+            normalize_identity_text(media_type),
+            normalize_identity_text(parsed.get("kind")),
+            normalized_title,
+            normalize_identity_text(parsed.get("author")),
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _tokens(value: str) -> set[str]:

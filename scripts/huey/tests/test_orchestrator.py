@@ -10,6 +10,7 @@ sys.path.insert(0, str(HUEY_ROOT))
 
 from clients import ServiceError
 from database import RequestStore
+from matching import request_target_key
 from orchestrator import RequestProcessor
 from results import result
 
@@ -70,6 +71,85 @@ class RequestProcessorTests(unittest.TestCase):
             event["event_type"] for event in self.store.events_for(first["request_id"])
         ]
         self.assertIn("duplicate_delivery", event_types)
+
+    def test_distinct_message_for_exact_active_target_reuses_request(self):
+        dispatcher = Mock(return_value=result("queued", "Queued"))
+        processor = RequestProcessor(self.store, services={}, dispatcher=dispatcher)
+        first = processor.process(self.delivery)
+        duplicate = processor.process(
+            {
+                **self.delivery,
+                "message_id": "101",
+                "content": "dune by FRANK HERBERT",
+            }
+        )
+        alias_redelivery = processor.process(
+            {
+                **self.delivery,
+                "message_id": "101",
+                "content": "dune by FRANK HERBERT",
+            }
+        )
+
+        self.assertEqual(duplicate["status"], "queued")
+        self.assertEqual(duplicate["request_id"], first["request_id"])
+        self.assertIn("exact target is already tracked", duplicate["message"])
+        self.assertEqual(alias_redelivery["request_id"], first["request_id"])
+        self.assertEqual(dispatcher.call_count, 1)
+
+    def test_completed_exact_target_returns_previous_request(self):
+        dispatcher = Mock(return_value=result("queued", "Queued", service="qbittorrent"))
+        processor = RequestProcessor(self.store, services={}, dispatcher=dispatcher)
+        first = processor.process(self.delivery)
+        self.store.transition(first["request_id"], "completed", "Imported")
+        duplicate = processor.process({**self.delivery, "message_id": "102"})
+        self.assertEqual(duplicate["status"], "completed")
+        self.assertIn("Previous request", duplicate["message"])
+        self.assertIn("already completed", duplicate["message"])
+        self.assertEqual(dispatcher.call_count, 1)
+
+    def test_failed_exact_target_can_be_retried_by_new_message(self):
+        dispatcher = Mock(return_value=result("failed", "No provider accepted it"))
+        processor = RequestProcessor(self.store, services={}, dispatcher=dispatcher)
+        first = processor.process(self.delivery)
+        retry = processor.process({**self.delivery, "message_id": "103"})
+        self.assertNotEqual(retry["request_id"], first["request_id"])
+        self.assertEqual(dispatcher.call_count, 2)
+
+    def test_target_identity_preserves_kind_author_and_edition_tokens(self):
+        ebook = request_target_key(
+            "ebooks", {"title": "Dune", "author": "Frank Herbert"}
+        )
+        self.assertEqual(
+            ebook,
+            request_target_key("ebooks", {"title": "DUNE", "author": "frank herbert"}),
+        )
+        self.assertNotEqual(
+            ebook,
+            request_target_key("ebooks", {"title": "DUNE!!!", "author": "frank herbert"}),
+        )
+        self.assertNotEqual(
+            ebook,
+            request_target_key("ebooks", {"title": "Dune illustrated", "author": "Frank Herbert"}),
+        )
+        self.assertNotEqual(
+            ebook,
+            request_target_key("ebooks", {"title": "Dune", "author": "Brian Herbert"}),
+        )
+        self.assertNotEqual(
+            request_target_key("movies-tv", {"kind": "movie", "title": "The Office"}),
+            request_target_key("movies-tv", {"kind": "tv", "title": "The Office"}),
+        )
+        self.assertNotEqual(
+            request_target_key("ebooks", {"title": "雪国"}),
+            request_target_key("ebooks", {"title": "人間失格"}),
+        )
+        self.assertNotEqual(
+            request_target_key("ebooks", {"title": "Resume"}),
+            request_target_key("ebooks", {"title": "Résumé"}),
+        )
+        self.assertIn("雪国", request_target_key("ebooks", {"title": "雪国"}))
+        self.assertIsNone(request_target_key("ebooks", {"title": "   "}))
 
     def test_parser_rejection_is_saved_and_actionable(self):
         dispatcher = Mock()

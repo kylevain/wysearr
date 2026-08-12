@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS requests (
     raw_request TEXT NOT NULL,
     title TEXT,
     author TEXT,
+    target_key TEXT,
     status TEXT NOT NULL DEFAULT 'new',
     service TEXT,
     external_id TEXT,
@@ -25,4 +26,11 @@ CREATE TABLE IF NOT EXISTS events (
     event_type TEXT NOT NULL,
     message TEXT NOT NULL,
     FOREIGN KEY(request_id) REFERENCES requests(id)
+);
+
+CREATE TABLE IF NOT EXISTS delivery_aliases (
+    message_id TEXT PRIMARY KEY,
+    request_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE
 );

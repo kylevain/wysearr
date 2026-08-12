@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import math
 import re
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
@@ -12,11 +13,11 @@ from urllib.parse import parse_qs, urlparse
 try:
     from .clients import ProwlarrClient, QBittorrentClient, ServiceError
     from .matching import Selection, select_release
-    from .results import result
+    from .results import result, safe_display_title, sanitize_display_text
 except ImportError:  # pragma: no cover - direct container entrypoint
     from clients import ProwlarrClient, QBittorrentClient, ServiceError
     from matching import Selection, select_release
-    from results import result
+    from results import result, safe_display_title, sanitize_display_text
 
 
 PROWLARR_CATEGORIES = {
@@ -28,10 +29,90 @@ PROWLARR_CATEGORIES = {
 }
 INFO_HASH = re.compile(r"^[a-fA-F0-9]{40}(?:[a-fA-F0-9]{24})?$")
 LOGGER = logging.getLogger("huey.acquisition")
+_FORMAT_WORDS = (
+    "epub",
+    "pdf",
+    "mobi",
+    "azw3",
+    "azw",
+    "m4b",
+    "mp3",
+    "flac",
+    "aac",
+)
 
 
 class UnsupportedTorrentVersion(ValueError):
     """The payload uses an info-hash scheme Huey cannot correlate safely."""
+
+
+def _human_size(value: object) -> str | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(size) or size <= 0 or size > 1024**5:
+        return None
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    unit = units[0]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            break
+        size /= 1024
+    return f"{size:.0f} {unit}" if unit in {"B", "KiB"} else f"{size:.1f} {unit}"
+
+
+def _safe_candidate_summary(item: Mapping[str, Any]) -> str | None:
+    title = sanitize_display_text(item.get("title"), limit=120)
+    if title is None:
+        return None
+
+    normalized_title = title.casefold()
+    details: list[str] = []
+    for format_name in _FORMAT_WORDS:
+        if re.search(
+            rf"(?<![a-z0-9]){re.escape(format_name)}(?![a-z0-9])",
+            normalized_title,
+        ):
+            details.append(format_name.upper())
+            break
+    size = _human_size(item.get("size"))
+    if size:
+        details.append(size)
+    return f"{title} ({', '.join(details)})" if details else title
+
+
+def ambiguity_message(
+    selection: Selection,
+    *,
+    minimum_confidence: float,
+    runner_up_gap: float,
+) -> str:
+    """Render at most three safe distinctions from the actual ambiguity band."""
+
+    summaries: list[str] = []
+    if selection.reason == "ambiguous" and selection.ranked:
+        top_score = selection.ranked[0].score
+        for candidate in selection.ranked:
+            if candidate.score < minimum_confidence:
+                continue
+            if top_score - candidate.score >= runner_up_gap:
+                continue
+            summary = _safe_candidate_summary(candidate.item)
+            if summary and summary not in summaries:
+                summaries.append(summary)
+            if len(summaries) == 3:
+                break
+    guidance = "Add an author, edition, platform, year, or format."
+    if not summaries:
+        return f"Several releases matched too closely to choose safely. {guidance}"
+    candidates = "\n".join(f"- {summary}" for summary in summaries)
+    return (
+        "Several releases matched too closely to choose safely. "
+        f"{guidance}\nClosest safe distinctions:\n{candidates}"
+    )
 
 
 def normalize_info_hash(value: object) -> str | None:
@@ -227,9 +308,10 @@ class DirectAcquirer:
             if selection.reason == "no_results":
                 message = "No matching release was found. Check the title and try again later."
             elif selection.reason == "ambiguous":
-                message = (
-                    "Several releases matched too closely to choose safely. "
-                    "Add an author, edition, platform, or format."
+                message = ambiguity_message(
+                    selection,
+                    minimum_confidence=self.minimum_confidence,
+                    runner_up_gap=self.runner_up_gap,
                 )
             else:
                 message = (
@@ -239,7 +321,7 @@ class DirectAcquirer:
             return result("needs_selection", message, service="prowlarr")
 
         selected = selection.selected
-        selected_title = str(selected.get("title") or title)
+        selected_title = safe_display_title(selected.get("title"), title)
         category = f"{self.category_prefix}{media_type}"
         tags = f"huey-{request_id}" if request_id is not None else None
         magnet = str(selected.get("magnetUrl") or "")
@@ -312,6 +394,43 @@ class DirectAcquirer:
                 "needs_selection",
                 "The best match has no stable torrent identity. Try a different or more specific release.",
                 service="prowlarr",
+                external_title=selected_title,
+            )
+
+        existing = self.qbittorrent.find_torrent(info_hash)
+        if existing is not None:
+            existing_category = str(existing.get("category") or "")
+            allowed_categories = {category, f"{category}-imported"}
+            if existing_category not in allowed_categories:
+                return result(
+                    "needs_selection",
+                    "That exact torrent already exists outside this media category. "
+                    "An administrator must review it before retrying.",
+                    service="qbittorrent",
+                    external_id=info_hash,
+                    external_title=selected_title,
+                )
+            if tags:
+                try:
+                    self.qbittorrent.add_tags(info_hash, tags)
+                except ServiceError:
+                    # Persisting the exact hash still lets BookBot reconcile a
+                    # safe imported ledger entry if the tag update is delayed.
+                    LOGGER.warning(
+                        "qBittorrent already had a request but deferred its correlation tag"
+                    )
+            if existing_category.endswith("-imported"):
+                message = (
+                    f"{selected_title} already has an imported qBittorrent record; "
+                    "BookBot will verify its import ledger."
+                )
+            else:
+                message = f"{selected_title} is already queued in qBittorrent."
+            return result(
+                "queued",
+                message,
+                service="qbittorrent",
+                external_id=info_hash,
                 external_title=selected_title,
             )
 

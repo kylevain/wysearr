@@ -17,6 +17,7 @@ _REQUEST_COLUMNS = {
     "external_title": "TEXT",
     "error": "TEXT",
     "notified_at": "TEXT",
+    "target_key": "TEXT",
 }
 
 
@@ -56,8 +57,13 @@ class RequestStore:
             self._merge_duplicate_messages(connection)
             self._ensure_unique_message_index(connection)
             self._fail_interrupted_requests(connection)
+            self._backfill_target_keys(connection)
             connection.executescript(
                 """
+                CREATE UNIQUE INDEX IF NOT EXISTS requests_active_target_uq
+                    ON requests(target_key)
+                    WHERE target_key IS NOT NULL
+                      AND status IN ('new', 'processing', 'queued', 'complete', 'completed');
                 CREATE INDEX IF NOT EXISTS requests_status_idx
                     ON requests(status, updated_at);
                 CREATE INDEX IF NOT EXISTS requests_media_created_idx
@@ -98,6 +104,75 @@ class RequestStore:
         for name, definition in _REQUEST_COLUMNS.items():
             if name not in columns:
                 connection.execute(f"ALTER TABLE requests ADD COLUMN {name} {definition}")
+
+    @staticmethod
+    def _backfill_target_keys(connection: sqlite3.Connection) -> None:
+        """Give historical active/completed rows the same exact identity boundary.
+
+        Historical failed and selection-needed rows stay unkeyed so they remain
+        retryable. If historical active rows already duplicate one another, one
+        terminal-first canonical row is keyed and the pre-existing records are
+        otherwise left untouched rather than silently merged.
+        """
+
+        try:
+            from .matching import request_target_key
+            from .parser import RequestParseError, parse_request
+        except ImportError:  # pragma: no cover - direct container entrypoint
+            from matching import request_target_key
+            from parser import RequestParseError, parse_request
+
+        rows = connection.execute(
+            """
+            SELECT id, media_type, raw_request, status
+            FROM requests
+            WHERE target_key IS NULL
+              AND status IN ('queued', 'complete', 'completed')
+            ORDER BY id
+            """
+        ).fetchall()
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            try:
+                parsed = parse_request(str(row["raw_request"]), str(row["media_type"]))
+            except RequestParseError:
+                continue
+            key = request_target_key(str(row["media_type"]), parsed)
+            if key is None:
+                continue
+            grouped.setdefault(key, []).append(row)
+
+        for key, candidates in grouped.items():
+            already_keyed = connection.execute(
+                """
+                SELECT id FROM requests
+                WHERE target_key = ?
+                  AND status IN ('new', 'processing', 'queued', 'complete', 'completed')
+                LIMIT 1
+                """,
+                (key,),
+            ).fetchone()
+            if already_keyed is not None:
+                continue
+            canonical = min(
+                candidates,
+                key=lambda row: (
+                    0 if row["status"] in {"complete", "completed"} else 1,
+                    row["id"],
+                ),
+            )
+            connection.execute(
+                "UPDATE requests SET target_key = ? WHERE id = ? AND target_key IS NULL",
+                (key, canonical["id"]),
+            )
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (
+                    canonical["id"],
+                    "migration_target_key",
+                    "Backfilled conservative exact-target identity",
+                ),
+            )
 
     @staticmethod
     def _merge_duplicate_messages(connection: sqlite3.Connection) -> None:
@@ -192,6 +267,16 @@ class RequestStore:
             row = connection.execute(
                 "SELECT * FROM requests WHERE message_id = ?", (str(message_id),)
             ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    """
+                    SELECT requests.*
+                    FROM delivery_aliases
+                    JOIN requests ON requests.id = delivery_aliases.request_id
+                    WHERE delivery_aliases.message_id = ?
+                    """,
+                    (str(message_id),),
+                ).fetchone()
         return dict(row) if row else None
 
     def create_request(
@@ -205,8 +290,14 @@ class RequestStore:
         raw_request: str,
         title: str | None,
         author: str | None,
+        target_key: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        """Insert once by Discord message ID and return ``(record, created)``."""
+        """Reserve one exact target and return its canonical request record.
+
+        Discord redeliveries are keyed by message ID. Distinct messages are
+        coalesced only while the exact canonical target is active or complete;
+        failed and ``needs_selection`` requests deliberately remain retryable.
+        """
 
         values = (
             str(discord_user_id),
@@ -217,40 +308,81 @@ class RequestStore:
             raw_request,
             title,
             author,
+            target_key,
         )
         with self.connect() as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO requests (
-                    discord_user_id, discord_username, channel_id, message_id,
-                    media_type, raw_request, title, author
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(message_id) DO NOTHING
-                """,
-                values,
-            )
-            created = cursor.rowcount == 1
-            if created:
-                request_id = cursor.lastrowid
-                connection.execute(
-                    "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
-                    (request_id, "received", "Request received from Discord"),
-                )
-            else:
+            # Serialize the read-before-insert reservation. This prevents two
+            # simultaneous Discord messages for one exact target from both
+            # reaching an acquisition handler.
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT id FROM requests WHERE message_id = ?", (str(message_id),)
+            ).fetchone()
+            if existing is None:
                 existing = connection.execute(
-                    "SELECT id FROM requests WHERE message_id = ?", (str(message_id),)
+                    "SELECT request_id AS id FROM delivery_aliases WHERE message_id = ?",
+                    (str(message_id),),
                 ).fetchone()
-                if existing is None:
-                    raise sqlite3.IntegrityError("Request could not be recorded")
+            if existing is not None:
                 request_id = existing["id"]
                 connection.execute(
                     "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
                     (request_id, "duplicate_delivery", "Duplicate Discord delivery ignored"),
                 )
+                row = connection.execute(
+                    "SELECT * FROM requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                return dict(row), False
+
+            canonical = None
+            if target_key:
+                canonical = connection.execute(
+                    """
+                    SELECT id FROM requests
+                    WHERE target_key = ?
+                      AND status IN ('new', 'processing', 'queued', 'complete', 'completed')
+                    ORDER BY id
+                    LIMIT 1
+                    """,
+                    (target_key,),
+                ).fetchone()
+            if canonical is not None:
+                request_id = canonical["id"]
+                connection.execute(
+                    "INSERT INTO delivery_aliases (message_id, request_id) VALUES (?, ?)",
+                    (str(message_id), request_id),
+                )
+                connection.execute(
+                    "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                    (
+                        request_id,
+                        "duplicate_target",
+                        "Exact active or completed target already has a canonical request",
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                return dict(row), False
+
+            cursor = connection.execute(
+                """
+                INSERT INTO requests (
+                    discord_user_id, discord_username, channel_id, message_id,
+                    media_type, raw_request, title, author, target_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            request_id = cursor.lastrowid
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (request_id, "received", "Request received from Discord"),
+            )
             row = connection.execute(
                 "SELECT * FROM requests WHERE id = ?", (request_id,)
             ).fetchone()
-        return dict(row), created
+        return dict(row), True
 
     def add_event(self, request_id: int, event_type: str, message: str) -> None:
         with self.connect() as connection:

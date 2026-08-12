@@ -2,10 +2,48 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
 RESULT_STATUSES = frozenset({"queued", "needs_selection", "failed", "completed"})
+_SENSITIVE_DISPLAY_TEXT = re.compile(
+    r"(?:https?://|ftp://|www\.|discord\.gg/|magnet:|"
+    r"(?:api[\s_-]*key|token|password|secret|authorization)\s*[:=]|"
+    r"authorization\s+bearer\s+)",
+    re.IGNORECASE,
+)
+
+
+def sanitize_display_text(value: object, *, limit: int = 160) -> str | None:
+    """Return inert bounded text, or ``None`` when metadata is sensitive/empty."""
+
+    text = "".join(
+        character for character in str(value or "") if character.isprintable()
+    )
+    text = " ".join(text.split())
+    if not text or _SENSITIVE_DISPLAY_TEXT.search(text):
+        return None
+    text = (
+        text.replace("@", "＠")
+        .replace("`", "'")
+        .replace("<", "‹")
+        .replace(">", "›")
+    )
+    bounded_limit = max(16, min(int(limit), 500))
+    if len(text) > bounded_limit:
+        text = text[: bounded_limit - 3].rstrip() + "..."
+    return text
+
+
+def safe_display_title(value: object, fallback: object = None) -> str:
+    """Prefer sanitized service metadata, then sanitized request text."""
+
+    return (
+        sanitize_display_text(value)
+        or sanitize_display_text(fallback)
+        or "your request"
+    )
 
 
 def result(

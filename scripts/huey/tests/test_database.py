@@ -2,6 +2,8 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from pathlib import Path
 
 
@@ -9,6 +11,14 @@ HUEY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HUEY_ROOT))
 
 from database import RequestStore
+from matching import request_target_key
+
+
+DUNE_TARGET = request_target_key("ebooks", {"title": "Dune", "author": "Frank Herbert"})
+DUNE_NO_AUTHOR_TARGET = request_target_key("ebooks", {"title": "Dune", "author": None})
+DUNE_EDITION_TARGET = request_target_key(
+    "ebooks", {"title": "Dune illustrated", "author": "Frank Herbert"}
+)
 
 
 OLD_SCHEMA = """
@@ -66,9 +76,26 @@ class DatabaseTests(unittest.TestCase):
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(requests)")}
             self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
         self.assertTrue(
-            {"updated_at", "service", "external_id", "external_title", "error", "notified_at"}
+            {
+                "updated_at",
+                "service",
+                "external_id",
+                "external_title",
+                "error",
+                "notified_at",
+                "target_key",
+            }
             <= columns
         )
+        with self.store.connect() as connection:
+            aliases = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_aliases'"
+            ).fetchone()
+            target_index = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='requests_active_target_uq'"
+            ).fetchone()
+        self.assertIsNotNone(aliases)
+        self.assertIsNotNone(target_index)
 
     def test_old_schema_migration_merges_duplicates_and_preserves_events(self):
         self.path.parent.mkdir(parents=True)
@@ -101,6 +128,7 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["id"], first_id)
             self.assertEqual(rows[0]["status"], "queued")
+            self.assertEqual(rows[0]["target_key"], DUNE_NO_AUTHOR_TARGET)
             event_request_ids = {
                 row[0] for row in migrated.execute("SELECT request_id FROM events").fetchall()
             }
@@ -130,6 +158,111 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(updated["service"], "qbittorrent")
         event_types = [event["event_type"] for event in self.store.events_for(first["id"])]
         self.assertEqual(event_types, ["received", "duplicate_delivery", "queued"])
+
+    def test_exact_active_target_reserves_one_canonical_request_and_alias(self):
+        self.store.initialize()
+        target_key = DUNE_TARGET
+        first, created = self.store.create_request(
+            **self.request_values("100"), target_key=target_key
+        )
+        self.store.transition(first["id"], "queued", "Queued")
+        second, second_created = self.store.create_request(
+            **self.request_values("101"), target_key=target_key
+        )
+        redelivery, redelivery_created = self.store.create_request(
+            **self.request_values("101"), target_key=target_key
+        )
+
+        self.assertTrue(created)
+        self.assertFalse(second_created)
+        self.assertFalse(redelivery_created)
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(first["id"], redelivery["id"])
+        self.assertEqual(self.store.get_by_message_id("101")["id"], first["id"])
+        with self.store.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM requests").fetchone()[0], 1)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM delivery_aliases").fetchone()[0], 1
+            )
+        event_types = [event["event_type"] for event in self.store.events_for(first["id"])]
+        self.assertEqual(event_types.count("duplicate_target"), 1)
+        self.assertEqual(event_types.count("duplicate_delivery"), 1)
+
+    def test_simultaneous_exact_target_reservation_dispatches_one_canonical(self):
+        self.store.initialize()
+        barrier = Barrier(2)
+
+        def reserve(message_id):
+            barrier.wait()
+            return self.store.create_request(
+                **self.request_values(message_id),
+                target_key=DUNE_TARGET,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(reserve, ("100", "101")))
+        records = [record for record, _created in results]
+        self.assertEqual(sum(created for _record, created in results), 1)
+        self.assertEqual({record["id"] for record in records}, {records[0]["id"]})
+        with self.store.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM requests").fetchone()[0], 1)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM delivery_aliases").fetchone()[0], 1
+            )
+
+    def test_failed_or_needs_selection_target_can_be_retried_by_new_message(self):
+        for status in ("failed", "needs_selection"):
+            with self.subTest(status=status):
+                self.temporary.cleanup()
+                self.temporary = tempfile.TemporaryDirectory()
+                self.path = Path(self.temporary.name) / "huey.db"
+                self.store = RequestStore(self.path)
+                self.store.initialize()
+                first, _ = self.store.create_request(
+                    **self.request_values("100"), target_key=DUNE_TARGET
+                )
+                self.store.transition(first["id"], status, "Retry allowed")
+                retry, created = self.store.create_request(
+                    **self.request_values("101"), target_key=DUNE_TARGET
+                )
+                self.assertTrue(created)
+                self.assertNotEqual(retry["id"], first["id"])
+
+    def test_completed_exact_target_is_reused_but_distinct_key_is_not(self):
+        self.store.initialize()
+        first, _ = self.store.create_request(
+            **self.request_values("100"), target_key=DUNE_TARGET
+        )
+        self.store.transition(first["id"], "completed", "Imported")
+        duplicate, created = self.store.create_request(
+            **self.request_values("101"), target_key=DUNE_TARGET
+        )
+        edition, edition_created = self.store.create_request(
+            **self.request_values("102"),
+            target_key=DUNE_EDITION_TARGET,
+        )
+        self.assertFalse(created)
+        self.assertEqual(duplicate["id"], first["id"])
+        self.assertTrue(edition_created)
+        self.assertNotEqual(edition["id"], first["id"])
+
+    def test_initialize_backfills_completed_legacy_target_without_replaying_it(self):
+        self.store.initialize()
+        legacy, _ = self.store.create_request(**self.request_values("legacy"))
+        self.store.transition(legacy["id"], "completed", "Imported")
+        self.assertIsNone(self.store.get_request(legacy["id"])["target_key"])
+
+        self.store.initialize()
+        migrated = self.store.get_request(legacy["id"])
+        self.assertEqual(
+            migrated["target_key"], DUNE_TARGET
+        )
+        duplicate, created = self.store.create_request(
+            **self.request_values("new-message"),
+            target_key=DUNE_TARGET,
+        )
+        self.assertFalse(created)
+        self.assertEqual(duplicate["id"], legacy["id"])
 
     def test_foreign_key_enforcement(self):
         self.store.initialize()

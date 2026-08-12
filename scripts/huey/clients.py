@@ -13,10 +13,10 @@ import requests
 
 try:  # Support both package imports and direct container script execution.
     from .matching import select_arr_candidate
-    from .results import result
+    from .results import result, safe_display_title
 except ImportError:  # pragma: no cover - exercised by the container entrypoint
     from matching import select_arr_candidate
-    from results import result
+    from results import result, safe_display_title
 
 
 class ServiceError(RuntimeError):
@@ -249,6 +249,26 @@ class ArrClient(JsonClient):
 
         return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
 
+    def _get_entity(self, entity_id: int) -> Mapping[str, Any]:
+        entity = self._request(
+            "GET", self._api(f"{self.spec.entity}/{entity_id}")
+        )
+        if not isinstance(entity, Mapping):
+            raise ServiceError(f"{self.service} returned an invalid entity response.")
+        return entity
+
+    def _entity_has_imported_media(self, entity: Mapping[str, Any]) -> bool:
+        if self.service == "radarr":
+            return entity.get("hasFile") is True
+
+        statistics = entity.get("statistics")
+        if not isinstance(statistics, Mapping):
+            return False
+        count_field = "episodeFileCount" if self.service == "sonarr" else "trackFileCount"
+        return self._positive_statistic(
+            statistics.get(count_field)
+        ) or self._positive_statistic(statistics.get("sizeOnDisk"))
+
     def has_imported_media(self, entity_id: str | int) -> bool:
         """Read one ARR entity and conservatively detect an imported media file.
 
@@ -264,22 +284,7 @@ class ArrClient(JsonClient):
         if internal_id <= 0:
             raise ServiceError(f"{self.service} request has an invalid entity ID.")
 
-        entity = self._request(
-            "GET", self._api(f"{self.spec.entity}/{internal_id}")
-        )
-        if not isinstance(entity, Mapping):
-            raise ServiceError(f"{self.service} returned an invalid entity response.")
-
-        if self.service == "radarr":
-            return entity.get("hasFile") is True
-
-        statistics = entity.get("statistics")
-        if not isinstance(statistics, Mapping):
-            return False
-        count_field = "episodeFileCount" if self.service == "sonarr" else "trackFileCount"
-        return self._positive_statistic(
-            statistics.get(count_field)
-        ) or self._positive_statistic(statistics.get("sizeOnDisk"))
+        return self._entity_has_imported_media(self._get_entity(internal_id))
 
     def submit(self, title: str) -> dict[str, str | None]:
         candidates = self.lookup(title)
@@ -291,18 +296,38 @@ class ArrClient(JsonClient):
                 service=self.service,
             )
 
-        selected_title = str(selected.get(self.spec.title_field) or title)
+        selected_title = safe_display_title(selected.get(self.spec.title_field), title)
         existing_id = selected.get("id")
+        existing_state = "new"
         if existing_id:
             entity_id = int(existing_id)
-            if selected.get("monitored") is not True:
-                monitored = dict(selected)
+            existing = self._get_entity(entity_id)
+            if self._entity_has_imported_media(existing):
+                return result(
+                    "completed",
+                    f"{self.service.title()} already has imported media for {selected_title} on the DAS.",
+                    service=self.service,
+                    external_id=entity_id,
+                    external_title=selected_title,
+                )
+            if existing.get("monitored") is True:
+                return result(
+                    "queued",
+                    f"{selected_title} is already monitored in {self.service.title()}; "
+                    "no duplicate search was started.",
+                    service=self.service,
+                    external_id=entity_id,
+                    external_title=selected_title,
+                )
+            else:
+                monitored = dict(existing)
                 monitored["monitored"] = True
                 self._request(
                     "PUT",
                     self._api(f"{self.spec.entity}/{entity_id}"),
                     json=monitored,
                 )
+                existing_state = "unmonitored"
         else:
             root = self._discover_root_folder()
             profile_id = self._discover_quality_profile()
@@ -319,9 +344,18 @@ class ArrClient(JsonClient):
             entity_id = int(added["id"])
 
         self._trigger_search(entity_id)
+        if existing_state == "unmonitored":
+            message = (
+                f"{selected_title} already existed in {self.service.title()}; "
+                "enabled monitoring and started a search."
+            )
+        else:
+            message = (
+                f"Queued {selected_title} in {self.service.title()} and started a search."
+            )
         return result(
             "queued",
-            f"Queued {selected_title} in {self.service.title()} and started a search.",
+            message,
             service=self.service,
             # The local entity ID is required for later read-only completion
             # reconciliation. Provider IDs from lookup results cannot address
@@ -569,8 +603,9 @@ class QBittorrentClient(JsonClient):
         """Make one authenticated request with an explicit safe-retry policy.
 
         qBittorrent reports expired cookie sessions as HTTP 403. Repeating
-        createCategory and addTags is safe because both operations are
-        idempotent. The torrent-add POST is deliberately never replayed: even
+        read-only lookups, createCategory, and addTags is safe because those
+        operations are idempotent. The torrent-add POST is deliberately never
+        replayed: even
         though a 403 normally means it was rejected before mutation, avoiding
         an automatic second add preserves at-most-once submission if a proxy
         or future qBittorrent version behaves unexpectedly.
@@ -662,3 +697,28 @@ class QBittorrentClient(JsonClient):
             retry_after_reauthentication=True,
             data={"hashes": torrent_hash.lower(), "tags": tags},
         )
+
+    def find_torrent(self, torrent_hash: str) -> Mapping[str, Any] | None:
+        """Return only an exact qBittorrent hash match through a read-only API."""
+
+        if not re.fullmatch(r"[a-fA-F0-9]{40}(?:[a-fA-F0-9]{24})?", torrent_hash):
+            raise ServiceError("Selected result has an invalid torrent identity.")
+        normalized = torrent_hash.lower()
+        response = self._authenticated_request(
+            "GET",
+            "/api/v2/torrents/info",
+            retry_after_reauthentication=True,
+            params={"hashes": normalized},
+        )
+        try:
+            value = response.json()
+        except (TypeError, ValueError) as error:
+            raise ServiceError("qBittorrent returned an invalid torrent response.") from error
+        if not isinstance(value, list) or any(not isinstance(item, Mapping) for item in value):
+            raise ServiceError("qBittorrent returned an invalid torrent response.")
+        matches = [
+            item for item in value if str(item.get("hash") or "").casefold() == normalized
+        ]
+        if value and len(matches) != 1:
+            raise ServiceError("qBittorrent returned an invalid torrent response.")
+        return matches[0] if matches else None
