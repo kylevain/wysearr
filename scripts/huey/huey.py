@@ -19,12 +19,14 @@ try:
     from .config import ChannelConfig, load_channel_config
     from .database import RequestStore
     from .orchestrator import RequestProcessor
+    from .results import safe_display_title
     from .services import ServiceRegistry
 except ImportError:  # Direct execution from /app/scripts/huey/huey.py.
     from clients import ServiceError
     from config import ChannelConfig, load_channel_config
     from database import RequestStore
     from orchestrator import RequestProcessor
+    from results import safe_display_title
     from services import ServiceRegistry
 
 
@@ -59,9 +61,18 @@ def format_reply(media_type: str, response: dict[str, Any]) -> str:
 
 
 def format_completion_notification(request: dict[str, Any]) -> str:
-    title = request.get("external_title") or request.get("title") or "your request"
+    title = safe_display_title(request.get("external_title"), request.get("title"))
     if request["status"] in {"complete", "completed"}:
-        return f"✅ Request #{request['id']} complete: {title} is now available in the library."
+        service = str(request.get("service") or "").casefold()
+        if service in {"sonarr", "radarr", "lidarr"}:
+            return (
+                f"✅ Request #{request['id']} complete: {title} was imported to its "
+                f"DAS library path by {service.title()}."
+            )
+        return (
+            f"✅ Request #{request['id']} complete: {title} was safely imported "
+            "to its DAS library path."
+        )
     detail = request.get("error") or ""
     if not detail or re.search(
         r"(?:https?://|magnet:|api[_-]?key|token|password|secret)", detail, re.IGNORECASE

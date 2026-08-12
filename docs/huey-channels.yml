@@ -7,11 +7,15 @@ requests:
   sheet-music: 1513348094413246554
 
 activity:
+  # Reserved inventory entry; Huey does not currently publish queue events.
   download-queue: 1513348215255334942
+  # Huey's sole operational auxiliary channel.
   request-status: 1513348792756338769
+  # Reserved inventory entry; Huey does not currently publish additions here.
   recent-additions: 1513348243956961290
 
 system:
+  # These system-channel identifiers are reserved and currently unwired.
   automation-admin: 1513348339020599447
   system-health: 1513348377893666827
   import-errors: 1513348404372312294

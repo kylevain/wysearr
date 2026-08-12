@@ -11,18 +11,46 @@ Post one request per message in the matching Discord request channel:
 
 | Channel | Request syntax | Workflow |
 | --- | --- | --- |
-| movies/tv | `movie: The Thing 1982` or `tv: Slow Horses 2022` | Radarr or Sonarr |
-| ebooks | `The Left Hand of Darkness by Ursula K. Le Guin` | Prowlarr, qBittorrent, BookBot |
-| audiobooks | `Piranesi by Susanna Clarke` | Prowlarr, qBittorrent, BookBot |
-| manga/comics | `Saga Volume 1` | Prowlarr, qBittorrent, BookBot |
-| roms | `Game Title platform` | Prowlarr, qBittorrent, BookBot |
-| sheet-music | `Work Title composer instrument` | Prowlarr, qBittorrent, BookBot |
+| `#movies-tv` | `movie: The Thing 1982` or `tv: Slow Horses 2022` | Radarr or Sonarr |
+| `#ebooks` | `The Left Hand of Darkness by Ursula K. Le Guin` | Prowlarr, qBittorrent, BookBot |
+| `#audiobooks` | `Piranesi by Susanna Clarke` | Prowlarr, qBittorrent, BookBot |
+| `#manga-comics` | `Saga Volume 1` | Prowlarr, qBittorrent, BookBot |
+| `#roms` | `Game Title platform` | Prowlarr, qBittorrent, BookBot |
+| `#sheet-music` | `Work Title composer instrument` | Prowlarr, qBittorrent, BookBot |
 
 Huey replies with a request number and persists every state change. If an exact,
 safe match cannot be selected, it asks for a more specific title instead of
-guessing. A terminal import success or failure is delivered best-effort to the
-original request and the request-status channel; one successful route marks the
-notification delivered so transient failure cannot create an endless retry loop.
+guessing. When close direct-media matches have useful metadata, that response
+shows at most three sanitized release titles with safe format/size distinctions;
+it never includes download URLs, torrent identities, credentials, or provider
+IDs.
+
+Separate messages for the same exact active or completed target reuse its
+canonical request number. The identity normalizes case and whitespace but keeps
+punctuation, accents, media kind, author, year, edition, platform, and format
+distinct; failed or selection-needed requests remain retryable. Huey also checks
+existing ARR state and exact qBittorrent hashes before starting work, and fails
+closed when an existing torrent belongs to a different media category.
+
+Acknowledgements and terminal results are delivered best-effort as a
+reply to the original request and mirrored to `#request-status`. Huey is the
+only Discord notification producer; one successful terminal route marks that
+request notified so transient delivery failure cannot create an endless retry
+loop.
+
+For movies and TV, `complete` currently means Sonarr or Radarr confirms that it
+imported a media file to the DAS. Huey does not yet trigger or confirm a Plex
+scan, so this does not claim that the title is visible in Plex; until the Plex
+integration is authorized, scan the matching Plex library manually. For direct
+media, `complete` means BookBot safely copied the validated payload to its
+configured DAS library path; it does not confirm that Kavita, Audiobookshelf,
+or RomM has indexed it.
+
+`#download-queue`, `#recent-additions`, `#automation-admin`, `#import-errors`,
+and `#system-health` are reserved channel names and are not currently written to
+or monitored by Huey. Use the service UIs, logs, and production validator for
+those operational views. Bazarr does not post routine subtitle activity to
+Discord.
 
 Music is managed through Lidarr's Web UI. Whisparr is likewise operated through
 its Web UI because neither has a configured Discord request channel.

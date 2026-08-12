@@ -27,7 +27,11 @@ BookBot removes torrent and local payload after 14 days
 
 ARR destinations are `/media/tv`, `/media/movies`, `/media/music`, and
 `/media/spicy`. Bazarr connects to Sonarr and Radarr, applies the configured
-English language profile, and searches enabled subtitle providers.
+English language profile, and searches enabled subtitle providers when the
+profile is not already satisfied. Matching embedded English tracks count as
+available subtitles, so an external `.srt` is neither required nor evidence of
+success by itself. External matches remain content- and provider-dependent;
+Bazarr does not emit routine Discord subtitle notifications.
 
 ## Discord and direct-media flow
 
@@ -50,12 +54,50 @@ Sonarr or Radarr          Prowlarr search + conservative match
 ```
 
 Huey stores request and event state in `state/huey/huey.db`. Discord
-`message_id` is unique, so gateway redelivery cannot create a second download.
-Titles are never silently guessed: ambiguous searches end in `needs_selection`.
+`message_id` plus durable delivery aliases make gateway redelivery idempotent.
+A transactionally reserved target key coalesces distinct Discord messages only
+when media type, movie/TV kind, case/space-normalized title, and normalized
+author match an active or completed request exactly. Punctuation, accents, year,
+edition, platform, and format remain significant; failed and `needs_selection`
+requests remain retryable.
+Historical active/completed requests receive the same key during migration but
+are never replayed or silently merged. Titles are never silently guessed:
+ambiguous searches end in `needs_selection`.
+
+An existing ARR entity is read before mutation. Imported media returns an
+already-imported result; a monitored item starts no duplicate search; an
+unmonitored item is monitored and searched. Direct acquisition derives the
+payload's exact v1 hash and asks qBittorrent whether that hash already exists
+before adding it. An expected base/imported category is correlated to the
+request without a second add; an imported category still requires BookBot's
+safe ledger verification before completion. A different or empty category
+fails closed for administrator review.
+
+When ambiguity metadata is useful, Huey renders no more than three candidates
+from the actual close-score band. Only a sanitized release title and derived
+format/size hints are shown; provider IDs, URLs, hashes, and credentials are
+never included. Poor or low-confidence metadata retains the generic refinement
+response.
+
 Direct qBittorrent jobs carry a `huey-<request-id>` tag so BookBot can reconcile
 the terminal import with the original request. Terminal delivery is idempotently
 recorded after at least one configured Discord route succeeds; Discord itself
 does not provide an atomic exactly-once send transaction.
+
+The six configured intake channels are `#movies-tv`, `#ebooks`, `#audiobooks`,
+`#manga-comics`, `#roms`, and `#sheet-music`. Huey replies to the originating
+message and mirrors request lifecycle messages to `#request-status`. The mapped
+`#download-queue`, `#recent-additions`, `#automation-admin`, `#import-errors`,
+and `#system-health` channels are reserved and currently unwired; they are not
+alternative completion producers. Lidarr music and Whisparr adult-media
+requests remain Web-UI-only.
+
+An ARR terminal completion currently means Sonarr or Radarr reports imported
+media on the DAS; Huey does not yet trigger or confirm a Plex scan, so the
+matching Plex library must be scanned manually until that integration is
+authorized. A direct terminal completion means BookBot validated and atomically
+copied the payload to its DAS destination. Neither boundary alone proves that a
+downstream playback or catalog application has indexed the item.
 
 Direct acquisition accepts only payloads whose BitTorrent v1 identity can be
 derived and cross-checked from the magnet or exact torrent metadata. Pure v2

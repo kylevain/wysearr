@@ -8,14 +8,17 @@ from unittest.mock import AsyncMock, Mock, patch
 
 
 HUEY_ROOT = Path(__file__).resolve().parents[1]
+PRODUCTION_CHANNELS = HUEY_ROOT.parents[1] / "docs" / "huey-channels.yml"
 sys.path.insert(0, str(HUEY_ROOT))
 
 from config import ChannelConfigError, validate_channel_config
 from clients import ServiceError
+from handlers import HANDLERS
 from healthcheck import is_ready
 from database import RequestStore
 from services import ServiceRegistry
 from huey import (
+    format_completion_notification,
     notification_loop,
     reconcile_arr_requests,
     reconcile_notifications,
@@ -33,7 +36,56 @@ REQUESTS = {
 }
 
 
+def read_production_channel_map() -> dict[str, dict[str, int]]:
+    """Read the deliberately simple two-level channel inventory without PyYAML."""
+
+    document: dict[str, dict[str, int]] = {}
+    section: dict[str, int] | None = None
+    for raw_line in PRODUCTION_CHANNELS.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            self_contained = line.removesuffix(":")
+            section = document.setdefault(self_contained, {})
+            continue
+        if section is None:
+            raise AssertionError("channel entry precedes its section")
+        name, value = line.strip().split(":", 1)
+        section[name] = int(value.strip())
+    return document
+
+
 class ConfigTests(unittest.TestCase):
+    def test_production_map_has_only_six_real_request_channels(self):
+        raw = read_production_channel_map()
+        config = validate_channel_config(raw)
+        configured_types = set(config.request_channels.values())
+
+        self.assertEqual(configured_types, set(REQUESTS))
+        self.assertEqual(len(config.request_channels), 6)
+        self.assertTrue(configured_types <= set(HANDLERS))
+        self.assertTrue(
+            {"music", "adult", "spicy", "whisparr"}.isdisjoint(configured_types)
+        )
+
+        self.assertEqual(
+            config.request_status_channel,
+            str(raw["activity"]["request-status"]),
+        )
+        self.assertEqual(
+            set(vars(config)), {"request_channels", "request_status_channel"}
+        )
+        reserved_ids = {
+            str(channel_id)
+            for group, channels in raw.items()
+            if group in {"activity", "system"}
+            for name, channel_id in channels.items()
+            if name != "request-status"
+        }
+        parsed_ids = set(config.request_channels) | {config.request_status_channel}
+        self.assertTrue(reserved_ids.isdisjoint(parsed_ids))
+
     def test_valid_config_inverts_request_mapping_and_reads_status(self):
         config = validate_channel_config(
             {"requests": REQUESTS, "activity": {"request-status": 20}}
@@ -229,9 +281,24 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.reconcile(client, config), 0)
         self.assertEqual(len(original_message.replies), 1)
         self.assertEqual(len(status_channel.sent), 1)
-        self.assertIn("now available", original_message.replies[0])
+        self.assertIn("safely imported to its DAS library path", original_message.replies[0])
         saved = self.store.get_request(self.request["id"])
         self.assertIsNotNone(saved["notified_at"])
+
+    def test_terminal_notification_sanitizes_persisted_external_title(self):
+        notification = format_completion_notification(
+            {
+                "id": 8,
+                "status": "completed",
+                "service": "radarr",
+                "external_title": "Dune @everyone https://invalid/?token=secret",
+                "title": "Dune",
+            }
+        )
+        self.assertIn("Dune", notification)
+        self.assertNotIn("@everyone", notification)
+        self.assertNotIn("https://", notification)
+        self.assertNotIn("token", notification)
 
     async def test_status_channel_is_fallback_when_original_is_missing(self):
         self.store.transition(self.request["id"], "failed", "Import failed", error="Retry limit reached")
@@ -274,7 +341,7 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         client = FakeClient({2: FakeChannel(original_message)})
         config = validate_channel_config({"requests": REQUESTS})
         self.assertEqual(await self.reconcile(client, config), 1)
-        self.assertIn("now available", original_message.replies[0])
+        self.assertIn("imported to its DAS library path by Radarr", original_message.replies[0])
 
     async def test_arr_without_files_remains_queued(self):
         self.store.transition(
