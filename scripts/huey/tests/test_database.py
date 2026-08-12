@@ -157,6 +157,18 @@ class DatabaseTests(unittest.TestCase):
         request, _ = self.store.create_request(**self.request_values())
         self.assertFalse(self.store.mark_notified(request["id"], "not terminal"))
 
+    def test_initialize_fails_interrupted_request_for_safe_reconciliation(self):
+        self.store.initialize()
+        request, _ = self.store.create_request(**self.request_values())
+        self.store.initialize()
+        reconciled = self.store.get_request(request["id"])
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertIn("review acquisition services", reconciled["error"])
+        self.assertEqual(
+            self.store.events_for(request["id"])[-1]["event_type"],
+            "startup_reconciled",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

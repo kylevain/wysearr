@@ -55,6 +55,7 @@ class RequestStore:
             )
             self._merge_duplicate_messages(connection)
             self._ensure_unique_message_index(connection)
+            self._fail_interrupted_requests(connection)
             connection.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS requests_status_idx
@@ -64,6 +65,29 @@ class RequestStore:
                 CREATE INDEX IF NOT EXISTS events_request_created_idx
                     ON events(request_id, created_at);
                 """
+            )
+
+    @staticmethod
+    def _fail_interrupted_requests(connection: sqlite3.Connection) -> None:
+        message = (
+            "Huey restarted before this request reached a durable queued state; "
+            "review acquisition services before resubmitting"
+        )
+        rows = connection.execute(
+            "SELECT id FROM requests WHERE status IN ('new', 'processing')"
+        ).fetchall()
+        for row in rows:
+            connection.execute(
+                """
+                UPDATE requests
+                SET status = 'failed', updated_at = CURRENT_TIMESTAMP, error = ?
+                WHERE id = ?
+                """,
+                (message, row["id"]),
+            )
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (row["id"], "startup_reconciled", message),
             )
 
     @staticmethod
