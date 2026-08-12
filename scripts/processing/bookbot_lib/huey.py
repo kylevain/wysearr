@@ -85,25 +85,48 @@ class HueyUpdater:
             if not request_columns or "id" not in request_columns:
                 return False
 
-            request_ids = set(self._request_ids_from_tags(tags))
-            hash_column = next(
-                (column for column in HASH_COLUMNS if column in request_columns),
-                None,
-            )
-            if hash_column is not None:
+            hash_columns = [
+                column for column in HASH_COLUMNS if column in request_columns
+            ]
+            tagged_ids = set(self._request_ids_from_tags(tags))
+            request_ids: set[int] = set()
+            if hash_columns:
+                hash_predicate = " OR ".join(
+                    f"lower({column}) = lower(?)" for column in hash_columns
+                )
+                hash_values = (torrent_hash,) * len(hash_columns)
                 request_ids.update(
                     int(row[0])
                     for row in connection.execute(
-                        f"SELECT id FROM requests WHERE lower({hash_column}) = lower(?)",
-                        (torrent_hash,),
+                        f"SELECT id FROM requests WHERE {hash_predicate}",
+                        hash_values,
                     ).fetchall()
                 )
+                if tagged_ids:
+                    placeholders = ",".join("?" for _ in tagged_ids)
+                    request_ids.update(
+                        int(row[0])
+                        for row in connection.execute(
+                            f"""
+                            SELECT id FROM requests
+                            WHERE id IN ({placeholders})
+                              AND ({hash_predicate})
+                            """,
+                            (*sorted(tagged_ids), *hash_values),
+                        ).fetchall()
+                    )
+            elif tagged_ids:
+                request_ids.update(tagged_ids)
             if not request_ids:
                 return False
             existing_ids = {
                 int(row[0])
                 for row in connection.execute(
-                    f"SELECT id FROM requests WHERE id IN ({','.join('?' for _ in request_ids)})",
+                    f"""
+                    SELECT id FROM requests
+                    WHERE id IN ({','.join('?' for _ in request_ids)})
+                      AND status IN ('queued', 'downloading', 'processing')
+                    """,
                     tuple(sorted(request_ids)),
                 ).fetchall()
             }

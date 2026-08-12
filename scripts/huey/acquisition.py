@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import re
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
@@ -26,6 +27,7 @@ PROWLARR_CATEGORIES = {
     "sheet-music": (7010, 7000),
 }
 INFO_HASH = re.compile(r"^[a-fA-F0-9]{40}(?:[a-fA-F0-9]{24})?$")
+LOGGER = logging.getLogger("huey.acquisition")
 
 
 def normalize_info_hash(value: object) -> str | None:
@@ -220,7 +222,15 @@ class DirectAcquirer:
             )
 
         if tags:
-            self.qbittorrent.add_tags(info_hash, tags)
+            try:
+                self.qbittorrent.add_tags(info_hash, tags)
+            except ServiceError:
+                # The add already succeeded. Returning the stable hash lets
+                # BookBot reconcile this request even if qBittorrent has not
+                # materialized the torrent quickly enough for tagging.
+                LOGGER.warning(
+                    "qBittorrent accepted a request but deferred its correlation tag"
+                )
         return result(
             "queued",
             f"Queued {selected_title} in qBittorrent.",

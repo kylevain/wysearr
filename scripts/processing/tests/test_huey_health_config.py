@@ -28,6 +28,7 @@ class HueyUpdaterTests(unittest.TestCase):
                     id INTEGER PRIMARY KEY,
                     status TEXT NOT NULL,
                     torrent_hash TEXT,
+                    external_id TEXT,
                     library_path TEXT,
                     error_message TEXT,
                     updated_at TEXT
@@ -38,9 +39,14 @@ class HueyUpdaterTests(unittest.TestCase):
                     event_type TEXT NOT NULL,
                     message TEXT NOT NULL
                 );
-                INSERT INTO requests (id, status, torrent_hash)
-                VALUES (42, 'downloading', NULL), (43, 'downloading', 'bbbb');
                 """
+            )
+            connection.executemany(
+                "INSERT INTO requests (id, status, torrent_hash, external_id) VALUES (?, ?, ?, ?)",
+                (
+                    (42, "downloading", None, HASH),
+                    (43, "downloading", "bbbb", "bbbb"),
+                ),
             )
 
     def tearDown(self) -> None:
@@ -81,11 +87,12 @@ class HueyUpdaterTests(unittest.TestCase):
         raw_connection = sqlite3.connect(self.database)
         with closing(raw_connection) as connection, connection:
             connection.execute(
-                "INSERT INTO requests (id, status, torrent_hash) VALUES (44, 'downloading', ?)",
-                (HASH,),
+                "INSERT INTO requests (id, status, torrent_hash, external_id) VALUES (44, 'downloading', ?, ?)",
+                (HASH, HASH),
             )
             connection.execute(
-                "INSERT INTO requests (id, status, torrent_hash) VALUES (45, 'downloading', NULL)"
+                "INSERT INTO requests (id, status, torrent_hash, external_id) VALUES (45, 'downloading', NULL, ?)",
+                (HASH,),
             )
         destination = Path("/media/ebooks/Books/Shared")
         self.assertTrue(
@@ -103,6 +110,29 @@ class HueyUpdaterTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual(rows, [(42, "complete"), (44, "complete"), (45, "complete")])
         self.assertEqual(event_ids, [(42,), (44,), (45,)])
+
+    def test_mismatched_tag_and_terminal_request_are_not_overwritten(self) -> None:
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            connection.execute(
+                "INSERT INTO requests (id, status, torrent_hash, external_id) VALUES (46, 'queued', NULL, ?)",
+                ("b" * 40,),
+            )
+            connection.execute(
+                "INSERT INTO requests (id, status, torrent_hash, external_id) VALUES (47, 'failed', ?, ?)",
+                (HASH, HASH),
+            )
+        self.assertTrue(
+            HueyUpdater(self.database).complete(
+                HASH, Path("/media/ebooks/Books/Shared"), "huey-46,huey-47"
+            )
+        )
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            rows = connection.execute(
+                "SELECT id, status FROM requests WHERE id IN (46,47) ORDER BY id"
+            ).fetchall()
+        self.assertEqual(rows, [(46, "queued"), (47, "failed")])
 
     def test_missing_or_incompatible_database_is_non_blocking(self) -> None:
         self.assertFalse(HueyUpdater(None).complete(HASH, Path("/media/book")))

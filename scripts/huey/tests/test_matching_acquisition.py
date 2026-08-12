@@ -175,6 +175,24 @@ class DirectAcquirerTests(unittest.TestCase):
         self.qbittorrent.add_magnet.assert_not_called()
         self.qbittorrent.add_tags.assert_not_called()
 
+    def test_tag_failure_after_successful_add_remains_queued_by_hash(self):
+        info_hash = "c" * 40
+        self.prowlarr.search.return_value = [
+            {
+                "title": "The Hobbit JRR Tolkien EPUB",
+                "seeders": 20,
+                "infoHash": info_hash,
+                "magnetUrl": f"magnet:?xt=urn:btih:{info_hash}",
+            }
+        ]
+        from clients import ServiceError
+
+        self.qbittorrent.add_tags.side_effect = ServiceError("qBittorrent is unavailable.")
+        response = self.acquirer.submit("ebooks", "The Hobbit", "JRR Tolkien", 48)
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["external_id"], info_hash)
+        self.qbittorrent.add_magnet.assert_called_once()
+
     def test_info_hash_helpers_support_magnet_and_torrent_file(self):
         info = b"d4:name4:teste"
         torrent = b"d4:info" + info + b"e"
