@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -42,6 +43,117 @@ BOOKBOT_BOOK_CATEGORIES = (
     "audiobooks",
     "audiobooks-imported",
 )
+MANAGED_USENET_SERVER_NAME = "WyseARR Primary"
+INI_SECTION_RE = re.compile(
+    r"^\s*(?P<open>\[+)(?P<name>[^\[\]]+)(?P<close>\]+)\s*(?:[#;].*)?$"
+)
+
+
+class ManagedUsenetSettings:
+    """Validated configuration for the one SAB server owned by WyseARR."""
+
+    __slots__ = (
+        "enabled",
+        "host",
+        "port",
+        "username",
+        "password",
+        "connections",
+        "ssl",
+        "retention",
+    )
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        host: str = "",
+        port: int = 563,
+        username: str = "",
+        password: str = "",
+        connections: int = 0,
+        ssl: bool = True,
+        retention: int = 0,
+    ) -> None:
+        self.enabled = enabled
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.connections = connections
+        self.ssl = ssl
+        self.retention = retention
+
+    def __repr__(self) -> str:
+        return "ManagedUsenetSettings(<private>)"
+
+
+def parse_managed_usenet_settings(
+    environment: Mapping[str, str],
+) -> ManagedUsenetSettings:
+    """Validate the opt-in provider contract before any live configuration."""
+
+    enabled = environment.get("WYSEARR_USENET_ENABLED", "")
+    if enabled not in {"", "true", "false"}:
+        raise BootstrapError(
+            "WYSEARR_USENET_ENABLED must be literal true, false, or blank"
+        )
+    if enabled in {"", "false"}:
+        return ManagedUsenetSettings(enabled=False)
+
+    required: dict[str, str] = {}
+    for name in (
+        "USENET_SERVER_HOST",
+        "USENET_SERVER_USERNAME",
+        "USENET_SERVER_PASSWORD",
+        "USENET_SERVER_CONNECTIONS",
+    ):
+        raw_value = environment.get(name, "")
+        if not raw_value or not raw_value.strip():
+            raise BootstrapError(f"Required private setting is missing: {name}")
+        required[name] = raw_value
+
+    def integer_setting(
+        name: str,
+        default: str | None,
+        *,
+        minimum: int,
+        maximum: int | None = None,
+    ) -> int:
+        raw_value = environment.get(name, "")
+        if not raw_value and default is not None:
+            raw_value = default
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise BootstrapError(f"{name} must be numeric") from exc
+        if parsed < minimum or (maximum is not None and parsed > maximum):
+            constraint = (
+                f"between {minimum} and {maximum}"
+                if maximum is not None
+                else f"at least {minimum}"
+            )
+            raise BootstrapError(f"{name} must be {constraint}")
+        return parsed
+
+    ssl_value = environment.get("USENET_SERVER_SSL", "") or "true"
+    if ssl_value != "true":
+        raise BootstrapError("USENET_SERVER_SSL must be literal true")
+
+    return ManagedUsenetSettings(
+        enabled=True,
+        host=required["USENET_SERVER_HOST"].strip().casefold(),
+        port=integer_setting(
+            "USENET_SERVER_PORT", "563", minimum=1, maximum=65535
+        ),
+        username=required["USENET_SERVER_USERNAME"].strip(),
+        password=required["USENET_SERVER_PASSWORD"],
+        connections=integer_setting(
+            "USENET_SERVER_CONNECTIONS", None, minimum=1, maximum=500
+        ),
+        ssl=True,
+        retention=integer_setting("USENET_SERVER_RETENTION", "0", minimum=0),
+    )
 
 
 def require_drained_bookbot_book_categories(
@@ -172,55 +284,359 @@ def _sab_category_write_confirmed(result: Any) -> bool:
     )
 
 
-def prepare_sabnzbd_private_config(path: Path) -> None:
-    """Disable SAB API parameter logging while the service is stopped."""
+def _sab_server_list(result: Any) -> list[dict[str, Any]]:
+    """Return the public, password-masked SAB server records."""
 
+    if not isinstance(result, dict) or result.get("status") is False:
+        raise BootstrapError("SABnzbd returned invalid server configuration")
+    config = result.get("config")
+    if not isinstance(config, dict):
+        raise BootstrapError("SABnzbd returned invalid server configuration")
+    # SAB 5 omits the `servers` key entirely when no server exists. A present
+    # key must still use the pinned public API's list-of-records contract.
+    if "servers" not in config:
+        if config:
+            raise BootstrapError("SABnzbd returned invalid server configuration")
+        return []
+    servers: Any = config["servers"]
+    if not isinstance(servers, list) or not all(
+        isinstance(server, dict) for server in servers
+    ):
+        raise BootstrapError("SABnzbd returned invalid server configuration")
+    return servers
+
+
+def _sab_boolean(value: Any) -> bool | None:
+    if value in (True, 1, "1", "true", "True"):
+        return True
+    if value in (False, 0, "0", "false", "False"):
+        return False
+    return None
+
+
+def _sab_masked_password(value: Any, *, allow_empty: bool = False) -> bool:
+    if value == "" and allow_empty:
+        return True
+    return isinstance(value, str) and bool(value) and set(value) == {"*"}
+
+
+def _sab_server_test_confirmed(result: Any) -> bool:
+    if not isinstance(result, dict) or result.get("status") is False:
+        return False
+    value = result.get("value")
+    return isinstance(value, dict) and value.get("result") is True
+
+
+def _sab_server_write_confirmed(
+    result: Any,
+    settings: ManagedUsenetSettings,
+    *,
+    enabled: bool,
+) -> bool:
+    """Validate a masked server echo without retaining or reporting secrets."""
+
+    if not isinstance(result, dict) or result.get("status") is False:
+        return False
     try:
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-            raise BootstrapError("SABnzbd configuration path is unsafe")
-        lines = path.read_text(encoding="utf-8").splitlines()
+        servers = _sab_server_list(result)
+    except BootstrapError:
+        return False
+    if len(servers) != 1:
+        return False
+    server = servers[0]
+    if (
+        server.get("name") != MANAGED_USENET_SERVER_NAME
+        or _sab_boolean(server.get("enable")) is not enabled
+        or not _sab_masked_password(
+            server.get("password"), allow_empty=not enabled
+        )
+    ):
+        return False
+    if not enabled:
+        return True
+    return bool(
+        server.get("displayname") == MANAGED_USENET_SERVER_NAME
+        and str(server.get("host", "")).casefold() == settings.host
+        and str(server.get("port")) == str(settings.port)
+        and server.get("username") == settings.username
+        and str(server.get("connections")) == str(settings.connections)
+        and _sab_boolean(server.get("ssl")) is settings.ssl
+        and str(server.get("ssl_verify")) == "3"
+        and str(server.get("retention")) == str(settings.retention)
+        and str(server.get("priority")) == "0"
+    )
+
+
+def configure_managed_usenet_provider(
+    settings: ManagedUsenetSettings,
+    port: int,
+    api_key: str,
+    *,
+    requester=_sab_request,
+) -> None:
+    """Test and converge, or safely disable, WyseARR's one managed server."""
+
+    configured = _sab_server_list(
+        requester(
+            port,
+            api_key,
+            {"mode": "get_config", "section": "servers"},
+        )
+    )
+    managed = [
+        server
+        for server in configured
+        if str(server.get("name") or "").casefold()
+        == MANAGED_USENET_SERVER_NAME.casefold()
+    ]
+    if len(managed) > 1:
+        raise BootstrapError("SABnzbd returned duplicate managed Usenet servers")
+
+    if settings.enabled is False:
+        if not managed or _sab_boolean(managed[0].get("enable")) is False:
+            return
+        result = requester(
+            port,
+            api_key,
+            {
+                "mode": "set_config",
+                "section": "servers",
+                "keyword": MANAGED_USENET_SERVER_NAME,
+                "enable": "0",
+            },
+        )
+        if not _sab_server_write_confirmed(result, settings, enabled=False):
+            raise BootstrapError("SABnzbd rejected managed Usenet server disablement")
+        return
+
+    test_result = requester(
+        port,
+        api_key,
+        {
+            "mode": "config",
+            "name": "test_server",
+            "server": MANAGED_USENET_SERVER_NAME,
+            "host": settings.host,
+            "port": str(settings.port),
+            "username": settings.username,
+            "password": settings.password,
+            "connections": str(settings.connections),
+            "ssl": "1" if settings.ssl else "0",
+            "ssl_verify": "3",
+        },
+    )
+    if not _sab_server_test_confirmed(test_result):
+        raise BootstrapError("SABnzbd rejected managed Usenet server connection test")
+
+    result = requester(
+        port,
+        api_key,
+        {
+            "mode": "set_config",
+            "section": "servers",
+            "keyword": MANAGED_USENET_SERVER_NAME,
+            "displayname": MANAGED_USENET_SERVER_NAME,
+            "host": settings.host,
+            "port": str(settings.port),
+            "username": settings.username,
+            "password": settings.password,
+            "connections": str(settings.connections),
+            "ssl": "1" if settings.ssl else "0",
+            "ssl_verify": "3",
+            "enable": "1",
+            "retention": str(settings.retention),
+            "priority": "0",
+        },
+    )
+    if not _sab_server_write_confirmed(result, settings, enabled=True):
+        raise BootstrapError("SABnzbd rejected managed Usenet server configuration")
+
+
+def _read_private_regular_text(path: Path) -> str:
+    """Read a private regular file without following a final-component link."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
     except OSError as exc:
         raise BootstrapError("SABnzbd configuration is unavailable") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise BootstrapError("SABnzbd configuration path is unsafe")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            return handle.read()
+    except UnicodeError as exc:
+        raise BootstrapError("SABnzbd configuration is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
-    section = ""
-    replaced = False
-    misc_end = len(lines)
+
+def _sab_section(line: str) -> tuple[int, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(("#", ";")):
+        return None
+    match = INI_SECTION_RE.fullmatch(line)
+    if match is None:
+        if stripped.startswith("["):
+            raise BootstrapError("SABnzbd configuration has malformed sections")
+        return None
+    opening = match.group("open")
+    closing = match.group("close")
+    if len(opening) != len(closing) or len(opening) not in {1, 2}:
+        raise BootstrapError("SABnzbd configuration has ambiguous nesting")
+    return len(opening), match.group("name").strip()
+
+
+def _sab_private_rewrite(lines: list[str]) -> tuple[list[str], bool]:
+    """Force private logging and quarantine the managed NNTP server offline."""
+
+    misc_sections: list[int] = []
+    servers_sections: list[int] = []
+    managed_sections: list[int] = []
+    current_top = ""
+    current_child = ""
+    misc_logging: list[int] = []
+    managed_enable: list[int] = []
+
     for index, raw_line in enumerate(lines):
-        line = raw_line.strip()
-        if line.startswith("[") and line.endswith("]"):
-            if section == "misc" and misc_end == len(lines):
-                misc_end = index
-            section = line[1:-1].strip().casefold()
-        elif section == "misc" and "=" in line:
-            key = line.split("=", 1)[0].strip().casefold()
-            if key == "api_logging":
-                lines[index] = "api_logging = 0"
-                replaced = True
-    if "[misc]" not in {line.strip().casefold() for line in lines}:
-        raise BootstrapError("SABnzbd misc configuration is unavailable")
-    if not replaced:
-        lines.insert(misc_end, "api_logging = 0")
+        section = _sab_section(raw_line)
+        if section is not None:
+            depth, name = section
+            folded = name.casefold()
+            if depth == 1:
+                current_top = folded
+                current_child = ""
+                if folded == "misc":
+                    misc_sections.append(index)
+                if folded == "servers":
+                    servers_sections.append(index)
+                if folded == MANAGED_USENET_SERVER_NAME.casefold():
+                    raise BootstrapError(
+                        "Managed SABnzbd server has ambiguous section nesting"
+                    )
+            else:
+                current_child = folded
+                if folded == MANAGED_USENET_SERVER_NAME.casefold():
+                    if current_top != "servers":
+                        raise BootstrapError(
+                            "Managed SABnzbd server is outside the servers section"
+                        )
+                    managed_sections.append(index)
+            continue
 
-    temporary = path.with_name(f"{path.name}.wysearr-tmp-{os.getpid()}")
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith(("#", ";")) or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip().casefold()
+        if current_top == "misc" and not current_child and key == "api_logging":
+            misc_logging.append(index)
+        if (
+            current_top == "servers"
+            and current_child == MANAGED_USENET_SERVER_NAME.casefold()
+            and key == "enable"
+        ):
+            managed_enable.append(index)
+
+    if len(misc_sections) != 1:
+        raise BootstrapError("SABnzbd misc configuration is unavailable or ambiguous")
+    if len(servers_sections) > 1 or len(managed_sections) > 1:
+        raise BootstrapError("SABnzbd managed server configuration is ambiguous")
+    if len(misc_logging) > 1 or len(managed_enable) > 1:
+        raise BootstrapError("SABnzbd managed settings are duplicated")
+
+    inserts: list[tuple[int, str]] = []
+    if misc_logging:
+        lines[misc_logging[0]] = "api_logging = 0"
+    else:
+        end = next(
+            (
+                index
+                for index in range(misc_sections[0] + 1, len(lines))
+                if (_sab_section(lines[index]) or (0, ""))[0] == 1
+            ),
+            len(lines),
+        )
+        inserts.append((end, "api_logging = 0"))
+
+    managed_present = bool(managed_sections)
+    if managed_present:
+        if managed_enable:
+            lines[managed_enable[0]] = "enable = 0"
+        else:
+            start = managed_sections[0]
+            end = next(
+                (
+                    index
+                    for index in range(start + 1, len(lines))
+                    if _sab_section(lines[index]) is not None
+                ),
+                len(lines),
+            )
+            inserts.append((end, "enable = 0"))
+
+    for index, value in sorted(inserts, reverse=True):
+        lines.insert(index, value)
+    return lines, managed_present
+
+
+def _atomic_private_replace(path: Path, content: str) -> None:
+    parent = path.parent
+    try:
+        parent_info = parent.lstat()
+    except OSError as exc:
+        raise BootstrapError("SABnzbd configuration directory is unavailable") from exc
+    if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode):
+        raise BootstrapError("SABnzbd configuration directory is unsafe")
+
+    temporary = path.with_name(
+        f".{path.name}.wysearr-tmp-{os.getpid()}-{secrets.token_hex(6)}"
+    )
+    descriptor = -1
     try:
         descriptor = os.open(
             temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
-    except OSError as exc:
-        raise BootstrapError("Cannot stage the private SABnzbd configuration") from exc
-    try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(lines) + "\n")
+            descriptor = -1
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        temporary.replace(path)
-    except Exception:
+        os.chmod(temporary, 0o600, follow_symlinks=False)
+        os.replace(temporary, path)
+        directory_descriptor = os.open(
+            parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except OSError as exc:
+        raise BootstrapError("Cannot stage the private SABnzbd configuration") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
         temporary.unlink(missing_ok=True)
-        raise
+
+
+def prepare_sabnzbd_private_config(path: Path) -> None:
+    """Disable API logging and quarantine WyseARR's NNTP server while stopped."""
+
+    original = _read_private_regular_text(path)
+    lines, managed_present = _sab_private_rewrite(original.splitlines())
+    _atomic_private_replace(path, "\n".join(lines) + "\n")
+
+    persisted = _read_private_regular_text(path).splitlines()
+    verified, verified_managed = _sab_private_rewrite(list(persisted))
+    if persisted != verified or verified_managed != managed_present:
+        raise BootstrapError("SABnzbd private offline convergence did not persist")
 
 
 def configure_sabnzbd(
@@ -330,6 +746,7 @@ def converge_shelfarr(
         "admin_username": environment["SHELFARR_ADMIN_USERNAME"],
         "admin_password": environment["SHELFARR_ADMIN_PASSWORD"],
         "existing_huey_token": environment.get("SHELFARR_API_TOKEN", ""),
+        "usenet_enabled": parse_managed_usenet_settings(environment).enabled,
     }
     result = runner(
         [
@@ -376,7 +793,12 @@ def converge_shelfarr(
 def bootstrap_shelfarr(root: Path, *, enable: bool = False) -> dict[str, Any]:
     env_path = root / ".env"
     environment = load_dotenv(env_path)
+    usenet_settings = parse_managed_usenet_settings(environment)
     enabling_now = enable or environment.get("SHELFARR_ENABLED", "") == "true"
+    if usenet_settings.enabled is True and not enabling_now:
+        raise BootstrapError(
+            "WYSEARR_USENET_ENABLED requires SHELFARR_ENABLED=true"
+        )
     if enabling_now:
         require_drained_bookbot_book_categories(environment)
     updates: dict[str, str] = {}
@@ -401,6 +823,7 @@ def bootstrap_shelfarr(root: Path, *, enable: bool = False) -> dict[str, Any]:
         environment["SABNZBD_ADMIN_USERNAME"],
         environment["SABNZBD_ADMIN_PASSWORD"],
     )
+    configure_managed_usenet_provider(usenet_settings, port, sab_key)
     value = converge_shelfarr(root, environment, sab_key)
     final_updates = {
         "SABNZBD_API_KEY": sab_key,
@@ -415,6 +838,29 @@ def bootstrap_shelfarr(root: Path, *, enable: bool = False) -> dict[str, Any]:
         "download_clients": list(value.get("download_clients", [])),
         "enabled": enabling_now,
     }
+
+
+def converge_managed_usenet_only(root: Path) -> bool:
+    """Converge only the managed SAB provider while Shelfarr may be stopped."""
+
+    environment = load_dotenv(root / ".env")
+    settings = parse_managed_usenet_settings(environment)
+    if (
+        settings.enabled is True
+        and environment.get("SHELFARR_ENABLED", "") != "true"
+    ):
+        raise BootstrapError(
+            "WYSEARR_USENET_ENABLED requires SHELFARR_ENABLED=true"
+        )
+    try:
+        port = int(environment.get("SABNZBD_ADMIN_PORT", "8085"))
+    except ValueError as exc:
+        raise BootstrapError("SABNZBD_ADMIN_PORT must be numeric") from exc
+    api_key = environment.get("SABNZBD_API_KEY", "") or _read_sab_api_key(
+        root / "config" / "sabnzbd" / "sabnzbd.ini"
+    )
+    configure_managed_usenet_provider(settings, port, api_key)
+    return settings.enabled
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -433,7 +879,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--prepare-sab-config",
         action="store_true",
-        help="Disable SAB API logging while SABnzbd is stopped",
+        help="Disable SAB API logging and quarantine managed NNTP while stopped",
+    )
+    parser.add_argument(
+        "--converge-usenet-only",
+        action="store_true",
+        help="Only enable/disable the managed SABnzbd NNTP provider",
     )
     return parser.parse_args(argv)
 
@@ -447,6 +898,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.enable,
                 arguments.check_drain_only,
                 arguments.prepare_sab_config,
+                arguments.converge_usenet_only,
             )
         )
         if selected_modes > 1:
@@ -455,12 +907,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             prepare_sabnzbd_private_config(
                 arguments.root.resolve() / "config" / "sabnzbd" / "sabnzbd.ini"
             )
-            print("SABnzbd API parameter logging is disabled on disk.")
+            print("SABnzbd private logging and managed NNTP are disabled on disk.")
             return 0
         if arguments.check_drain_only:
             environment = load_dotenv(arguments.root.resolve() / ".env")
             require_drained_bookbot_book_categories(environment)
             print("BookBot ebook/audiobook categories are drained.")
+            return 0
+        if arguments.converge_usenet_only:
+            enabled = converge_managed_usenet_only(arguments.root.resolve())
+            state = "enabled and connection-tested" if enabled else "disabled"
+            print(f"Managed SABnzbd Usenet provider is {state}.")
             return 0
         result = bootstrap_shelfarr(arguments.root.resolve(), enable=arguments.enable)
     except BootstrapError as exc:

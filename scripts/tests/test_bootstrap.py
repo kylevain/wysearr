@@ -53,6 +53,30 @@ def indexer_schema(spec):
     }
 
 
+def generic_newznab_schema():
+    return {
+        "id": 0,
+        "name": "Generic Newznab",
+        "definitionName": "Newznab",
+        "implementation": "Newznab",
+        "implementationName": "Newznab",
+        "configContract": "NewznabSettings",
+        "protocol": "usenet",
+        "enable": False,
+        "supportsRss": True,
+        "supportsSearch": True,
+        "appProfileId": 1,
+        "priority": 25,
+        "tags": [],
+        "fields": [
+            {"name": "baseUrl", "value": ""},
+            {"name": "apiPath", "value": "/api"},
+            {"name": "apiKey", "value": ""},
+            {"name": "additionalParameters", "value": None},
+        ],
+    }
+
+
 class EnvironmentTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -449,6 +473,169 @@ class FakeProwlarrApi:
         return payload
 
 
+class FakeManagedNewznabApi:
+    def __init__(
+        self,
+        *,
+        tags=None,
+        applications=None,
+        existing=None,
+        book_categories=True,
+    ):
+        self.tags = copy.deepcopy(tags or [])
+        self.applications = copy.deepcopy(
+            applications
+            or [
+                {
+                    "id": 100 + index,
+                    "name": service.name,
+                    "implementation": service.name,
+                    "tags": [],
+                }
+                for index, service in enumerate(bootstrap.ARR_SERVICES, start=1)
+            ]
+        )
+        self.existing = copy.deepcopy(existing or [])
+        self.schemas = [
+            {
+                "name": "Newznab",
+                "presets": [
+                    dict(generic_newznab_schema(), name="Provider-specific preset"),
+                    generic_newznab_schema(),
+                ],
+            }
+        ]
+        self.creates = []
+        self.puts = []
+        self.tests = []
+        self.tag_creates = []
+        self.application_puts = []
+        self.events = []
+        self.fail_test_with = None
+        self.book_categories = book_categories
+        self.fail_tag_label = None
+
+    def get_json(self, path):
+        resource_suffix = path.removeprefix("/api/v1/indexer/")
+        if resource_suffix.isdigit():
+            resource_id = int(resource_suffix)
+            return copy.deepcopy(
+                next(item for item in self.existing if item.get("id") == resource_id)
+            )
+        application_suffix = path.removeprefix("/api/v1/applications/")
+        if application_suffix.isdigit():
+            resource_id = int(application_suffix)
+            return copy.deepcopy(
+                next(
+                    item
+                    for item in self.applications
+                    if item.get("id") == resource_id
+                )
+            )
+        values = {
+            "/api/v1/tag": self.tags,
+            "/api/v1/applications": self.applications,
+            "/api/v1/indexer": self.existing,
+            "/api/v1/indexer/schema": self.schemas,
+            "/api/v1/appprofile": [{"id": 1, "name": "Standard"}],
+        }
+        if path not in values:
+            raise AssertionError(path)
+        return copy.deepcopy(values[path])
+
+    def _mask_api_key(self, payload):
+        stored = copy.deepcopy(payload)
+        field = next(
+            (
+                item
+                for item in stored.get("fields", [])
+                if item.get("name") == "apiKey"
+            ),
+            None,
+        )
+        if field is not None:
+            field["value"] = "********"
+        if stored.get("implementation") == "Newznab":
+            categories = (
+                [
+                    {
+                        "id": 3000,
+                        "name": "Audio",
+                        "subCategories": [
+                            {
+                                "id": 3030,
+                                "name": "Audio/Audiobook",
+                                "subCategories": [],
+                            }
+                        ],
+                    },
+                    {
+                        "id": 7000,
+                        "name": "Books",
+                        "subCategories": [
+                            {
+                                "id": 7020,
+                                "name": "Books/EBook",
+                                "subCategories": [],
+                            }
+                        ],
+                    },
+                ]
+                if self.book_categories
+                else [{"id": 2000, "name": "Movies", "subCategories": []}]
+            )
+            stored["capabilities"] = {"categories": categories}
+        return stored
+
+    def post_json(self, path, payload, retry=False):
+        if path == "/api/v1/tag":
+            if payload["label"] == self.fail_tag_label:
+                raise bootstrap.ApiTransportError(path)
+            next_id = max((item["id"] for item in self.tags), default=6) + 1
+            created = {"id": next_id, "label": payload["label"]}
+            self.tags.append(created)
+            self.tag_creates.append(copy.deepcopy(payload))
+            self.events.append(("tag", payload["label"]))
+            return copy.deepcopy(created)
+        if path == "/api/v1/indexer/test":
+            self.tests.append(copy.deepcopy(payload))
+            self.events.append(("test", payload.get("name")))
+            if self.fail_test_with is not None:
+                raise self.fail_test_with
+            return {}
+        if path == "/api/v1/indexer?forceSave=true":
+            created = copy.deepcopy(payload)
+            created["id"] = 41
+            self.creates.append(created)
+            self.existing.append(self._mask_api_key(created))
+            self.events.append(("indexer-create", created["name"]))
+            return copy.deepcopy(created)
+        raise AssertionError(path)
+
+    def put_json(self, path, payload):
+        updated = copy.deepcopy(payload)
+        self.puts.append((path, updated))
+        resource_id = updated["id"]
+        if path.startswith("/api/v1/applications/"):
+            self.applications = [
+                updated if item.get("id") == resource_id else item
+                for item in self.applications
+            ]
+            self.application_puts.append((path, updated))
+            self.events.append(("application-put", updated["name"]))
+        else:
+            self.existing = [
+                self._mask_api_key(updated)
+                if item.get("id") == resource_id
+                else item
+                for item in self.existing
+            ]
+            self.events.append(
+                ("indexer-put", updated["name"], bool(updated.get("enable")))
+            )
+        return copy.deepcopy(updated)
+
+
 class ProwlarrTests(unittest.TestCase):
     def test_selected_indexer_payloads_fail_independently_and_are_idempotent(self):
         api = FakeProwlarrApi()
@@ -514,6 +701,599 @@ class ProwlarrTests(unittest.TestCase):
         self.assertTrue(
             all(path == "/api/v1/applications/test" for path, _ in api.tests)
         )
+
+    def test_managed_newznab_environment_contract_is_strict_and_private(self):
+        disabled = bootstrap.managed_newznab_config({})
+        self.assertFalse(disabled.enabled)
+        self.assertEqual(disabled.name, "WyseARR Books")
+        self.assertFalse(
+            bootstrap.managed_newznab_config(
+                {"WYSEARR_USENET_ENABLED": "false"}
+            ).enabled
+        )
+
+        for enabled in ("false", "true"):
+            with self.subTest(custom_name_enabled=enabled), self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "NEWZNAB_INDEXER_NAME must be exactly WyseARR Books",
+            ):
+                bootstrap.managed_newznab_config(
+                    {
+                        "WYSEARR_USENET_ENABLED": enabled,
+                        "NEWZNAB_INDEXER_NAME": "Old Books Pilot",
+                    }
+                )
+
+        for invalid_flag in ("yes", " true", "true ", "False"):
+            with self.subTest(flag=invalid_flag), self.assertRaisesRegex(
+                bootstrap.BootstrapError,
+                "must be blank or literal true or false",
+            ):
+                bootstrap.managed_newznab_config(
+                    {"WYSEARR_USENET_ENABLED": invalid_flag}
+                )
+
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "requires SHELFARR_ENABLED=true",
+        ):
+            bootstrap.managed_newznab_config({"WYSEARR_USENET_ENABLED": "true"})
+
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "Required private setting is missing: NEWZNAB_BASE_URL",
+        ):
+            bootstrap.managed_newznab_config(
+                {
+                    "WYSEARR_USENET_ENABLED": "true",
+                    "SHELFARR_ENABLED": "true",
+                }
+            )
+
+        configured = bootstrap.managed_newznab_config(
+            {
+                "WYSEARR_USENET_ENABLED": "true",
+                "SHELFARR_ENABLED": "true",
+                "NEWZNAB_BASE_URL": "https://indexer.example/",
+                "NEWZNAB_API_KEY": "private-newznab-key",
+            }
+        )
+        self.assertEqual(
+            configured,
+            bootstrap.ManagedNewznabConfig(
+                True,
+                "WyseARR Books",
+                "https://indexer.example",
+                "private-newznab-key",
+                "/api",
+            ),
+        )
+
+        for bad_url in (
+            "ftp://indexer.example",
+            "https://user:secret@indexer.example",
+            "https://indexer.example?apikey=secret",
+            "https://[",
+            "https://indexer.example\\redirect",
+            "https://indexer example",
+        ):
+            with self.subTest(base_url=bad_url), self.assertRaisesRegex(
+                bootstrap.BootstrapError, "NEWZNAB_BASE_URL"
+            ):
+                bootstrap.managed_newznab_config(
+                    {
+                        "WYSEARR_USENET_ENABLED": "true",
+                        "SHELFARR_ENABLED": "true",
+                        "NEWZNAB_BASE_URL": bad_url,
+                        "NEWZNAB_API_KEY": "private-newznab-key",
+                    }
+                )
+
+        for bad_path in (
+            "api",
+            "//other.example/api",
+            "/api?apikey=secret",
+            "/api#fragment",
+            "/api\\redirect",
+            "/api path",
+        ):
+            with self.subTest(api_path=bad_path), self.assertRaisesRegex(
+                bootstrap.BootstrapError, "NEWZNAB_API_PATH"
+            ):
+                bootstrap.managed_newznab_config(
+                    {
+                        "WYSEARR_USENET_ENABLED": "true",
+                        "SHELFARR_ENABLED": "true",
+                        "NEWZNAB_BASE_URL": "https://indexer.example",
+                        "NEWZNAB_API_KEY": "private-newznab-key",
+                        "NEWZNAB_API_PATH": bad_path,
+                    }
+                )
+
+    def test_managed_newznab_creates_exact_tagged_generic_and_is_idempotent(self):
+        api = FakeManagedNewznabApi()
+        config = bootstrap.managed_newznab_config(
+            {
+                "WYSEARR_USENET_ENABLED": "true",
+                "SHELFARR_ENABLED": "true",
+                "NEWZNAB_BASE_URL": "https://indexer.example",
+                "NEWZNAB_API_KEY": "private-newznab-key",
+            }
+        )
+
+        self.assertEqual(
+            bootstrap.configure_managed_newznab(
+                api, config, secret_values=[config.api_key]
+            ),
+            "created",
+        )
+        self.assertEqual(
+            api.tag_creates,
+            [{"label": "shelfarr"}, {"label": "wysearr-arr"}],
+        )
+        self.assertEqual(len(api.application_puts), len(bootstrap.ARR_SERVICES))
+        for application in api.applications:
+            self.assertIn(8, application["tags"])
+            self.assertNotIn(7, application["tags"])
+        self.assertEqual(len(api.creates), 1)
+        created = api.creates[0]
+        self.assertEqual(created["name"], "WyseARR Books")
+        self.assertEqual(created["implementation"], "Newznab")
+        self.assertEqual(created["configContract"], "NewznabSettings")
+        self.assertEqual(created["protocol"], "usenet")
+        self.assertTrue(created["enable"])
+        self.assertEqual(created["priority"], 20)
+        self.assertEqual(created["appProfileId"], 1)
+        self.assertEqual(created["tags"], [7])
+        self.assertEqual(
+            bootstrap.get_provider_field(created, "baseUrl"),
+            "https://indexer.example",
+        )
+        self.assertEqual(bootstrap.get_provider_field(created, "apiPath"), "/api")
+        self.assertEqual(
+            bootstrap.get_provider_field(created, "apiKey"),
+            "private-newznab-key",
+        )
+
+        first_put_count = len(api.puts)
+        self.assertEqual(
+            bootstrap.configure_managed_newznab(
+                api, config, secret_values=[config.api_key]
+            ),
+            "verified",
+        )
+        self.assertEqual(len(api.creates), 1)
+        self.assertEqual(first_put_count, len(bootstrap.ARR_SERVICES))
+        self.assertEqual(
+            api.tag_creates,
+            [{"label": "shelfarr"}, {"label": "wysearr-arr"}],
+        )
+        self.assertEqual(len(api.tests), 3)
+        self.assertEqual(len(api.puts), first_put_count)
+
+    def test_arr_isolation_quarantines_existing_managed_before_tag_transition(self):
+        managed = generic_newznab_schema()
+        managed.update(
+            {
+                "id": 42,
+                "name": "WyseARR Books",
+                "enable": True,
+                "priority": 20,
+                "tags": [8, 9, 12],
+            }
+        )
+        bootstrap.set_provider_field(managed, "baseUrl", "https://indexer.example")
+        bootstrap.set_provider_field(managed, "apiKey", "********")
+        unrelated = dict(
+            indexer_schema(bootstrap.PUBLIC_INDEXERS[0]),
+            id=99,
+            enable=True,
+            tags=[11],
+        )
+        applications = [
+            {
+                "id": 100 + index,
+                "name": service.name,
+                "implementation": service.name,
+                "tags": [12],
+            }
+            for index, service in enumerate(bootstrap.ARR_SERVICES, start=1)
+        ]
+        api = FakeManagedNewznabApi(
+            tags=[
+                {"id": 7, "label": "shelfarr"},
+                {"id": 8, "label": "wysearr-arr"},
+            ],
+            applications=applications,
+            existing=[managed, unrelated],
+        )
+        config = bootstrap.ManagedNewznabConfig(
+            True,
+            "WyseARR Books",
+            "https://indexer.example",
+            "private-newznab-key",
+            "/api",
+        )
+
+        self.assertEqual(
+            bootstrap.configure_managed_newznab(api, config),
+            "updated",
+        )
+        indexer_puts = [event for event in api.events if event[0] == "indexer-put"]
+        self.assertEqual(indexer_puts[0], ("indexer-put", "WyseARR Books", False))
+        self.assertEqual(indexer_puts[-1], ("indexer-put", "WyseARR Books", True))
+        first_application = next(
+            index
+            for index, event in enumerate(api.events)
+            if event[0] == "application-put"
+        )
+        managed_reenable = max(
+            index
+            for index, event in enumerate(api.events)
+            if event == ("indexer-put", "WyseARR Books", True)
+        )
+        unrelated_tagged = next(
+            index
+            for index, event in enumerate(api.events)
+            if event == ("indexer-put", unrelated["name"], True)
+        )
+        self.assertLess(unrelated_tagged, first_application)
+        self.assertLess(first_application, managed_reenable)
+        self.assertEqual(api.existing[0]["tags"], [7, 9])
+        self.assertEqual(api.existing[1]["tags"], [8, 11])
+        for application in api.applications:
+            self.assertEqual(application["tags"], [8, 12])
+
+    def test_tag_creation_failure_leaves_existing_managed_newznab_quarantined(self):
+        managed = generic_newznab_schema()
+        managed.update(
+            {
+                "id": 42,
+                "name": "WyseARR Books",
+                "enable": True,
+                "priority": 20,
+                "tags": [7],
+            }
+        )
+        bootstrap.set_provider_field(managed, "baseUrl", "https://indexer.example")
+        bootstrap.set_provider_field(managed, "apiKey", "********")
+        api = FakeManagedNewznabApi(
+            tags=[{"id": 7, "label": "shelfarr"}],
+            existing=[managed],
+        )
+        api.fail_tag_label = "wysearr-arr"
+        config = bootstrap.ManagedNewznabConfig(
+            True,
+            "WyseARR Books",
+            "https://indexer.example",
+            "private-newznab-key",
+            "/api",
+        )
+
+        with self.assertRaises(bootstrap.ApiTransportError):
+            bootstrap.configure_managed_newznab(api, config)
+
+        self.assertEqual(
+            api.events,
+            [("indexer-put", "WyseARR Books", False)],
+        )
+        self.assertFalse(api.existing[0]["enable"])
+        self.assertEqual(api.application_puts, [])
+        self.assertEqual(api.creates, [])
+
+    def test_managed_newznab_repairs_only_the_exact_managed_resource(self):
+        installed = generic_newznab_schema()
+        installed.update(
+            {
+                "id": 42,
+                "name": "WyseARR Books",
+                "enable": False,
+                "priority": 50,
+                "tags": [8, 9],
+            }
+        )
+        bootstrap.set_provider_field(installed, "baseUrl", "https://old.invalid")
+        bootstrap.set_provider_field(installed, "apiPath", "/old-api")
+        bootstrap.set_provider_field(installed, "apiKey", "********")
+        unrelated = dict(
+            indexer_schema(bootstrap.PUBLIC_INDEXERS[0]),
+            id=99,
+            enable=True,
+            tags=[11],
+        )
+        api = FakeManagedNewznabApi(
+            tags=[
+                {"id": 7, "label": "shelfarr"},
+                {"id": 8, "label": "wysearr-arr"},
+            ],
+            existing=[installed, unrelated],
+        )
+        config = bootstrap.ManagedNewznabConfig(
+            True,
+            "WyseARR Books",
+            "https://indexer.example",
+            "private-newznab-key",
+            "/api",
+        )
+
+        self.assertEqual(
+            bootstrap.configure_managed_newznab(api, config),
+            "updated",
+        )
+        managed_puts = [
+            item for item in api.puts if item[0].startswith("/api/v1/indexer/42")
+        ]
+        self.assertEqual(len(managed_puts), 1)
+        path, updated = managed_puts[0]
+        self.assertEqual(path, "/api/v1/indexer/42?forceSave=true")
+        self.assertEqual(updated["tags"], [7, 9])
+        self.assertEqual(updated["priority"], 20)
+        self.assertTrue(updated["enable"])
+        self.assertEqual(api.existing[1]["tags"], [8, 11])
+        for application in api.applications:
+            self.assertEqual(application["tags"], [8])
+
+    def test_disabled_managed_newznab_disables_exact_name_and_absent_is_noop(self):
+        installed = generic_newznab_schema()
+        installed.update({"id": 42, "name": "WyseARR Books", "enable": True})
+        unrelated = dict(
+            indexer_schema(bootstrap.PUBLIC_INDEXERS[0]),
+            id=99,
+            enable=True,
+            tags=[11],
+        )
+        api = FakeManagedNewznabApi(existing=[installed, unrelated])
+        config = bootstrap.ManagedNewznabConfig(False, "WyseARR Books", "", "", "")
+
+        self.assertEqual(
+            bootstrap.configure_managed_newznab(api, config),
+            "disabled",
+        )
+        self.assertEqual(len(api.puts), 1)
+        self.assertFalse(api.puts[0][1]["enable"])
+        self.assertEqual(api.existing[1], unrelated)
+        self.assertTrue(all(not item["tags"] for item in api.applications))
+        self.assertEqual(api.tests, [])
+
+        absent = FakeManagedNewznabApi()
+        self.assertEqual(
+            bootstrap.configure_managed_newznab(absent, config),
+            "absent",
+        )
+        self.assertEqual(absent.creates, [])
+        self.assertEqual(absent.puts, [])
+        self.assertEqual(absent.tag_creates, [])
+
+    def test_disabled_mode_maintains_an_existing_arr_isolation_topology(self):
+        installed = generic_newznab_schema()
+        installed.update(
+            {
+                "id": 42,
+                "name": "WyseARR Books",
+                "enable": True,
+                "tags": [7],
+            }
+        )
+        unrelated = dict(
+            indexer_schema(bootstrap.PUBLIC_INDEXERS[0]),
+            id=99,
+            enable=True,
+            tags=[11],
+        )
+        applications = [
+            {
+                "id": 100 + index,
+                "name": service.name,
+                "implementation": service.name,
+                "tags": [12],
+            }
+            for index, service in enumerate(bootstrap.ARR_SERVICES, start=1)
+        ]
+        api = FakeManagedNewznabApi(
+            tags=[
+                {"id": 7, "label": "shelfarr"},
+                {"id": 8, "label": "wysearr-arr"},
+            ],
+            applications=applications,
+            existing=[installed, unrelated],
+        )
+        config = bootstrap.ManagedNewznabConfig(
+            False, "WyseARR Books", "", "", ""
+        )
+
+        self.assertEqual(
+            bootstrap.configure_managed_newznab(api, config), "disabled"
+        )
+        self.assertEqual(
+            api.events[0], ("indexer-put", "WyseARR Books", False)
+        )
+        self.assertEqual(api.existing[0]["tags"], [7])
+        self.assertEqual(api.existing[1]["tags"], [8, 11])
+        for application in api.applications:
+            self.assertEqual(application["tags"], [8, 12])
+        first_application = next(
+            index
+            for index, event in enumerate(api.events)
+            if event[0] == "application-put"
+        )
+        unrelated_tagged = api.events.index(
+            ("indexer-put", unrelated["name"], True)
+        )
+        self.assertLess(unrelated_tagged, first_application)
+
+    def test_disabled_mode_rejects_partial_retained_topology_after_quarantine(self):
+        installed = generic_newznab_schema()
+        installed.update(
+            {
+                "id": 42,
+                "name": "WyseARR Books",
+                "enable": True,
+                "tags": [7],
+            }
+        )
+        api = FakeManagedNewznabApi(
+            tags=[{"id": 7, "label": "shelfarr"}],
+            existing=[installed],
+        )
+        config = bootstrap.ManagedNewznabConfig(
+            False, "WyseARR Books", "", "", ""
+        )
+
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, "partial or conflicting retained"
+        ):
+            bootstrap.configure_managed_newznab(api, config)
+
+        self.assertEqual(
+            api.events, [("indexer-put", "WyseARR Books", False)]
+        )
+        self.assertFalse(api.existing[0]["enable"])
+        self.assertEqual(api.application_puts, [])
+
+    def test_unmanaged_shelfarr_tag_fails_before_any_tag_migration(self):
+        orphan = dict(
+            generic_newznab_schema(),
+            id=77,
+            name="Old Books Pilot",
+            enable=False,
+            tags=[7],
+        )
+        unrelated = dict(
+            indexer_schema(bootstrap.PUBLIC_INDEXERS[0]),
+            id=99,
+            enable=True,
+            tags=[],
+        )
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                api = FakeManagedNewznabApi(
+                    tags=[
+                        {"id": 7, "label": "shelfarr"},
+                        {"id": 8, "label": "wysearr-arr"},
+                    ],
+                    existing=[orphan, unrelated],
+                )
+                config = bootstrap.ManagedNewznabConfig(
+                    enabled,
+                    "WyseARR Books",
+                    "https://indexer.example" if enabled else "",
+                    "private-newznab-key" if enabled else "",
+                    "/api" if enabled else "",
+                )
+
+                with self.assertRaisesRegex(
+                    bootstrap.BootstrapError,
+                    "unmanaged indexers carrying the shelfarr tag: Old Books Pilot",
+                ):
+                    bootstrap.configure_managed_newznab(api, config)
+
+                self.assertEqual(api.puts, [])
+                self.assertEqual(api.application_puts, [])
+                self.assertEqual(api.tag_creates, [])
+
+    def test_configure_rejects_noncanonical_managed_name_before_api_access(self):
+        api = FakeManagedNewznabApi()
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "NEWZNAB_INDEXER_NAME must be exactly WyseARR Books",
+        ):
+            bootstrap.configure_managed_newznab(
+                api,
+                bootstrap.ManagedNewznabConfig(
+                    False, "Old Books Pilot", "", "", ""
+                ),
+            )
+        self.assertEqual(api.events, [])
+
+    def test_managed_newznab_fails_before_indexer_mutation_if_arr_has_tag(self):
+        applications = [
+            {
+                "id": 100 + index,
+                "name": service.name,
+                "implementation": service.name,
+                "tags": [7] if service.name == "Radarr" else [],
+            }
+            for index, service in enumerate(bootstrap.ARR_SERVICES, start=1)
+        ]
+        api = FakeManagedNewznabApi(
+            tags=[
+                {"id": 7, "label": "shelfarr"},
+                {"id": 8, "label": "wysearr-arr"},
+            ],
+            applications=applications,
+        )
+        config = bootstrap.ManagedNewznabConfig(
+            True,
+            "WyseARR Books",
+            "https://indexer.example",
+            "private-newznab-key",
+            "/api",
+        )
+
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "ARR applications must not carry the shelfarr tag: Radarr",
+        ):
+            bootstrap.configure_managed_newznab(api, config)
+        self.assertEqual(api.tests, [])
+        self.assertEqual(api.creates, [])
+        self.assertEqual(api.puts, [])
+
+    def test_managed_newznab_rejects_name_collision_and_redacts_test_error(self):
+        collision = dict(
+            indexer_schema(bootstrap.PUBLIC_INDEXERS[0]),
+            id=42,
+            name="WyseARR Books",
+        )
+        config = bootstrap.ManagedNewznabConfig(
+            True,
+            "WyseARR Books",
+            "https://indexer.example",
+            "private-newznab-key",
+            "/api",
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "is not a Generic Newznab resource",
+        ):
+            bootstrap.configure_managed_newznab(
+                FakeManagedNewznabApi(existing=[collision]), config
+            )
+
+        api = FakeManagedNewznabApi(
+            tags=[
+                {"id": 7, "label": "shelfarr"},
+                {"id": 8, "label": "wysearr-arr"},
+            ]
+        )
+        body = json.dumps(
+            {"message": f"invalid apiKey={config.api_key}"}
+        ).encode()
+        api.fail_test_with = bootstrap.ApiError(
+            400, "/api/v1/indexer/test", "Bad Request", body
+        )
+        with self.assertRaises(bootstrap.BootstrapError) as raised:
+            bootstrap.configure_managed_newznab(
+                api, config, secret_values=[config.api_key]
+            )
+        self.assertNotIn(config.api_key, str(raised.exception))
+        self.assertIn("[redacted]", str(raised.exception))
+        self.assertEqual(api.creates, [])
+
+    def test_managed_newznab_requires_ebook_and_audiobook_categories(self):
+        api = FakeManagedNewznabApi(book_categories=False)
+        config = bootstrap.ManagedNewznabConfig(
+            True,
+            "WyseARR Books",
+            "https://indexer.example",
+            "private-newznab-key",
+            "/api",
+        )
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "does not advertise ebook and audiobook categories",
+        ):
+            bootstrap.configure_managed_newznab(api, config)
 
 
 class BazarrTests(unittest.TestCase):
@@ -596,6 +1376,30 @@ class BazarrTests(unittest.TestCase):
 
 
 class HttpAndSecretSafetyTests(unittest.TestCase):
+    def test_dotenv_preserves_raw_usenet_feature_literal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text(
+                "WYSEARR_USENET_ENABLED= true \nOTHER=value\n",
+                encoding="utf-8",
+            )
+            values = bootstrap.load_dotenv(path)
+        self.assertEqual(values["WYSEARR_USENET_ENABLED"], " true ")
+        self.assertEqual(values["OTHER"], "value")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.managed_newznab_config(values)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text(
+                "WYSEARR_USENET_ENABLED=true\n"
+                "WYSEARR_USENET_ENABLED=true\n",
+                encoding="utf-8",
+            )
+            duplicate = bootstrap.load_dotenv(path)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.managed_newznab_config(duplicate)
+
     def test_get_retries_transient_transport_failure_with_mocked_opener(self):
         class Response:
             status = 200

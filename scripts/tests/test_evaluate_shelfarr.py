@@ -145,6 +145,276 @@ class ShelfarrEvaluationTests(unittest.TestCase):
             "direct",
         )
 
+    def test_newznab_and_prowlarr_candidates_have_protocol_counts(self):
+        record = evaluate_shelfarr.EvaluationRecord(
+            12, "73", "Dune", "Frank Herbert", "ebook", "needs_selection"
+        )
+        results = [
+            {
+                "id": 1,
+                "source": "newznab",
+                "indexer": "Books NZB",
+                "status": "selected",
+            },
+            {"id": 2, "source": "gutenberg", "status": "pending"},
+            {
+                "id": 3,
+                "source": "prowlarr",
+                "indexer": "The Pirate Bay",
+                "status": "pending",
+            },
+            {
+                "id": 4,
+                "source": "prowlarr",
+                "indexer": "Books NZB",
+                "status": "pending",
+            },
+            {
+                "id": 5,
+                "source": "prowlarr",
+                "indexer": "Unmapped Indexer",
+                "status": "pending",
+            },
+        ]
+
+        evaluate_shelfarr.observe_acquisition_candidates(
+            record,
+            results,
+            {"the pirate bay": "torrent", "books nzb": "usenet"},
+        )
+
+        self.assertEqual(
+            record.acquisition_candidate_counts,
+            {"direct": 1, "usenet": 2, "torrent": 1, "unknown": 1},
+        )
+        self.assertEqual(record.selected_source, "usenet")
+
+    def test_prowlarr_protocol_map_uses_only_read_only_indexer_api(self):
+        class ReadOnlyProwlarr:
+            calls = []
+
+            def __init__(self, base_url, api_key, *, timeout):
+                self.__class__.calls.append(
+                    ("init", base_url, bool(api_key), timeout)
+                )
+
+            def _request(self, method, endpoint):
+                self.__class__.calls.append((method, endpoint))
+                return [
+                    {"name": "Books NZB", "protocol": "usenet"},
+                    {"name": "The Pirate Bay", "protocol": "torrent"},
+                    {"name": "Untrusted", "protocol": "other"},
+                ]
+
+        with patch.object(
+            evaluate_shelfarr, "ProwlarrClient", ReadOnlyProwlarr
+        ):
+            protocols = evaluate_shelfarr.read_prowlarr_indexer_protocols(
+                {
+                    "PROWLARR_API_KEY": "secret",
+                    "WYSEARR_BIND_ADDRESS": "192.0.2.1",
+                    "PROWLARR_PORT": "9696",
+                }
+            )
+
+        self.assertEqual(
+            protocols,
+            {"books nzb": "usenet", "the pirate bay": "torrent"},
+        )
+        self.assertEqual(ReadOnlyProwlarr.calls[-1], ("GET", "/api/v1/indexer"))
+
+    def test_metadata_visibility_distinguishes_ambiguity_and_no_results(self):
+        class MetadataClient:
+            minimum_confidence = 0.80
+            runner_up_gap = 0.05
+
+            def __init__(self, candidates):
+                self.candidates = candidates
+
+            def search(self, _title, _author):
+                return self.candidates
+
+        ambiguous = [
+            {
+                "work_id": "openlibrary:ONE",
+                "title": "Work in Progress",
+                "author": "Michael Eisner",
+                "content_kind": "book",
+                "available_book_types": ["ebook"],
+            },
+            {
+                "work_id": "openlibrary:TWO",
+                "title": "Work in Progress",
+                "author": "Michael D. Eisner",
+                "content_kind": "book",
+                "available_book_types": ["ebook"],
+            },
+        ]
+        ambiguous_record = evaluate_shelfarr.EvaluationRecord(
+            10,
+            None,
+            "Work in Progress",
+            "Michael Eisner",
+            "ebook",
+            "needs_selection",
+        )
+        evaluate_shelfarr.observe_metadata_resolution(
+            MetadataClient(ambiguous), ambiguous_record, "ebooks"
+        )
+        self.assertEqual(ambiguous_record.metadata_resolution, "ambiguous")
+        self.assertEqual(ambiguous_record.metadata_candidate_count, 2)
+
+        missing_record = evaluate_shelfarr.EvaluationRecord(
+            19,
+            None,
+            "Down in the Dirt",
+            "Trevor Burbage",
+            "ebook",
+            "needs_selection",
+        )
+        evaluate_shelfarr.observe_metadata_resolution(
+            MetadataClient([]), missing_record, "ebooks"
+        )
+        self.assertEqual(missing_record.metadata_resolution, "no_results")
+        self.assertEqual(missing_record.metadata_candidate_count, 0)
+
+    def test_terminal_visibility_separates_acquisition_from_import(self):
+        successful = evaluate_shelfarr.EvaluationRecord(
+            1,
+            "71",
+            "Book",
+            None,
+            "ebook",
+            "failed",
+            download_result="success",
+            shelfarr_status="completed",
+            final_library_available=True,
+        )
+        missing_import = evaluate_shelfarr.EvaluationRecord(
+            2,
+            "72",
+            "Book Two",
+            None,
+            "ebook",
+            "failed",
+            download_result="import_path_missing",
+            shelfarr_status="completed",
+        )
+        unselected = evaluate_shelfarr.EvaluationRecord(
+            3,
+            "73",
+            "Book Three",
+            None,
+            "ebook",
+            "failed",
+            download_result="failure",
+            shelfarr_status="failed",
+            acquisition_candidate_counts={
+                "direct": 0,
+                "usenet": 1,
+                "torrent": 0,
+                "unknown": 0,
+            },
+        )
+        selected_failure = evaluate_shelfarr.EvaluationRecord(
+            4,
+            "74",
+            "Book Four",
+            None,
+            "ebook",
+            "failed",
+            download_result="failure",
+            shelfarr_status="failed",
+            selected_source="torrent",
+        )
+        import_failure = evaluate_shelfarr.EvaluationRecord(
+            5,
+            "75",
+            "Book Five",
+            None,
+            "ebook",
+            "failed",
+            download_result="failure",
+            shelfarr_status="failed",
+        )
+        evaluate_shelfarr.apply_artifact_observation(
+            import_failure,
+            {
+                "download_status": 3,
+                "download_type": "torrent",
+                "client_type": "qbittorrent",
+                "release_title": "Book Five EPUB",
+            },
+            [],
+            Path("/mnt/media"),
+        )
+
+        for record in (
+            successful,
+            missing_import,
+            unselected,
+            selected_failure,
+            import_failure,
+        ):
+            evaluate_shelfarr.update_measurement_outcomes(record)
+
+        self.assertEqual(
+            (successful.acquisition_result, successful.import_result),
+            ("success", "success"),
+        )
+        self.assertEqual(
+            (missing_import.acquisition_result, missing_import.import_result),
+            ("success", "artifact_missing"),
+        )
+        self.assertEqual(
+            (unselected.acquisition_result, unselected.import_result),
+            ("candidate_unselected", "not_started"),
+        )
+        self.assertEqual(
+            (selected_failure.acquisition_result, selected_failure.import_result),
+            ("failure", "not_started"),
+        )
+        self.assertEqual(
+            (import_failure.acquisition_result, import_failure.import_result),
+            ("success", "failure"),
+        )
+
+    def test_legacy_report_loads_with_visibility_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "legacy.json"
+            report.write_text(
+                __import__("json").dumps(
+                    {
+                        "records": [
+                            {
+                                "huey_request_id": 12,
+                                "shelfarr_request_id": "7",
+                                "title": "The Boxcar Children",
+                                "author": "Gertrude Chandler Warner",
+                                "format": "ebook",
+                                "previous_status": "needs_selection",
+                                "download_result": "failure",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            record = evaluate_shelfarr.load_evaluation_records(report)[0]
+
+            self.assertEqual(record.metadata_resolution, "not_observed")
+            self.assertIsNone(record.metadata_candidate_count)
+            self.assertIsNone(record.acquisition_candidate_counts)
+            self.assertIsNone(record.selected_source)
+            self.assertEqual(record.acquisition_result, "not_observed")
+            self.assertEqual(record.import_result, "not_observed")
+
+            evaluate_shelfarr.write_results(report, [record])
+            rewritten = evaluate_shelfarr.load_evaluation_records(report)[0]
+            self.assertEqual(rewritten.acquisition_result, "not_observed")
+            self.assertEqual(rewritten.import_result, "not_observed")
+
     def test_cancellation_must_be_confirmed(self):
         record = evaluate_shelfarr.EvaluationRecord(
             1, "73", "Dune", "Frank Herbert", "ebook", "failed"
@@ -288,6 +558,7 @@ class ShelfarrEvaluationTests(unittest.TestCase):
             output = root / "state" / "shelfarr-evaluation" / "results.json"
             with (
                 patch.object(evaluate_shelfarr, "ShelfarrClient", FakeClient),
+                patch.object(evaluate_shelfarr, "observe_metadata_resolution"),
                 patch.object(evaluate_shelfarr, "validate_shelfarr_database"),
                 patch.object(evaluate_shelfarr, "library_has_title", return_value=False),
                 self.assertRaises(KeyboardInterrupt),
@@ -347,6 +618,7 @@ class ShelfarrEvaluationTests(unittest.TestCase):
             output = root / "state" / "shelfarr-evaluation" / "results.json"
             with (
                 patch.object(evaluate_shelfarr, "ShelfarrClient", LostPostClient),
+                patch.object(evaluate_shelfarr, "observe_metadata_resolution"),
                 patch.object(evaluate_shelfarr, "validate_shelfarr_database"),
                 patch.object(evaluate_shelfarr, "library_has_title", return_value=False),
             ):
@@ -506,6 +778,7 @@ class ShelfarrEvaluationTests(unittest.TestCase):
             output = root / "state" / "shelfarr-evaluation" / "results.json"
             with (
                 patch.object(evaluate_shelfarr, "ShelfarrClient", FinalRecoveryClient),
+                patch.object(evaluate_shelfarr, "observe_metadata_resolution"),
                 patch.object(evaluate_shelfarr, "validate_shelfarr_database"),
                 patch.object(evaluate_shelfarr, "library_has_title", return_value=False),
                 patch.object(evaluate_shelfarr, "shelfarr_artifact", return_value=artifact),

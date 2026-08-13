@@ -9,6 +9,7 @@ require "securerandom"
 
 result_sentinel = "WYSEARR_BOOTSTRAP_RESULT="
 input = JSON.parse(STDIN.read)
+usenet_enabled = input.fetch("usenet_enabled") == true
 puid = Integer(ENV.fetch("PUID", "1000"), 10)
 pgid = Integer(ENV.fetch("PGID", "1000"), 10)
 
@@ -25,7 +26,11 @@ settings = {
   indexer_search_scope: "broad",
   prowlarr_url: "http://prowlarr:9696",
   prowlarr_api_key: input.fetch("prowlarr_api_key"),
-  preferred_download_types: %w[direct usenet torrent],
+  # An empty search filter lets Shelfarr query both its isolated Newznab and
+  # the existing torrent fallback set. Prowlarr application tags, not this
+  # search filter, keep the book indexer out of the ARRs.
+  prowlarr_tags: "",
+  preferred_download_types: usenet_enabled ? %w[direct usenet torrent] : %w[direct torrent],
   download_local_path: "/downloads",
   download_remote_path: "",
   ebook_output_path: "/ebooks",
@@ -102,7 +107,8 @@ client_attributes = [
     api_key: nil,
     category: "shelfarr",
     download_path: "/downloads/shelfarr",
-    priority: 0
+    priority: 0,
+    enabled: true
   },
   {
     name: "WyseARR SABnzbd",
@@ -113,15 +119,18 @@ client_attributes = [
     api_key: input.fetch("sabnzbd_api_key"),
     category: "shelfarr",
     download_path: "/downloads/usenet",
-    priority: 0
+    priority: 0,
+    enabled: usenet_enabled
   }
 ].freeze
 
 clients = client_attributes.map do |attributes|
   client = DownloadClient.find_or_initialize_by(name: attributes.fetch(:name))
-  client.assign_attributes(attributes.merge(enabled: true))
+  client.assign_attributes(attributes)
   client.save!
-  raise "#{client.name} connection validation failed" unless client.test_connection
+  if client.enabled? && !client.test_connection
+    raise "#{client.name} connection validation failed"
+  end
 
   client
 end

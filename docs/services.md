@@ -16,6 +16,14 @@ Host: `wysearr` (`192.168.4.86`) on Debian 13. Docker Compose project: `wysearr`
 | Huey | no HTTP UI | Discord intake and request state | `state/huey` |
 | BookBot | no HTTP UI | Direct-media import and retention | `config/bookbot` |
 
+The Usenet layer is enabled only by `WYSEARR_USENET_ENABLED=true` with private
+NNTP and Newznab credentials in `.env`. Repository bootstrap code configures and
+connection-tests the managed SABnzbd server and Prowlarr Generic Newznab; no
+service configuration file needs a manual edit. The managed book indexer is
+isolated from every ARR application by the `shelfarr`/`wysearr-arr` tag
+boundary. With the flag false, the managed NNTP provider and Shelfarr's SABnzbd
+client are disabled, and Shelfarr omits Usenet from its acquisition order.
+
 Existing UI ports are intended only for the trusted home LAN. Shelfarr and
 SABnzbd are more restricted: their host ports bind only to `127.0.0.1`, and
 Shelfarr is not a family request UI. qBittorrent's peer port is TCP/UDP 6881.

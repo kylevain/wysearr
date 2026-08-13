@@ -14,6 +14,31 @@ env_value() {
     awk -F= -v wanted="$key" '$1 == wanted {sub(/^[^=]*=/, ""); print; exit}' .env
 }
 
+strict_env_value() {
+    local key="$1"
+    awk -v wanted="$key" '
+        /^[[:space:]]*#/ { next }
+        {
+            raw = $0
+            probe = $0
+            sub(/^[[:space:]]*/, "", probe)
+            sub(/^export[[:space:]]+/, "", probe)
+            equals = index(probe, "=")
+            if (equals == 0) next
+            left = substr(probe, 1, equals - 1)
+            gsub(/[[:space:]]/, "", left)
+            if (left != wanted) next
+            count += 1
+            if (index(raw, wanted "=") != 1) invalid = 1
+            value = substr(raw, length(wanted) + 2)
+        }
+        END {
+            if (count > 1 || invalid) print "__WYSEARR_INVALID__"
+            else if (count == 1) print value
+        }
+    ' .env
+}
+
 wait_for_health() {
     local timeout_seconds="$1"
     shift
@@ -91,12 +116,18 @@ docker compose config --quiet
 deployment_id="$(date -u +%Y%m%d-%H%M%S)-$$"
 
 feature_flag="$(env_value SHELFARR_ENABLED)"
+usenet_flag="$(strict_env_value WYSEARR_USENET_ENABLED)"
 core_services=(qbittorrent prowlarr sonarr radarr lidarr whisparr bazarr)
 evaluation_services=()
 case "$feature_flag" in
     true) evaluation_services=(sabnzbd shelfarr) ;;
     false|"") ;;
     *) fail "SHELFARR_ENABLED must be literal true or false" ;;
+esac
+case "$usenet_flag" in
+    true) [ "$feature_flag" = "true" ] || fail "WYSEARR_USENET_ENABLED requires SHELFARR_ENABLED=true" ;;
+    false|"") ;;
+    *) fail "WYSEARR_USENET_ENABLED must be literal true or false" ;;
 esac
 
 service_is_running() {
@@ -171,7 +202,9 @@ python3 scripts/bootstrap.py
 # qBittorrent clients so every service receives the newly persisted values.
 docker compose up -d --force-recreate --no-deps qbittorrent
 wait_for_health 180 qbittorrent
-docker compose up -d --force-recreate --no-deps sonarr radarr lidarr whisparr
+# Preserve Compose dependency metadata/config hashes. qBittorrent is already
+# healthy, so including dependencies here does not recreate it unnecessarily.
+docker compose up -d --force-recreate sonarr radarr lidarr whisparr
 wait_for_health 300 sonarr radarr lidarr whisparr
 
 if [ "${#evaluation_services[@]}" -gt 0 ]; then
@@ -194,6 +227,14 @@ if [ "${#evaluation_services[@]}" -gt 0 ]; then
     wait_for_health 300 shelfarr
     python3 scripts/bootstrap_shelfarr.py
 else
+    # Quarantine the exact managed NNTP server on disk before SAB can resume a
+    # persisted queue. The live pass verifies that the disabled state loads.
+    if [ -f config/sabnzbd/sabnzbd.ini ]; then
+        python3 scripts/bootstrap_shelfarr.py --prepare-sab-config
+        docker compose up -d --remove-orphans sabnzbd
+        wait_for_health 300 sabnzbd
+        python3 scripts/bootstrap_shelfarr.py --converge-usenet-only
+    fi
     docker compose stop shelfarr sabnzbd
 fi
 

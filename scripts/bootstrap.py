@@ -119,6 +119,15 @@ class IndexerSpec:
     base_url: str | None
 
 
+@dataclass(frozen=True)
+class ManagedNewznabConfig:
+    enabled: bool
+    name: str
+    base_url: str
+    api_key: str
+    api_path: str
+
+
 PUBLIC_INDEXERS = (
     # Music-focused public source with a browse feed that Lidarr can validate.
     IndexerSpec("MixtapeTorrent", "mixtapetorrent", None),
@@ -136,6 +145,12 @@ PUBLIC_INDEXERS = (
     ),
     IndexerSpec("The Pirate Bay", "thepiratebay", "https://thepiratebay.org/"),
 )
+
+USENET_FEATURE_FLAG = "WYSEARR_USENET_ENABLED"
+SHELFARR_PROWLARR_TAG = "shelfarr"
+ARR_PROWLARR_TAG = "wysearr-arr"
+DEFAULT_NEWZNAB_INDEXER_NAME = "WyseARR Books"
+GENERIC_NEWZNAB_SCHEMA_NAME = "Generic Newznab"
 
 BAZARR_PROVIDERS = ("embeddedsubtitles", "yifysubtitles", "subf2m")
 BAZARR_USER_AGENT = "Mozilla/5.0 (WyseARR Bazarr)"
@@ -428,7 +443,21 @@ def load_dotenv(path: Path) -> dict[str, str]:
     for line in lines:
         match = ENV_ASSIGNMENT_RE.match(line)
         if match:
-            values[match.group(1)] = _decode_env_value(match.group(2))
+            key = match.group(1)
+            if key == USENET_FEATURE_FLAG:
+                # Match deploy.sh's literal contract. Quoting, whitespace, or
+                # alternate assignment syntax must not silently enable NNTP.
+                values[key] = (
+                    "__WYSEARR_DUPLICATE__"
+                    if key in values
+                    else (
+                        line[len(f"{key}="):]
+                        if line.startswith(f"{key}=")
+                        else line
+                    )
+                )
+            else:
+                values[key] = _decode_env_value(match.group(2))
     return values
 
 
@@ -945,6 +974,79 @@ def _normalize_name(value: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value).casefold())
 
 
+def managed_newznab_config(
+    environment: Mapping[str, str],
+) -> ManagedNewznabConfig:
+    """Parse the explicit, fail-closed Usenet feature contract."""
+
+    raw_enabled = environment.get(USENET_FEATURE_FLAG, "")
+    if raw_enabled not in {"", "true", "false"}:
+        raise BootstrapError(
+            f"{USENET_FEATURE_FLAG} must be blank or literal true or false"
+        )
+
+    configured_name = environment.get("NEWZNAB_INDEXER_NAME", "")
+    if configured_name not in {"", DEFAULT_NEWZNAB_INDEXER_NAME}:
+        raise BootstrapError(
+            f"NEWZNAB_INDEXER_NAME must be exactly {DEFAULT_NEWZNAB_INDEXER_NAME}"
+        )
+    name = DEFAULT_NEWZNAB_INDEXER_NAME
+    if raw_enabled != "true":
+        return ManagedNewznabConfig(False, name, "", "", "")
+    if environment.get("SHELFARR_ENABLED", "") != "true":
+        raise BootstrapError(
+            "WYSEARR_USENET_ENABLED=true requires SHELFARR_ENABLED=true"
+        )
+
+    base_url = environment.get("NEWZNAB_BASE_URL", "").strip()
+    api_key = environment.get("NEWZNAB_API_KEY", "").strip()
+    api_path = environment.get("NEWZNAB_API_PATH", "").strip() or "/api"
+    for variable, value in (
+        ("NEWZNAB_BASE_URL", base_url),
+        ("NEWZNAB_API_KEY", api_key),
+    ):
+        if not value:
+            raise BootstrapError(f"Required private setting is missing: {variable}")
+
+    try:
+        parsed_url = urllib.parse.urlsplit(base_url)
+        parsed_hostname = parsed_url.hostname
+        parsed_url.port
+    except ValueError as exc:
+        raise BootstrapError(
+            "NEWZNAB_BASE_URL must be a valid HTTP(S) URL"
+        ) from exc
+    if (
+        parsed_url.scheme not in {"http", "https"}
+        or not parsed_url.netloc
+        or not parsed_hostname
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or parsed_url.query
+        or parsed_url.fragment
+        or "\\" in base_url
+        or any(character.isspace() for character in base_url)
+    ):
+        raise BootstrapError(
+            "NEWZNAB_BASE_URL must be an HTTP(S) URL without credentials or query data"
+        )
+    if (
+        not api_path.startswith("/")
+        or api_path.startswith("//")
+        or any(character in api_path for character in ("?", "#", "\\"))
+        or any(character.isspace() for character in api_path)
+    ):
+        raise BootstrapError("NEWZNAB_API_PATH must be an absolute URL path")
+
+    return ManagedNewznabConfig(
+        True,
+        name,
+        base_url.rstrip("/"),
+        api_key,
+        api_path,
+    )
+
+
 def flatten_indexer_schemas(schemas: Iterable[Any]) -> list[dict[str, Any]]:
     flattened: list[dict[str, Any]] = []
     for schema in schemas:
@@ -991,6 +1093,560 @@ def _indexer_managed_state(resource: Mapping[str, Any]) -> tuple[Any, ...]:
         resource.get("priority"),
         get_provider_field(resource, "baseUrl"),
     )
+
+
+def _prowlarr_tag_ids(resource: Mapping[str, Any]) -> set[int]:
+    raw_tags = resource.get("tags", [])
+    if not isinstance(raw_tags, list):
+        raise BootstrapError("Prowlarr returned invalid application tags")
+    result: set[int] = set()
+    for raw_tag in raw_tags:
+        value = raw_tag.get("id") if isinstance(raw_tag, dict) else raw_tag
+        if isinstance(value, bool):
+            raise BootstrapError("Prowlarr returned invalid application tags")
+        try:
+            tag_id = int(value)
+        except (TypeError, ValueError) as exc:
+            raise BootstrapError("Prowlarr returned invalid application tags") from exc
+        if tag_id <= 0:
+            raise BootstrapError("Prowlarr returned invalid application tags")
+        result.add(tag_id)
+    return result
+
+
+def _existing_prowlarr_tag(client: Any, label: str) -> int | None:
+    tags = client.get_json("/api/v1/tag")
+    if not isinstance(tags, list):
+        raise BootstrapError("Prowlarr returned invalid tag data")
+    matching = [
+        tag
+        for tag in tags
+        if isinstance(tag, dict)
+        and str(tag.get("label", "")).strip().casefold() == label.casefold()
+    ]
+    if len(matching) > 1:
+        raise BootstrapError(f"Prowlarr has duplicate {label} tags")
+    if not matching:
+        return None
+    tag_id = matching[0].get("id")
+    if isinstance(tag_id, bool) or not isinstance(tag_id, int) or tag_id <= 0:
+        raise BootstrapError(f"Prowlarr {label} tag has no numeric id")
+    return tag_id
+
+
+def ensure_prowlarr_tag(client: Any, label: str) -> int:
+    existing = _existing_prowlarr_tag(client, label)
+    if existing is not None:
+        return existing
+    created = client.post_json("/api/v1/tag", {"label": label}, retry=False)
+    if not isinstance(created, dict):
+        raise BootstrapError(f"Prowlarr did not create the {label} tag")
+    tag_id = created.get("id")
+    created_label = str(created.get("label", "")).strip()
+    if (
+        isinstance(tag_id, bool)
+        or not isinstance(tag_id, int)
+        or tag_id <= 0
+        or created_label.casefold() != label.casefold()
+    ):
+        raise BootstrapError(f"Prowlarr did not create the {label} tag")
+    return tag_id
+
+
+def _required_arr_applications(
+    applications: Any,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(applications, list):
+        raise BootstrapError("Prowlarr returned invalid applications")
+    found: dict[str, dict[str, Any]] = {}
+    for service in ARR_SERVICES:
+        key = service.name.casefold()
+        matches = [
+            application
+            for application in applications
+            if isinstance(application, dict)
+            and (
+                str(application.get("implementation", "")).casefold() == key
+                or str(application.get("name", "")).casefold() == key
+            )
+        ]
+        if len(matches) != 1:
+            raise BootstrapError(
+                f"Prowlarr does not have exactly one {service.name} application"
+            )
+        found[service.name] = matches[0]
+    return found
+
+
+def assert_arr_application_tag_boundary(
+    applications: Any,
+    *,
+    arr_tag_id: int,
+    shelfarr_tag_id: int,
+) -> dict[str, dict[str, Any]]:
+    required = _required_arr_applications(applications)
+    missing_arr = []
+    shelfarr_conflicts = []
+    for name, application in required.items():
+        tags = _prowlarr_tag_ids(application)
+        if arr_tag_id not in tags:
+            missing_arr.append(name)
+        if shelfarr_tag_id in tags:
+            shelfarr_conflicts.append(name)
+    if shelfarr_conflicts:
+        raise BootstrapError(
+            f"Prowlarr ARR applications must not carry the {SHELFARR_PROWLARR_TAG} tag: "
+            + ", ".join(sorted(shelfarr_conflicts))
+        )
+    if missing_arr:
+        raise BootstrapError(
+            f"Prowlarr ARR applications are missing the {ARR_PROWLARR_TAG} tag: "
+            + ", ".join(sorted(missing_arr))
+        )
+    return required
+
+
+def _put_and_verify_tags(
+    client: Any,
+    endpoint: str,
+    resource: Mapping[str, Any],
+    desired_tags: set[int],
+) -> dict[str, Any]:
+    resource_id = resource.get("id")
+    if isinstance(resource_id, bool) or not isinstance(resource_id, int):
+        raise BootstrapError(f"Prowlarr {endpoint.rsplit('/', 1)[-1]} has no numeric id")
+    desired = copy.deepcopy(dict(resource))
+    desired["tags"] = sorted(desired_tags)
+    saved = client.put_json(
+        f"{endpoint}/{resource_id}?forceSave=true",
+        desired,
+    )
+    saved_id = saved.get("id") if isinstance(saved, dict) else None
+    if saved_id != resource_id:
+        raise BootstrapError("Prowlarr did not persist its tag boundary")
+    persisted = client.get_json(f"{endpoint}/{resource_id}")
+    if not isinstance(persisted, dict) or _prowlarr_tag_ids(persisted) != desired_tags:
+        raise BootstrapError("Prowlarr did not persist its tag boundary")
+    return persisted
+
+
+def _disable_managed_newznab(client: Any, installed: Mapping[str, Any]) -> dict[str, Any]:
+    if not bool(installed.get("enable")):
+        return copy.deepcopy(dict(installed))
+    resource_id = installed.get("id")
+    if isinstance(resource_id, bool) or not isinstance(resource_id, int):
+        raise BootstrapError(
+            f"Prowlarr {installed.get('name', 'managed')} indexer has no numeric id"
+        )
+    disabled = copy.deepcopy(dict(installed))
+    disabled["enable"] = False
+    saved = client.put_json(
+        f"/api/v1/indexer/{resource_id}?forceSave=true", disabled
+    )
+    saved_id = saved.get("id") if isinstance(saved, dict) else None
+    persisted = client.get_json(f"/api/v1/indexer/{resource_id}")
+    if (
+        saved_id != resource_id
+        or not isinstance(persisted, dict)
+        or bool(persisted.get("enable"))
+    ):
+        raise BootstrapError("Prowlarr did not disable its managed Newznab indexer")
+    return persisted
+
+
+def _assert_no_orphan_shelfarr_indexers(
+    indexers: Sequence[Mapping[str, Any]],
+    *,
+    managed_name: str,
+    shelfarr_tag_id: int | None,
+) -> None:
+    """Refuse to reclassify a previously managed book indexer as ARR-owned."""
+
+    if shelfarr_tag_id is None:
+        return
+    orphans = sorted(
+        str(indexer.get("name") or "unnamed")
+        for indexer in indexers
+        if indexer.get("name") != managed_name
+        and shelfarr_tag_id in _prowlarr_tag_ids(indexer)
+    )
+    if orphans:
+        raise BootstrapError(
+            f"Prowlarr has unmanaged indexers carrying the {SHELFARR_PROWLARR_TAG} tag: "
+            + ", ".join(orphans)
+        )
+
+
+def converge_prowlarr_arr_isolation(
+    client: Any,
+    *,
+    managed_name: str,
+    shelfarr_tag_id: int,
+    arr_tag_id: int,
+    indexers: list[dict[str, Any]],
+    applications: Any,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Preserve the ARRs' prior all-indexer set while excluding Shelfarr's NZB."""
+
+    # Prowlarr intentionally treats an application with no tags as matching
+    # every valid indexer.  Tagging only the Newznab resource would therefore
+    # still distribute it to all four ARRs.  First tag every indexer in their
+    # existing shared set, then tag the applications, and only afterward let
+    # the separately tagged managed Newznab become enabled.
+    required = _required_arr_applications(applications)
+    shelfarr_conflicts = [
+        name
+        for name, application in required.items()
+        if shelfarr_tag_id in _prowlarr_tag_ids(application)
+    ]
+    if shelfarr_conflicts:
+        raise BootstrapError(
+            f"Prowlarr ARR applications must not carry the {SHELFARR_PROWLARR_TAG} tag: "
+            + ", ".join(sorted(shelfarr_conflicts))
+        )
+
+    converged_indexers: list[dict[str, Any]] = []
+    for indexer in indexers:
+        if indexer.get("name") == managed_name:
+            converged_indexers.append(indexer)
+            continue
+        desired_tags = _prowlarr_tag_ids(indexer) | {arr_tag_id}
+        if _prowlarr_tag_ids(indexer) != desired_tags:
+            indexer = _put_and_verify_tags(
+                client, "/api/v1/indexer", indexer, desired_tags
+            )
+        converged_indexers.append(indexer)
+
+    converged_applications: dict[str, dict[str, Any]] = {}
+    for name, application in required.items():
+        desired_tags = _prowlarr_tag_ids(application) | {arr_tag_id}
+        if _prowlarr_tag_ids(application) != desired_tags:
+            application = _put_and_verify_tags(
+                client, "/api/v1/applications", application, desired_tags
+            )
+        converged_applications[name] = application
+
+    assert_arr_application_tag_boundary(
+        list(converged_applications.values()),
+        arr_tag_id=arr_tag_id,
+        shelfarr_tag_id=shelfarr_tag_id,
+    )
+    return converged_indexers, converged_applications
+
+
+def _generic_newznab_resource(resource: Mapping[str, Any]) -> bool:
+    return bool(
+        str(resource.get("implementation", "")).casefold() == "newznab"
+        and str(resource.get("configContract", "")).casefold()
+        == "newznabsettings"
+        and str(resource.get("protocol", "")).casefold() == "usenet"
+    )
+
+
+def _newznab_managed_state(resource: Mapping[str, Any]) -> tuple[Any, ...]:
+    base_url = str(get_provider_field(resource, "baseUrl") or "").rstrip("/")
+    return (
+        resource.get("name"),
+        bool(resource.get("enable")),
+        resource.get("appProfileId"),
+        resource.get("priority"),
+        tuple(sorted(_prowlarr_tag_ids(resource))),
+        base_url,
+        get_provider_field(resource, "apiPath"),
+        bool(str(get_provider_field(resource, "apiKey") or "").strip()),
+    )
+
+
+def _indexer_category_ids(resource: Mapping[str, Any]) -> set[int]:
+    capabilities = resource.get("capabilities")
+    categories = capabilities.get("categories") if isinstance(capabilities, dict) else []
+    if not isinstance(categories, list):
+        return set()
+    result: set[int] = set()
+    pending = list(categories)
+    while pending:
+        category = pending.pop()
+        if not isinstance(category, dict):
+            continue
+        raw_id = category.get("id")
+        if not isinstance(raw_id, bool):
+            try:
+                result.add(int(raw_id))
+            except (TypeError, ValueError):
+                pass
+        children = category.get("subCategories", [])
+        if isinstance(children, list):
+            pending.extend(children)
+    return result
+
+
+def _newznab_supports_pilot_books(resource: Mapping[str, Any]) -> bool:
+    category_ids = _indexer_category_ids(resource)
+    return 3030 in category_ids and bool({7000, 7020} & category_ids)
+
+
+def _newznab_payload_needs_update(
+    current: Mapping[str, Any],
+    desired: Mapping[str, Any],
+    *,
+    current_test_ok: bool,
+) -> bool:
+    if not current_test_ok:
+        return True
+    if not _newznab_supports_pilot_books(current):
+        return True
+    if _newznab_managed_state(current) != _newznab_managed_state(desired):
+        return True
+    current_api_key = get_provider_field(current, "apiKey")
+    desired_api_key = get_provider_field(desired, "apiKey")
+    return bool(
+        current_api_key not in MASKED_SECRET_VALUES
+        and current_api_key != desired_api_key
+    )
+
+
+def configure_managed_newznab(
+    client: Any,
+    config: ManagedNewznabConfig,
+    *,
+    secret_values: Iterable[str] = (),
+) -> str:
+    """Converge one book-only Generic Newznab without syncing it to the ARRs."""
+
+    if config.name != DEFAULT_NEWZNAB_INDEXER_NAME:
+        raise BootstrapError(
+            f"NEWZNAB_INDEXER_NAME must be exactly {DEFAULT_NEWZNAB_INDEXER_NAME}"
+        )
+
+    existing_raw = client.get_json("/api/v1/indexer")
+    if not isinstance(existing_raw, list):
+        raise BootstrapError("Prowlarr returned invalid indexer data")
+    existing = [item for item in existing_raw if isinstance(item, dict)]
+    exact = [
+        item
+        for item in existing
+        if item.get("name") == config.name
+    ]
+    if len(exact) > 1:
+        raise BootstrapError(f"Prowlarr has duplicate indexers named {config.name}")
+    installed = exact[0] if exact else None
+    casefold_collisions = [
+        item
+        for item in existing
+        if str(item.get("name", "")).casefold() == config.name.casefold()
+        and item is not installed
+    ]
+    if casefold_collisions:
+        raise BootstrapError(f"Prowlarr has a conflicting indexer named {config.name}")
+    if installed is not None and not _generic_newznab_resource(installed):
+        raise BootstrapError(
+            f"Prowlarr indexer name {config.name} is not a Generic Newznab resource"
+        )
+
+    if not config.enabled:
+        action = "disabled" if installed is not None else "absent"
+        if installed is not None:
+            installed = _disable_managed_newznab(client, installed)
+            existing = [
+                installed if item.get("name") == config.name else item
+                for item in existing
+            ]
+
+        shelfarr_tag_id = _existing_prowlarr_tag(
+            client, SHELFARR_PROWLARR_TAG
+        )
+        arr_tag_id = _existing_prowlarr_tag(client, ARR_PROWLARR_TAG)
+        if shelfarr_tag_id is None and arr_tag_id is None:
+            return action
+        if (
+            shelfarr_tag_id is None
+            or arr_tag_id is None
+            or shelfarr_tag_id == arr_tag_id
+        ):
+            raise BootstrapError(
+                "Prowlarr has a partial or conflicting retained isolation topology"
+            )
+        _assert_no_orphan_shelfarr_indexers(
+            existing,
+            managed_name=config.name,
+            shelfarr_tag_id=shelfarr_tag_id,
+        )
+        applications = client.get_json("/api/v1/applications")
+        converge_prowlarr_arr_isolation(
+            client,
+            managed_name=config.name,
+            shelfarr_tag_id=shelfarr_tag_id,
+            arr_tag_id=arr_tag_id,
+            indexers=existing,
+            applications=applications,
+        )
+        return action
+
+    try:
+        existing_shelfarr_tag_id = _existing_prowlarr_tag(
+            client, SHELFARR_PROWLARR_TAG
+        )
+        existing_arr_tag_id = _existing_prowlarr_tag(client, ARR_PROWLARR_TAG)
+        _assert_no_orphan_shelfarr_indexers(
+            existing,
+            managed_name=config.name,
+            shelfarr_tag_id=existing_shelfarr_tag_id,
+        )
+        applications = client.get_json("/api/v1/applications")
+        required_applications = _required_arr_applications(applications)
+        application_tag_ids = set().union(
+            *(
+                _prowlarr_tag_ids(application)
+                for application in required_applications.values()
+            )
+        )
+        topology_ready = bool(
+            existing_shelfarr_tag_id is not None
+            and existing_arr_tag_id is not None
+            and existing_shelfarr_tag_id != existing_arr_tag_id
+            and all(
+                existing_arr_tag_id in _prowlarr_tag_ids(application)
+                and existing_shelfarr_tag_id
+                not in _prowlarr_tag_ids(application)
+                for application in required_applications.values()
+            )
+            and all(
+                indexer.get("name") == config.name
+                or existing_arr_tag_id in _prowlarr_tag_ids(indexer)
+                for indexer in existing
+            )
+            and (
+                installed is None
+                or (
+                    existing_shelfarr_tag_id in _prowlarr_tag_ids(installed)
+                    and not (
+                        _prowlarr_tag_ids(installed) & application_tag_ids
+                    )
+                )
+            )
+        )
+    except BootstrapError:
+        if installed is not None:
+            installed = _disable_managed_newznab(client, installed)
+        raise
+    if installed is not None and bool(installed.get("enable")) and not topology_ready:
+        installed = _disable_managed_newznab(client, installed)
+        existing = [
+            installed if item.get("name") == config.name else item
+            for item in existing
+        ]
+
+    shelfarr_tag_id = ensure_prowlarr_tag(client, SHELFARR_PROWLARR_TAG)
+    arr_tag_id = ensure_prowlarr_tag(client, ARR_PROWLARR_TAG)
+    if shelfarr_tag_id == arr_tag_id:
+        raise BootstrapError("Prowlarr returned conflicting isolation tag IDs")
+
+    existing, converged_applications = converge_prowlarr_arr_isolation(
+        client,
+        managed_name=config.name,
+        shelfarr_tag_id=shelfarr_tag_id,
+        arr_tag_id=arr_tag_id,
+        indexers=existing,
+        applications=applications,
+    )
+    installed = next(
+        (item for item in existing if item.get("name") == config.name), None
+    )
+
+    schemas_raw = client.get_json("/api/v1/indexer/schema")
+    profiles = client.get_json("/api/v1/appprofile")
+    if not isinstance(schemas_raw, list):
+        raise BootstrapError("Prowlarr returned invalid indexer schemas")
+    if not isinstance(profiles, list) or not profiles:
+        raise BootstrapError("Prowlarr has no application profile")
+    profile_id = profiles[0].get("id")
+    if isinstance(profile_id, bool) or not isinstance(profile_id, int):
+        raise BootstrapError("Prowlarr application profile has no numeric id")
+
+    generic_schemas = [
+        item
+        for item in flatten_indexer_schemas(schemas_raw)
+        if item.get("name") == GENERIC_NEWZNAB_SCHEMA_NAME
+        and _generic_newznab_resource(item)
+    ]
+    if len(generic_schemas) != 1:
+        raise BootstrapError("Prowlarr has no unique Generic Newznab schema")
+
+    source = installed or generic_schemas[0]
+    desired = build_indexer_payload(
+        source,
+        IndexerSpec(config.name, "Newznab", config.base_url),
+        profile_id,
+    )
+    managed_tags = (
+        _prowlarr_tag_ids(installed) if installed is not None else set()
+    )
+    arr_application_tags = set().union(
+        *(
+            _prowlarr_tag_ids(application)
+            for application in converged_applications.values()
+        )
+    )
+    managed_tags.difference_update(arr_application_tags)
+    managed_tags.add(shelfarr_tag_id)
+    desired["tags"] = sorted(managed_tags)
+    set_provider_field(desired, "apiPath", config.api_path)
+    set_provider_field(desired, "apiKey", config.api_key)
+
+    current_test_ok = False
+    if installed is not None:
+        try:
+            client.post_json("/api/v1/indexer/test", installed, retry=True)
+            current_test_ok = True
+        except (ApiError, ApiTransportError):
+            pass
+        if not _newznab_payload_needs_update(
+            installed, desired, current_test_ok=current_test_ok
+        ):
+            return "verified"
+
+    try:
+        client.post_json("/api/v1/indexer/test", desired, retry=True)
+    except (ApiError, ApiTransportError) as exc:
+        raise BootstrapError(
+            f"Prowlarr {config.name} test failed: "
+            f"{safe_api_error_detail(exc, secret_values)}"
+        ) from exc
+
+    if installed is None:
+        saved = client.post_json(
+            "/api/v1/indexer?forceSave=true", desired, retry=False
+        )
+        action = "created"
+    else:
+        resource_id = installed.get("id")
+        if isinstance(resource_id, bool) or not isinstance(resource_id, int):
+            raise BootstrapError(f"Prowlarr {config.name} indexer has no numeric id")
+        saved = client.put_json(
+            f"/api/v1/indexer/{resource_id}?forceSave=true", desired
+        )
+        action = "updated"
+    saved_id = saved.get("id") if isinstance(saved, dict) else None
+    if isinstance(saved_id, bool) or not isinstance(saved_id, int):
+        raise BootstrapError(f"Prowlarr did not persist {config.name}")
+    persisted = client.get_json(f"/api/v1/indexer/{saved_id}")
+    if not (
+        isinstance(persisted, dict)
+        and _generic_newznab_resource(persisted)
+        and _newznab_managed_state(persisted) == _newznab_managed_state(desired)
+        and _newznab_supports_pilot_books(persisted)
+    ):
+        raise BootstrapError(
+            f"Prowlarr {config.name} does not advertise ebook and audiobook categories"
+        )
+    try:
+        client.post_json("/api/v1/indexer/test", persisted, retry=True)
+    except (ApiError, ApiTransportError) as exc:
+        raise BootstrapError(
+            f"Prowlarr persisted {config.name} but its test failed: "
+            f"{safe_api_error_detail(exc, secret_values)}"
+        ) from exc
+    return action
 
 
 def _collect_error_strings(value: Any) -> list[str]:
@@ -1117,6 +1773,7 @@ def configure_prowlarr(
     secret_values: Iterable[str],
     client_factory: Callable[..., Any] = ApiClient,
 ) -> list[str]:
+    newznab = managed_newznab_config(environment)
     try:
         port = int(environment.get("PROWLARR_PORT", 9696))
     except ValueError as exc:
@@ -1133,6 +1790,11 @@ def configure_prowlarr(
         reporter=reporter,
         secret_values=secret_values,
         mutation_pause_seconds=15,
+    )
+    configure_managed_newznab(
+        client,
+        newznab,
+        secret_values=secret_values,
     )
     # Adding/updating an indexer initiates application synchronization.  A
     # second reachability pass makes sync failure a bootstrap failure instead
@@ -1435,7 +2097,11 @@ def bootstrap(
         f"ARR qBittorrent integrations verified ({arr_updates} repaired)."
     )
 
-    all_secrets = [qbit_password, *api_keys.values()]
+    all_secrets = [
+        qbit_password,
+        *api_keys.values(),
+        environment.get("NEWZNAB_API_KEY", ""),
+    ]
     indexers = configure_prowlarr(
         environment,
         api_keys["PROWLARR_API_KEY"],

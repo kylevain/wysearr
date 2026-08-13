@@ -148,8 +148,15 @@ failed import fail safe and preserves seeding after a successful import.
 Shelfarr uses a private local nested staging mount for Project Gutenberg ebook
 downloads before publishing to the CIFS DAS. Direct LibriVox audiobooks are
 disabled because Shelfarr requires atomic same-filesystem directory publication.
-Usenet preference is configured, but no NNTP provider or Usenet indexer was
-available for the initial evaluation.
+The enabled-Usenet source preference is direct, then Usenet, then torrent;
+when disabled it is direct, then torrent and Shelfarr's SAB client is off.
+Usenet is fail-closed behind `WYSEARR_USENET_ENABLED`: the repository manages one
+TLS-verified SABnzbd provider and one Generic Newznab indexer. Prowlarr uses
+separate `shelfarr` and `wysearr-arr` tags so the book-only Newznab cannot sync
+to Sonarr, Radarr, Lidarr, or Whisparr while existing torrent indexers remain
+available to those applications and to Shelfarr fallback. No NNTP provider or
+book Newznab credentials were available for the initial or 2026-08-12 Usenet
+preflight, so this branch remains disabled and unproven end to end.
 
 All containers use bind-mounted persistence, `restart: unless-stopped`, bounded
 JSON logs, and Docker healthchecks. Official images and Python build bases are

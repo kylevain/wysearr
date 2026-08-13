@@ -37,6 +37,11 @@ EVALUATION_SERVICES = ("sabnzbd", "shelfarr")
 DIRECT_CATEGORIES = ("ebooks", "audiobooks", "manga-comics", "roms", "sheet-music")
 ARR_CATEGORIES = ("tv", "movies", "music", "spicy")
 SHELFARR_DOWNLOAD_CATEGORY = "shelfarr"
+USENET_FEATURE_FLAG = "WYSEARR_USENET_ENABLED"
+MANAGED_SABNZBD_SERVER = "WyseARR Primary"
+MANAGED_NEWZNAB_INDEXER_DEFAULT = "WyseARR Books"
+MANAGED_PROWLARR_TAG = "shelfarr"
+ARR_PROWLARR_TAG = "wysearr-arr"
 BAZARR_PROVIDERS = {"embeddedsubtitles", "yifysubtitles", "subf2m"}
 REQUIRED_DISCORD_CHANNELS = {
     "requests": frozenset(
@@ -77,11 +82,27 @@ def load_env(path: Path) -> dict[str, str]:
     if not path.exists():
         return values
     for raw_line in path.read_text(encoding="utf-8").splitlines():
+        flag_assignment = re.match(
+            rf"^\s*(?:export\s+)?{re.escape(USENET_FEATURE_FLAG)}\s*=",
+            raw_line,
+        )
+        if flag_assignment:
+            values[USENET_FEATURE_FLAG] = (
+                "__WYSEARR_DUPLICATE__"
+                if USENET_FEATURE_FLAG in values
+                else (
+                    raw_line[len(f"{USENET_FEATURE_FLAG}="):]
+                    if raw_line.startswith(f"{USENET_FEATURE_FLAG}=")
+                    else raw_line
+                )
+            )
+            continue
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip()
+        key, _value = line.split("=", 1)
+        normalized_key = key.strip()
+        values[normalized_key] = _value.strip()
     return values
 
 
@@ -237,6 +258,20 @@ def _database_truthy(value: object) -> bool:
     return bool(value)
 
 
+def _strict_feature_flag(
+    environment: dict[str, str], key: str
+) -> tuple[bool, bool, str]:
+    """Return validity, enabled state, and a secret-free status detail."""
+
+    value = environment.get(key, "")
+    valid = value in {"", "false", "true"}
+    return (
+        valid,
+        value == "true",
+        f"literal {value or 'false'}" if valid else "must be literal true or false",
+    )
+
+
 def bazarr_native_discord_check(database: Path, config: Path) -> Check:
     """Ensure Bazarr cannot bypass Huey with a native Discord notification."""
 
@@ -297,6 +332,28 @@ def request_json(
         return json.load(response)
 
 
+def sabnzbd_post_json(
+    port: str,
+    api_key: str,
+    parameters: dict[str, object],
+    *,
+    timeout: int = 30,
+) -> object:
+    """Call a SAB configuration endpoint without putting credentials in a URL."""
+
+    body = urllib.parse.urlencode(
+        {"output": "json", "apikey": api_key, **parameters}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{int(port)}/api",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
 def qbit_opener(base_url: str, username: str, password: str) -> urllib.request.OpenerDirector:
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
@@ -319,6 +376,194 @@ def provider_fields(resource: dict[str, object]) -> dict[str, object]:
         for field in fields
         if isinstance(field, dict) and field.get("name")
     }
+
+
+def indexer_category_ids(resource: dict[str, object]) -> set[int]:
+    capabilities = resource.get("capabilities")
+    categories = capabilities.get("categories") if isinstance(capabilities, dict) else []
+    if not isinstance(categories, list):
+        return set()
+    result: set[int] = set()
+    pending = list(categories)
+    while pending:
+        category = pending.pop()
+        if not isinstance(category, dict):
+            continue
+        raw_id = category.get("id")
+        if not isinstance(raw_id, bool):
+            try:
+                result.add(int(raw_id))
+            except (TypeError, ValueError):
+                pass
+        children = category.get("subCategories", [])
+        if isinstance(children, list):
+            pending.extend(children)
+    return result
+
+
+def prowlarr_managed_newznab_check(
+    indexers: list[dict[str, object]],
+    tags: list[dict[str, object]],
+    applications: list[dict[str, object]],
+    live_indexer_ids: set[int],
+    environment: dict[str, str],
+    *,
+    enabled: bool,
+    flag_valid: bool = True,
+) -> Check:
+    """Require a live Shelfarr-only Generic Newznab when Usenet is enabled."""
+
+    configured_name = environment.get("NEWZNAB_INDEXER_NAME", "")
+    identity_valid = configured_name in {"", MANAGED_NEWZNAB_INDEXER_DEFAULT}
+    managed_name = MANAGED_NEWZNAB_INDEXER_DEFAULT
+    managed_matches = [
+        item
+        for item in indexers
+        if str(item.get("name") or "").casefold() == managed_name.casefold()
+    ]
+    managed_indexer = managed_matches[0] if len(managed_matches) == 1 else None
+    shelfarr_tags = [
+        item
+        for item in tags
+        if str(item.get("label") or "").casefold() == MANAGED_PROWLARR_TAG
+    ]
+    arr_tags = [
+        item
+        for item in tags
+        if str(item.get("label") or "").casefold() == ARR_PROWLARR_TAG
+    ]
+    shelfarr_tag_id = (
+        shelfarr_tags[0].get("id") if len(shelfarr_tags) == 1 else None
+    )
+    arr_tag_id = arr_tags[0].get("id") if len(arr_tags) == 1 else None
+    required_apps: dict[str, list[dict[str, object]]] = {}
+    for required_name in ("sonarr", "radarr", "lidarr", "whisparr"):
+        required_apps[required_name] = [
+            app
+            for app in applications
+            if str(app.get("name") or "").casefold() == required_name
+            or str(app.get("implementation") or "").casefold() == required_name
+        ]
+    if not enabled:
+        managed_disabled = len(managed_matches) <= 1 and (
+            managed_indexer is None or managed_indexer.get("enable") is False
+        )
+        topology_absent = not shelfarr_tags and not arr_tags
+        topology_retained = bool(
+            len(shelfarr_tags) == 1
+            and len(arr_tags) == 1
+            and isinstance(shelfarr_tag_id, int)
+            and isinstance(arr_tag_id, int)
+            and shelfarr_tag_id != arr_tag_id
+            and all(len(matches) == 1 for matches in required_apps.values())
+            and all(
+                arr_tag_id in set(matches[0].get("tags") or [])
+                and shelfarr_tag_id not in set(matches[0].get("tags") or [])
+                for matches in required_apps.values()
+                if len(matches) == 1
+            )
+            and all(
+                item is managed_indexer
+                or (
+                    arr_tag_id in set(item.get("tags") or [])
+                    and shelfarr_tag_id not in set(item.get("tags") or [])
+                )
+                for item in indexers
+            )
+        )
+        ok = identity_valid and managed_disabled and (
+            topology_absent or topology_retained
+        )
+        return Check(
+            "prowlarr:managed-newznab",
+            ok,
+            "disabled"
+            if ok
+            else "managed Newznab or retained tag isolation is unsafe while disabled",
+        )
+    expected_url = environment.get("NEWZNAB_BASE_URL", "").strip().rstrip("/")
+    expected_path = environment.get("NEWZNAB_API_PATH", "/api").strip()
+    fields = (
+        provider_fields(managed_indexer)
+        if isinstance(managed_indexer, dict)
+        else {}
+    )
+    book_categories = (
+        indexer_category_ids(managed_indexer)
+        if isinstance(managed_indexer, dict)
+        else set()
+    )
+    private_settings_ok = bool(
+        flag_valid
+        and identity_valid
+        and managed_name
+        and expected_url
+        and environment.get("NEWZNAB_API_KEY", "").strip()
+        and expected_path.startswith("/")
+    )
+    app_isolation_ok = bool(
+        isinstance(shelfarr_tag_id, int)
+        and isinstance(arr_tag_id, int)
+        and shelfarr_tag_id != arr_tag_id
+        and all(len(matches) == 1 for matches in required_apps.values())
+        and all(
+            arr_tag_id in set(matches[0].get("tags") or [])
+            and shelfarr_tag_id not in set(matches[0].get("tags") or [])
+            for matches in required_apps.values()
+            if len(matches) == 1
+        )
+    )
+    application_tag_ids = set().union(
+        *(
+            set(matches[0].get("tags") or [])
+            for matches in required_apps.values()
+            if len(matches) == 1
+        )
+    )
+    indexer_isolation_ok = bool(
+        isinstance(shelfarr_tag_id, int)
+        and isinstance(arr_tag_id, int)
+        and all(
+            (
+                shelfarr_tag_id in set(item.get("tags") or [])
+                and not (set(item.get("tags") or []) & application_tag_ids)
+            )
+            if item is managed_indexer
+            else (
+                arr_tag_id in set(item.get("tags") or [])
+                and shelfarr_tag_id not in set(item.get("tags") or [])
+            )
+            for item in indexers
+        )
+    )
+    ok = bool(
+        private_settings_ok
+        and isinstance(managed_indexer, dict)
+        and managed_indexer.get("enable") is True
+        and str(managed_indexer.get("implementation") or "").casefold()
+        == "newznab"
+        and str(managed_indexer.get("configContract") or "").casefold()
+        == "newznabsettings"
+        and str(managed_indexer.get("protocol") or "").casefold() == "usenet"
+        and managed_indexer.get("name") == MANAGED_NEWZNAB_INDEXER_DEFAULT
+        and str(managed_indexer.get("priority")) == "20"
+        and managed_indexer.get("id") in live_indexer_ids
+        and len(managed_matches) == 1
+        and app_isolation_ok
+        and indexer_isolation_ok
+        and str(fields.get("baseurl") or "").rstrip("/") == expected_url
+        and str(fields.get("apipath") or "") == expected_path
+        and bool(str(fields.get("apikey") or "").strip())
+        and 3030 in book_categories
+        and bool({7000, 7020} & book_categories)
+    )
+    return Check(
+        "prowlarr:managed-newznab",
+        ok,
+        "tag-isolated Generic Newznab configured and live"
+        if ok
+        else "managed indexer, private settings, tag isolation, or live test failed",
+    )
 
 
 def arr_download_client_accepted(
@@ -687,13 +932,21 @@ def shelfarr_configuration_checks(
         )
     )
 
+    flag_valid, usenet_enabled, _flag_detail = _strict_feature_flag(
+        environment, USENET_FEATURE_FLAG
+    )
     expected_clients = {
         "qbittorrent": ("http://qbittorrent:8080", "/downloads/shelfarr"),
         "sabnzbd": ("http://sabnzbd:8080", "/downloads/usenet"),
     }
     configured_clients: set[str] = set()
+    client_states: dict[str, list[bool]] = {}
     for row in clients:
         client_type = str(row["client_type"] or "")
+        if client_type in expected_clients:
+            client_states.setdefault(client_type, []).append(
+                _database_truthy(row["enabled"])
+            )
         if (
             _database_truthy(row["enabled"])
             and client_type in expected_clients
@@ -707,12 +960,20 @@ def shelfarr_configuration_checks(
             )
         ):
             configured_clients.add(client_type)
-    clients_ok = configured_clients == set(expected_clients)
+    expected_enabled = {"qbittorrent"} | ({"sabnzbd"} if usenet_enabled else set())
+    client_rows_ok = bool(
+        all(len(client_states.get(name, [])) == 1 for name in expected_clients)
+        and client_states.get("qbittorrent") == [True]
+        and client_states.get("sabnzbd") == [usenet_enabled]
+    )
+    clients_ok = bool(
+        flag_valid and client_rows_ok and configured_clients == expected_enabled
+    )
     checks.append(
         Check(
             "shelfarr:download-clients",
             clients_ok,
-            "qBittorrent and SABnzbd isolated"
+            "qBittorrent isolated; SABnzbd follows the Usenet feature flag"
             if clients_ok
             else "missing, disabled, or not using category shelfarr",
         )
@@ -724,14 +985,30 @@ def shelfarr_configuration_checks(
         )
     except json.JSONDecodeError:
         preferred_types = []
-    order_ok = preferred_types == ["direct", "usenet", "torrent"]
+    expected_order = (
+        ["direct", "usenet", "torrent"]
+        if usenet_enabled
+        else ["direct", "torrent"]
+    )
+    order_ok = flag_valid and preferred_types == expected_order
     checks.append(
         Check(
             "shelfarr:acquisition-order",
             order_ok,
-            "direct, usenet, torrent"
+            ", ".join(expected_order)
             if order_ok
-            else "expected direct, usenet, torrent",
+            else "acquisition order does not match the Usenet feature flag",
+        )
+    )
+
+    search_scope_ok = settings.get("prowlarr_tags") == ""
+    checks.append(
+        Check(
+            "shelfarr:indexer-scope",
+            search_scope_ok,
+            "all Prowlarr fallback protocols visible"
+            if search_scope_ok
+            else "Prowlarr tag filter would hide an acquisition source",
         )
     )
 
@@ -851,10 +1128,14 @@ def sabnzbd_configuration_checks(
     config_path: Path,
     port: str,
     expected_username: str = "",
+    environment: dict[str, str] | None = None,
     *,
     requester: object = request_json,
+    server_tester: object = sabnzbd_post_json,
 ) -> list[Check]:
-    """Validate isolated SAB paths/API; report provider availability separately."""
+    """Validate isolated SAB paths/API and the feature-gated NNTP provider."""
+
+    environment = dict(environment or {})
 
     try:
         misc = _ini_section_values(config_path, "misc")
@@ -913,12 +1194,22 @@ def sabnzbd_configuration_checks(
             if isinstance(raw_servers, dict)
             else raw_servers
         )
-        enabled_server = any(
-            isinstance(server, dict)
+        enabled_servers = [
+            server
+            for server in servers
+            if isinstance(server, dict)
             and _database_truthy(server.get("enable"))
             and bool(str(server.get("host") or "").strip())
+        ]
+        enabled_server = bool(enabled_servers)
+        managed_servers = [
+            server
             for server in servers
-        )
+            if isinstance(server, dict)
+            and str(server.get("name") or "").casefold()
+            == MANAGED_SABNZBD_SERVER.casefold()
+        ]
+        managed_server = managed_servers[0] if len(managed_servers) == 1 else None
         categories = (
             categories_payload.get("categories", [])
             if isinstance(categories_payload, dict)
@@ -939,6 +1230,8 @@ def sabnzbd_configuration_checks(
     except (TypeError, ValueError, OSError, urllib.error.URLError):
         api_ok = False
         enabled_server = False
+        managed_server = None
+        managed_servers = []
         detail = "API unavailable or Shelfarr category missing"
     checks.append(Check("sabnzbd:api-category", api_ok, detail))
     checks.append(
@@ -950,12 +1243,200 @@ def sabnzbd_configuration_checks(
             else "no enabled provider; Usenet acquisition unavailable",
         )
     )
+
+    flag_valid, usenet_enabled, flag_detail = _strict_feature_flag(
+        environment, USENET_FEATURE_FLAG
+    )
+    if not flag_valid:
+        checks.append(
+            Check(
+                "sabnzbd:usenet-provider",
+                False,
+                "provider validation blocked by invalid feature flag",
+            )
+        )
+        return checks
+
+    if not usenet_enabled:
+        provider_disabled = len(managed_servers) <= 1 and not (
+            isinstance(managed_server, dict)
+            and _database_truthy(managed_server.get("enable"))
+        )
+        checks.append(
+            Check(
+                "sabnzbd:usenet-provider",
+                provider_disabled,
+                "disabled"
+                if provider_disabled
+                else "managed NNTP provider is enabled while feature is disabled",
+            )
+        )
+        return checks
+
+    required = (
+        "USENET_SERVER_HOST",
+        "USENET_SERVER_USERNAME",
+        "USENET_SERVER_PASSWORD",
+        "USENET_SERVER_CONNECTIONS",
+    )
+    missing = [key for key in required if not environment.get(key, "").strip()]
+    ssl_value = environment.get("USENET_SERVER_SSL", "true").strip()
+    try:
+        provider_port = int(environment.get("USENET_SERVER_PORT", "563"))
+        connections = int(environment.get("USENET_SERVER_CONNECTIONS", ""))
+        retention = int(environment.get("USENET_SERVER_RETENTION", "0"))
+        numeric_ok = 1 <= provider_port <= 65535 and 1 <= connections <= 500 and retention >= 0
+    except (TypeError, ValueError):
+        provider_port = 0
+        connections = 0
+        retention = -1
+        numeric_ok = False
+    provider_env_ok = not missing and ssl_value == "true" and numeric_ok
+    ssl_enabled = True
+
+    live_ok = False
+    if provider_env_ok and isinstance(managed_server, dict):
+        try:
+            password_echo = str(managed_server.get("password") or "")
+            live_ok = bool(
+                _database_truthy(managed_server.get("enable"))
+                and str(managed_server.get("displayname") or "")
+                == MANAGED_SABNZBD_SERVER
+                and str(managed_server.get("host") or "").casefold()
+                == environment["USENET_SERVER_HOST"].strip().casefold()
+                and int(managed_server.get("port", 0)) == provider_port
+                and str(managed_server.get("username") or "")
+                == environment["USENET_SERVER_USERNAME"]
+                and int(managed_server.get("connections", 0)) == connections
+                and _database_truthy(managed_server.get("ssl")) == ssl_enabled
+                and int(managed_server.get("ssl_verify", -1)) == 3
+                and int(managed_server.get("retention", -1)) == retention
+                and int(managed_server.get("priority", -1)) == 0
+                and password_echo
+                and not password_echo.strip("*")
+            )
+        except (TypeError, ValueError):
+            live_ok = False
+
+    connection_ok = False
+    # Never send the private NNTP password through SAB's test endpoint while
+    # parameter logging is enabled or operator authentication is incomplete.
+    if auth_ok and provider_env_ok and live_ok and api_ok:
+        try:
+            tested = server_tester(
+                port,
+                api_key,
+                {
+                    "mode": "config",
+                    "name": "test_server",
+                    "server": MANAGED_SABNZBD_SERVER,
+                    "host": environment["USENET_SERVER_HOST"],
+                    "port": str(provider_port),
+                    "username": environment["USENET_SERVER_USERNAME"],
+                    "password": environment["USENET_SERVER_PASSWORD"],
+                    "connections": str(connections),
+                    "ssl": "1" if ssl_enabled else "0",
+                    "ssl_verify": "3",
+                },
+            )
+            test_value = tested.get("value") if isinstance(tested, dict) else None
+            connection_ok = bool(
+                isinstance(test_value, dict) and test_value.get("result") is True
+            )
+        except (TypeError, ValueError, OSError, urllib.error.URLError):
+            connection_ok = False
+
+    provider_ok = provider_env_ok and live_ok and connection_ok
+    checks.append(
+        Check(
+            "sabnzbd:usenet-provider",
+            provider_ok,
+            "managed TLS provider configured and connection-tested"
+            if provider_ok
+            else (
+                "required private provider settings are missing or invalid"
+                if not provider_env_ok
+                else "managed provider configuration or connection test failed"
+            ),
+        )
+    )
     return checks
+
+
+def sabnzbd_stopped_managed_provider_check(config_path: Path) -> Check:
+    """Verify the managed NNTP server is disabled while SAB itself is stopped."""
+
+    if not config_path.exists():
+        return Check("sabnzbd:usenet-provider", True, "absent")
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return Check("sabnzbd:usenet-provider", False, "configuration unavailable")
+
+    in_servers = False
+    current_name: str | None = None
+    current_values: dict[str, str] = {}
+    servers: list[tuple[str, dict[str, str]]] = []
+
+    def finish_current() -> None:
+        nonlocal current_name, current_values
+        if current_name is not None:
+            servers.append((current_name, current_values))
+        current_name = None
+        current_values = {}
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if line == "[servers]":
+            finish_current()
+            in_servers = True
+            continue
+        if in_servers and line.startswith("[[") and line.endswith("]]"):
+            finish_current()
+            current_name = line[2:-2].strip()
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            if in_servers:
+                finish_current()
+            in_servers = False
+            continue
+        if in_servers and current_name is not None and "=" in line:
+            key, raw_value = line.split("=", 1)
+            value = raw_value.strip()
+            if (
+                len(value) >= 2
+                and value[0] == value[-1]
+                and value[0] in {"'", '"'}
+            ):
+                value = value[1:-1]
+            current_values[key.strip().casefold()] = value
+    finish_current()
+
+    managed = [
+        values
+        for section_name, values in servers
+        if section_name.casefold() == MANAGED_SABNZBD_SERVER.casefold()
+        or str(values.get("name") or values.get("displayname") or "").casefold()
+        == MANAGED_SABNZBD_SERVER.casefold()
+    ]
+    if len(managed) > 1:
+        return Check(
+            "sabnzbd:usenet-provider", False, "duplicate managed providers"
+        )
+    if not managed:
+        return Check("sabnzbd:usenet-provider", True, "absent")
+    disabled = not _database_truthy(managed[0].get("enable", "1"))
+    return Check(
+        "sabnzbd:usenet-provider",
+        disabled,
+        "disabled" if disabled else "managed NNTP provider remains enabled",
+    )
 
 
 def shelfarr_runtime_checks(
     port: str,
     api_token: str,
+    usenet_enabled: bool = False,
     *,
     runner: object = subprocess.run,
     requester: object = request_json,
@@ -1010,7 +1491,7 @@ def shelfarr_runtime_checks(
             "[]",
         )
         items = json.loads(payload_line) if result.returncode == 0 else []
-        expected = {"qbittorrent", "sabnzbd"}
+        expected = {"qbittorrent"} | ({"sabnzbd"} if usenet_enabled else set())
         working = {
             str(item[0])
             for item in items
@@ -1019,14 +1500,14 @@ def shelfarr_runtime_checks(
             and item[1] == SHELFARR_DOWNLOAD_CATEGORY
             and item[2] is True
         }
-        clients_ok = expected <= working
+        clients_ok = expected == working
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         clients_ok = False
     checks.append(
         Check(
             "shelfarr:client-connectivity",
             clients_ok,
-            "qBittorrent and SABnzbd live tests passed"
+            "enabled download-client live tests passed"
             if clients_ok
             else "one or more client tests failed",
         )
@@ -1112,12 +1593,36 @@ def validate() -> list[Check]:
         )
     )
     shelfarr_enabled = feature_flag == "true"
+    usenet_flag_valid, usenet_enabled, usenet_flag_detail = _strict_feature_flag(
+        env, USENET_FEATURE_FLAG
+    )
+    checks.append(
+        Check("usenet:feature-flag", usenet_flag_valid, usenet_flag_detail)
+    )
+    checks.append(
+        Check(
+            "usenet:ownership-boundary",
+            not usenet_enabled or shelfarr_enabled,
+            "Shelfarr owns enabled book Usenet acquisition"
+            if usenet_enabled and shelfarr_enabled
+            else (
+                "disabled"
+                if not usenet_enabled
+                else "Usenet cannot be enabled while Shelfarr ownership is disabled"
+            ),
+        )
+    )
     services = CORE_SERVICES + (EVALUATION_SERVICES if shelfarr_enabled else ())
     for service in services:
         checks.append(container_check(service))
     if not shelfarr_enabled:
         for service in EVALUATION_SERVICES:
             checks.append(container_stopped_check(service))
+        checks.append(
+            sabnzbd_stopped_managed_provider_check(
+                STACK_ROOT / "config" / "sabnzbd" / "sabnzbd.ini"
+            )
+        )
     if shelfarr_enabled:
         checks.append(private_published_port_check("sabnzbd"))
         checks.append(private_published_port_check("shelfarr"))
@@ -1152,6 +1657,7 @@ def validate() -> list[Check]:
                 STACK_ROOT / "config" / "sabnzbd" / "sabnzbd.ini",
                 env.get("SABNZBD_ADMIN_PORT", "8085"),
                 env.get("SABNZBD_ADMIN_USERNAME", ""),
+                env,
             )
         )
         checks.append(
@@ -1163,6 +1669,7 @@ def validate() -> list[Check]:
             shelfarr_runtime_checks(
                 env.get("SHELFARR_ADMIN_PORT", "5056"),
                 env.get("SHELFARR_API_TOKEN", ""),
+                usenet_enabled,
             )
         )
 
@@ -1204,12 +1711,25 @@ def validate() -> list[Check]:
         status = request_json(f"{prowlarr_url}/api/v1/system/status", api_key=prowlarr_key)
         indexers = request_json(f"{prowlarr_url}/api/v1/indexer", api_key=prowlarr_key)
         applications = request_json(f"{prowlarr_url}/api/v1/applications", api_key=prowlarr_key)
+        tags = request_json(f"{prowlarr_url}/api/v1/tag", api_key=prowlarr_key)
         app_names = {item.get("name") for item in applications if item.get("enable", True)}
         required_apps = {"Sonarr", "Radarr", "Lidarr", "Whisparr"}
         checks.append(Check("prowlarr:api", bool(status.get("version")), f"version={status.get('version')}"))
         enabled_indexers = sum(bool(item.get("enable")) for item in indexers)
+        managed_newznab_name = MANAGED_NEWZNAB_INDEXER_DEFAULT.casefold()
+        managed_newznab_id = next(
+            (
+                item.get("id")
+                for item in indexers
+                if str(item.get("name") or "").casefold()
+                == managed_newznab_name
+                and isinstance(item.get("id"), int)
+            ),
+            None,
+        )
         live_indexer = False
         live_protocols: set[str] = set()
+        live_indexer_ids: set[int] = set()
         for indexer in indexers:
             if not indexer.get("enable"):
                 continue
@@ -1224,7 +1744,18 @@ def validate() -> list[Check]:
                 protocol = str(indexer.get("protocol", "")).strip().casefold()
                 if protocol in {"torrent", "usenet"}:
                     live_protocols.add(protocol)
-                if {"torrent", "usenet"} <= live_protocols:
+                if isinstance(indexer.get("id"), int):
+                    live_indexer_ids.add(indexer["id"])
+                if (
+                    "torrent" in live_protocols
+                    and (
+                        not usenet_enabled
+                        or (
+                            "usenet" in live_protocols
+                            and managed_newznab_id in live_indexer_ids
+                        )
+                    )
+                ):
                     break
             except Exception:
                 continue
@@ -1233,7 +1764,7 @@ def validate() -> list[Check]:
             enabled_indexers > 0 and live_indexer,
             f"enabled={enabled_indexers} live_test={live_indexer}",
         ))
-        required_book_protocols = {"torrent"}
+        required_book_protocols = {"torrent"} | ({"usenet"} if usenet_enabled else set())
         checks.append(
             Check(
                 "prowlarr:book-protocols",
@@ -1242,6 +1773,17 @@ def validate() -> list[Check]:
                 + ("Usenet indexer available" if "usenet" in live_protocols else "Usenet indexer unavailable")
                 if required_book_protocols <= live_protocols
                 else "missing a live torrent indexer",
+            )
+        )
+        checks.append(
+            prowlarr_managed_newznab_check(
+                indexers,
+                tags,
+                applications,
+                live_indexer_ids,
+                env,
+                enabled=usenet_enabled,
+                flag_valid=usenet_flag_valid,
             )
         )
         checks.append(Check("prowlarr:applications", required_apps <= app_names, f"configured={len(app_names)}"))

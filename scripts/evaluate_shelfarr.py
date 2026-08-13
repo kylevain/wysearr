@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from bootstrap import BootstrapError, load_dotenv
-from huey.clients import ServiceError, ShelfarrClient
-from huey.matching import normalize_text
+from huey.clients import ProwlarrClient, ServiceError, ShelfarrClient
+from huey.matching import normalize_text, select_shelfarr_candidate
 
 
 STACK_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +33,19 @@ EBOOK_EXTENSIONS = frozenset({".azw", ".azw3", ".cbz", ".epub", ".mobi", ".pdf"}
 AUDIOBOOK_EXTENSIONS = frozenset(
     {".aac", ".flac", ".m4a", ".m4b", ".mp3", ".ogg", ".opus"}
 )
+DIRECT_SOURCES = frozenset(
+    {"anna_archive", "gutenberg", "librivox", "zlibrary"}
+)
+USENET_SOURCES = frozenset({"newznab", "nzb", "usenet"})
+TORRENT_SOURCES = frozenset({"jackett", "torrent"})
+CANDIDATE_SOURCE_KINDS = ("direct", "usenet", "torrent", "unknown")
+DOWNLOAD_STATUS_NAMES = {
+    0: "queued",
+    1: "downloading",
+    2: "paused",
+    3: "completed",
+    4: "failed",
+}
 
 
 @dataclass
@@ -53,6 +66,12 @@ class EvaluationRecord:
     library_catalog_visible: str = "unverified"
     notes: str = ""
     correlation_id: int | None = None
+    metadata_resolution: str = "not_observed"
+    metadata_candidate_count: int | None = None
+    acquisition_candidate_counts: dict[str, int] | None = None
+    selected_source: str | None = None
+    acquisition_result: str = "not_observed"
+    import_result: str = "not_observed"
 
 
 def _open_readonly(path: Path) -> sqlite3.Connection:
@@ -156,6 +175,197 @@ def _api_search_results(client: ShelfarrClient, request_id: str) -> list[dict[st
     return [dict(item) for item in value["search_results"] if isinstance(item, dict)]
 
 
+def observe_metadata_resolution(
+    client: ShelfarrClient,
+    record: EvaluationRecord,
+    media_type: str,
+) -> None:
+    """Record the normal Huey matcher decision without creating a request."""
+
+    candidates = client.search(record.title, record.author)
+    selection = select_shelfarr_candidate(
+        record.title,
+        record.author,
+        media_type,
+        candidates,
+        minimum_confidence=client.minimum_confidence,
+        runner_up_gap=client.runner_up_gap,
+    )
+    record.metadata_candidate_count = len(selection.ranked)
+    record.metadata_resolution = (
+        "resolved" if selection.reason == "selected" else selection.reason
+    )
+
+
+def read_prowlarr_indexer_protocols(
+    environment: dict[str, str],
+) -> dict[str, str]:
+    """Return a sanitized indexer-name -> protocol map using one read-only GET.
+
+    Candidate visibility must never become a prerequisite for acquisition.  If
+    Prowlarr is unavailable or returns an unfamiliar shape, callers classify
+    its candidates as ``unknown`` rather than guessing from an indexer name.
+    """
+
+    api_key = environment.get("PROWLARR_API_KEY", "").strip()
+    if not api_key:
+        return {}
+    base_url = environment.get("PROWLARR_URL", "").strip()
+    if not base_url:
+        bind_address = environment.get(
+            "WYSEARR_BIND_ADDRESS", "192.168.4.86"
+        ).strip()
+        port = environment.get("PROWLARR_PORT", "9696").strip()
+        base_url = f"http://{bind_address}:{port}"
+    try:
+        client = ProwlarrClient(base_url, api_key, timeout=10)
+        value = client._request("GET", "/api/v1/indexer")
+    except (ServiceError, ValueError):
+        return {}
+    if not isinstance(value, list):
+        return {}
+    protocols: dict[str, str] = {}
+    conflicting_names: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = normalize_text(item.get("name"))
+        protocol = str(item.get("protocol") or "").strip().casefold()
+        if not name or protocol not in {"torrent", "usenet"}:
+            continue
+        if name in conflicting_names:
+            continue
+        previous = protocols.get(name)
+        if previous is not None and previous != protocol:
+            protocols.pop(name, None)
+            conflicting_names.add(name)
+            continue
+        protocols[name] = protocol
+    return protocols
+
+
+def _source_key(value: Any) -> str:
+    return (
+        str(value or "")
+        .strip()
+        .casefold()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+
+def candidate_source_kind(
+    candidate: dict[str, Any], indexer_protocols: dict[str, str] | None = None
+) -> str:
+    """Classify one Shelfarr result without inferring protocol from its name."""
+
+    source = _source_key(candidate.get("source"))
+    if source in DIRECT_SOURCES:
+        return "direct"
+    if source in USENET_SOURCES:
+        return "usenet"
+    if source in TORRENT_SOURCES:
+        return "torrent"
+    if source == "prowlarr":
+        protocol = (indexer_protocols or {}).get(
+            normalize_text(candidate.get("indexer"))
+        )
+        if protocol in {"torrent", "usenet"}:
+            return protocol
+    return "unknown"
+
+
+def observe_acquisition_candidates(
+    record: EvaluationRecord,
+    results: Sequence[dict[str, Any]],
+    indexer_protocols: dict[str, str] | None = None,
+) -> None:
+    """Record source counts and the source of Shelfarr's selected release."""
+
+    counts = {kind: 0 for kind in CANDIDATE_SOURCE_KINDS}
+    selected: dict[str, Any] | None = None
+    for candidate in results:
+        kind = candidate_source_kind(candidate, indexer_protocols)
+        counts[kind] += 1
+        if (
+            selected is None
+            and str(candidate.get("status") or "").casefold() == "selected"
+        ):
+            selected = candidate
+    record.acquisition_candidate_counts = counts
+    if selected is not None:
+        record.selected_source = candidate_source_kind(
+            selected, indexer_protocols
+        )
+
+
+def update_measurement_outcomes(record: EvaluationRecord) -> None:
+    """Derive acquisition and import phase outcomes from recorded evidence."""
+
+    result = record.download_result.casefold()
+    status = record.shelfarr_status.casefold()
+    candidate_count = sum((record.acquisition_candidate_counts or {}).values())
+
+    if result == "success":
+        record.acquisition_result = "success"
+        record.import_result = "success"
+    elif result == "import_path_missing":
+        record.acquisition_result = "success"
+        record.import_result = "artifact_missing"
+    elif result == "skipped_existing":
+        record.acquisition_result = "not_started"
+        record.import_result = "preexisting"
+    elif result == "metadata_unresolved":
+        record.acquisition_result = "not_started"
+        record.import_result = "not_started"
+    elif result in {"submission_uncertain", "cleanup_failed"}:
+        record.acquisition_result = "uncertain"
+        record.import_result = "uncertain"
+    elif result in {"timed_out", "submission_failed"}:
+        record.acquisition_result = result
+        record.import_result = "not_started"
+    elif result == "not_found":
+        record.acquisition_result = "no_candidate"
+        record.import_result = "not_started"
+    elif result == "failure" or status == "failed":
+        if record.acquisition_result == "success":
+            record.import_result = "failure"
+            return
+        if record.selected_source or record.selected_release:
+            record.acquisition_result = "failure"
+        elif record.acquisition_candidate_counts is None:
+            # A legacy row (or a monitoring observation failure) has no phase
+            # evidence. Preserve unknown rather than recasting it as no-result.
+            return
+        elif candidate_count:
+            record.acquisition_result = "candidate_unselected"
+        else:
+            record.acquisition_result = "no_candidate"
+        record.import_result = "not_started"
+    elif status == "completed" or result == "processing":
+        record.acquisition_result = "success"
+        record.import_result = "in_progress"
+    elif result in ACTIVE_RESULTS:
+        record.acquisition_result = "in_progress"
+        record.import_result = "not_started"
+    elif result == "not_started":
+        record.acquisition_result = "not_started"
+        record.import_result = "not_started"
+
+
+def download_status_name(value: Any) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        numeric = None
+    if numeric is not None and str(value).strip().isdigit():
+        return DOWNLOAD_STATUS_NAMES.get(numeric)
+    normalized = str(value).strip().casefold()
+    return normalized if normalized in set(DOWNLOAD_STATUS_NAMES.values()) else None
+
+
 def shelfarr_artifact(database: Path, request_id: str) -> dict[str, Any]:
     with closing(_open_readonly(database)) as connection:
         row = connection.execute(
@@ -185,7 +395,11 @@ def shelfarr_artifact(database: Path, request_id: str) -> dict[str, Any]:
     return dict(row) if row is not None else {}
 
 
-def acquisition_source(artifact: dict[str, Any], results: list[dict[str, Any]]) -> str | None:
+def acquisition_source(
+    artifact: dict[str, Any],
+    results: Sequence[dict[str, Any]] | None,
+    indexer_protocols: dict[str, str] | None = None,
+) -> str | None:
     client_type = str(artifact.get("client_type") or "").casefold()
     source = str(artifact.get("source") or "").casefold()
     download_type = str(artifact.get("download_type") or "").casefold()
@@ -193,38 +407,60 @@ def acquisition_source(artifact: dict[str, Any], results: list[dict[str, Any]]) 
         return "usenet"
     if client_type in {"qbittorrent", "decypharr", "deluge", "transmission"}:
         return "torrent"
-    if download_type == "direct" or source in {
-        "anna_archive", "zlibrary", "gutenberg", "librivox"
-    }:
+    if download_type == "direct" or source in DIRECT_SOURCES:
         return "direct"
     selected = next(
-        (item for item in results if str(item.get("status")) == "selected"),
+        (
+            item
+            for item in (results or ())
+            if str(item.get("status") or "").casefold() == "selected"
+        ),
         None,
     )
-    if selected and selected.get("source") in {
-        "gutenberg", "librivox", "anna_archive", "zlibrary"
-    }:
-        return "direct"
+    if selected:
+        selected_kind = candidate_source_kind(selected, indexer_protocols)
+        if selected_kind != "unknown":
+            return selected_kind
+    artifact_kind = candidate_source_kind(artifact, indexer_protocols)
+    if artifact_kind != "unknown":
+        return artifact_kind
     return source or None
 
 
 def apply_artifact_observation(
     record: EvaluationRecord,
     artifact: dict[str, Any],
-    results: list[dict[str, Any]],
+    results: Sequence[dict[str, Any]] | None,
     media_root: Path,
+    indexer_protocols: dict[str, str] | None = None,
 ) -> None:
     """Apply source/release/path evidence without trusting remote status alone."""
 
+    if results is not None:
+        observe_acquisition_candidates(record, results, indexer_protocols)
     record.found = bool(results) or bool(artifact.get("download_type"))
-    record.acquisition_source = acquisition_source(artifact, results)
+    record.acquisition_source = acquisition_source(
+        artifact, results, indexer_protocols
+    )
+    if record.acquisition_source in {"direct", "usenet", "torrent"}:
+        record.selected_source = record.acquisition_source
+    observed_download_status = download_status_name(artifact.get("download_status"))
+    if observed_download_status == "completed":
+        record.acquisition_result = "success"
+        record.import_result = "in_progress"
+    elif observed_download_status == "failed":
+        record.acquisition_result = "failure"
+        record.import_result = "not_started"
+    elif observed_download_status in {"queued", "downloading", "paused"}:
+        record.acquisition_result = "in_progress"
+        record.import_result = "not_started"
     record.selected_release = (
         str(artifact["release_title"])
         if artifact.get("release_title")
         else next(
             (
                 str(item.get("title"))
-                for item in results
+                for item in (results or ())
                 if str(item.get("status")) == "selected" and item.get("title")
             ),
             None,
@@ -254,7 +490,7 @@ def verify_recovered_completions(
             artifact = shelfarr_artifact(
                 shelfarr_database, record.shelfarr_request_id
             )
-            apply_artifact_observation(record, artifact, [], media_root)
+            apply_artifact_observation(record, artifact, None, media_root)
         except (OSError, sqlite3.Error, TypeError, ValueError):
             record.download_result = "cleanup_failed"
             record.notes = (
@@ -507,6 +743,8 @@ def recover_uncertain_evaluation_requests(
 def write_results(path: Path, records: Sequence[EvaluationRecord]) -> None:
     if path.parent.is_symlink() or not path.parent.is_dir():
         raise BootstrapError("Shelfarr evaluation output directory is unsafe")
+    for record in records:
+        update_measurement_outcomes(record)
     payload = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "records": [asdict(record) for record in records],
@@ -648,6 +886,7 @@ def _evaluate_locked(
         ),
         language=environment.get("SHELFARR_LANGUAGE", "en"),
     )
+    indexer_protocols = read_prowlarr_indexer_protocols(environment)
     historical = historical_requests(root / "state" / "huey" / "huey.db", request_ids)
     media_root = Path(environment.get("MEDIA_ROOT", "/mnt/media"))
     shelfarr_database = root / "config" / "shelfarr" / "production.sqlite3"
@@ -684,6 +923,11 @@ def _evaluate_locked(
                 records.append(record)
                 continue
             try:
+                observe_metadata_resolution(client, record, media_type)
+            except ServiceError:
+                record.metadata_resolution = "observation_failed"
+                record.metadata_candidate_count = None
+            try:
                 record.correlation_id = evaluation_correlation_id(
                     record.huey_request_id, attempt
                 )
@@ -711,6 +955,8 @@ def _evaluate_locked(
                 record.found = False
                 record.download_result = "metadata_unresolved"
                 record.notes = str(response["message"])
+                if record.metadata_resolution == "observation_failed":
+                    record.metadata_resolution = "unresolved"
             elif response["status"] in {"complete", "completed"}:
                 record.found = True
                 record.download_result = "processing"
@@ -740,7 +986,13 @@ def _evaluate_locked(
                     continue
 
                 record.shelfarr_status = status
-                apply_artifact_observation(record, artifact, results, media_root)
+                apply_artifact_observation(
+                    record,
+                    artifact,
+                    results,
+                    media_root,
+                    indexer_protocols,
+                )
                 if status == "completed":
                     record.download_result = (
                         "success"

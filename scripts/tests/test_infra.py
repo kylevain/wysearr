@@ -348,6 +348,58 @@ class DeploymentCheckpointTests(unittest.TestCase):
         self.assertLess(restart_evaluation, restart_huey)
         self.assertLess(restart_huey, second_validation)
 
+        evaluation_if = deploy.index(
+            'if [ "${#evaluation_services[@]}" -gt 0 ]; then'
+        )
+        disabled_else = deploy.index("\nelse\n", evaluation_if)
+        disabled_end = deploy.index("\nfi\n", disabled_else)
+        disabled_branch = deploy[disabled_else:disabled_end]
+        offline_prepare = disabled_branch.index(
+            "python3 scripts/bootstrap_shelfarr.py --prepare-sab-config"
+        )
+        first_disabled_sab_start = disabled_branch.index(
+            "docker compose up -d --remove-orphans sabnzbd"
+        )
+        self.assertIn(
+            "python3 scripts/bootstrap_shelfarr.py --converge-usenet-only",
+            disabled_branch,
+        )
+        self.assertLess(
+            offline_prepare,
+            first_disabled_sab_start,
+        )
+        self.assertLess(
+            first_disabled_sab_start,
+            disabled_branch.index(
+                "python3 scripts/bootstrap_shelfarr.py --converge-usenet-only"
+            ),
+        )
+        self.assertLess(
+            disabled_branch.index(
+                "python3 scripts/bootstrap_shelfarr.py --converge-usenet-only"
+            ),
+            disabled_branch.index("docker compose stop shelfarr sabnzbd"),
+        )
+
+    def test_deploy_rejects_usenet_without_shelfarr_before_runtime_mutation(self):
+        deploy = (SCRIPTS.parent / "deploy.sh").read_text(encoding="utf-8")
+        ownership_gate = deploy.index(
+            'WYSEARR_USENET_ENABLED requires SHELFARR_ENABLED=true'
+        )
+        first_stop = deploy.index("docker compose stop huey shelfarr sabnzbd")
+        self.assertLess(ownership_gate, first_stop)
+
+    def test_arr_recreate_preserves_compose_dependency_metadata(self):
+        deploy = (SCRIPTS.parent / "deploy.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            "docker compose up -d --force-recreate sonarr radarr lidarr whisparr",
+            deploy,
+        )
+        self.assertNotIn(
+            "--force-recreate --no-deps sonarr radarr lidarr whisparr",
+            deploy,
+        )
+
     def test_deploy_failure_trap_tracks_all_evaluation_and_intake_services(self):
         deploy = (SCRIPTS.parent / "deploy.sh").read_text(encoding="utf-8")
         self.assertIn("trap restore_previous_runtime EXIT", deploy)
@@ -369,6 +421,17 @@ class DeploymentCheckpointTests(unittest.TestCase):
 
 
 class ShelfarrDeploymentTests(unittest.TestCase):
+    def test_shelfarr_sab_client_follows_usenet_feature_flag(self):
+        convergence = (SCRIPTS / "shelfarr_bootstrap.rb").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('input.fetch("usenet_enabled") == true', convergence)
+        self.assertIn(
+            "usenet_enabled ? %w[direct usenet torrent] : %w[direct torrent]",
+            convergence,
+        )
+        self.assertIn("enabled: usenet_enabled", convergence)
+
     def test_evaluation_services_are_immutable_private_and_persistent(self):
         compose = (SCRIPTS.parent / "docker-compose.yml").read_text(
             encoding="utf-8"
@@ -479,6 +542,45 @@ class ValidationTests(unittest.TestCase):
             path = Path(directory) / ".env"
             path.write_text("# ignored\nONE=1\nTOKEN=abc=def\n\n", encoding="utf-8")
             self.assertEqual(validate.load_env(path), {"ONE": "1", "TOKEN": "abc=def"})
+
+    def test_usenet_feature_flag_is_literal_and_blank_means_disabled(self):
+        for value, expected_enabled in (("", False), ("false", False), ("true", True)):
+            with self.subTest(value=value):
+                valid, enabled, _detail = validate._strict_feature_flag(
+                    {"WYSEARR_USENET_ENABLED": value},
+                    "WYSEARR_USENET_ENABLED",
+                )
+                self.assertTrue(valid)
+                self.assertIs(enabled, expected_enabled)
+        for value in (" true ", "TRUE", "1", "yes"):
+            with self.subTest(value=value):
+                valid, _enabled, _detail = validate._strict_feature_flag(
+                    {"WYSEARR_USENET_ENABLED": value},
+                    "WYSEARR_USENET_ENABLED",
+                )
+                self.assertFalse(valid)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("WYSEARR_USENET_ENABLED= true \n", encoding="utf-8")
+            loaded = validate.load_env(path)
+            self.assertEqual(loaded["WYSEARR_USENET_ENABLED"], " true ")
+            self.assertFalse(
+                validate._strict_feature_flag(
+                    loaded, "WYSEARR_USENET_ENABLED"
+                )[0]
+            )
+            path.write_text(
+                "WYSEARR_USENET_ENABLED=true\n"
+                "WYSEARR_USENET_ENABLED=true\n",
+                encoding="utf-8",
+            )
+            duplicate = validate.load_env(path)
+            self.assertFalse(
+                validate._strict_feature_flag(
+                    duplicate, "WYSEARR_USENET_ENABLED"
+                )[0]
+            )
 
     def test_writable_check_uses_and_removes_probe(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -603,6 +705,7 @@ class ValidationTests(unittest.TestCase):
                         ("prowlarr_url", "http://prowlarr:9696"),
                         ("prowlarr_api_key", "configured"),
                         ("preferred_download_types", '["direct","usenet","torrent"]'),
+                        ("prowlarr_tags", ""),
                         ("ebook_output_path", "/ebooks"),
                         ("audiobook_output_path", "/audiobooks"),
                         ("download_local_path", "/downloads"),
@@ -671,9 +774,34 @@ class ValidationTests(unittest.TestCase):
                 )
 
             checks = validate.shelfarr_configuration_checks(
-                storage, {"SHELFARR_API_TOKEN": token}
+                storage,
+                {
+                    "SHELFARR_API_TOKEN": token,
+                    "WYSEARR_USENET_ENABLED": "true",
+                },
             )
             self.assertTrue(all(check.ok for check in checks))
+
+            with closing(
+                sqlite3.connect(storage / "production.sqlite3")
+            ) as connection, connection:
+                connection.execute(
+                    "UPDATE settings SET value = ? "
+                    "WHERE key = 'preferred_download_types'",
+                    ('["direct","torrent"]',),
+                )
+                connection.execute(
+                    "UPDATE download_clients SET enabled = 0 "
+                    "WHERE client_type = 'sabnzbd'"
+                )
+            disabled_checks = validate.shelfarr_configuration_checks(
+                storage,
+                {
+                    "SHELFARR_API_TOKEN": token,
+                    "WYSEARR_USENET_ENABLED": "false",
+                },
+            )
+            self.assertTrue(all(check.ok for check in disabled_checks))
 
             with closing(
                 sqlite3.connect(storage / "production.sqlite3")
@@ -685,7 +813,11 @@ class ValidationTests(unittest.TestCase):
             checks = {
                 check.name: check
                 for check in validate.shelfarr_configuration_checks(
-                    storage, {"SHELFARR_API_TOKEN": token}
+                    storage,
+                    {
+                        "SHELFARR_API_TOKEN": token,
+                        "WYSEARR_USENET_ENABLED": "false",
+                    },
                 )
             }
             self.assertFalse(checks["shelfarr:download-clients"].ok)
@@ -718,11 +850,7 @@ class ValidationTests(unittest.TestCase):
                     return {"version": "5.0.4"}
                 if "mode=get_cats" in url:
                     return {"categories": ["*", "shelfarr"]}
-                return {
-                    "config": {
-                        "servers": [{"host": "news.example", "enable": 1}]
-                    }
-                }
+                return {"config": {"servers": []}}
 
             checks = validate.sabnzbd_configuration_checks(
                 config, "8085", "operator", requester=requester
@@ -778,6 +906,422 @@ class ValidationTests(unittest.TestCase):
             self.assertTrue(provider.ok)
             self.assertIn("unavailable", provider.detail)
 
+    def test_sabnzbd_usenet_provider_requires_exact_live_tls_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "sabnzbd.ini"
+            config.write_text(
+                "[misc]\n"
+                "download_dir = /downloads/incomplete/usenet\n"
+                "complete_dir = /downloads/usenet\n"
+                "api_key = private\n"
+                "username = operator\n"
+                "password = private-password\n"
+                "api_logging = 0\n",
+                encoding="utf-8",
+            )
+            environment = {
+                "WYSEARR_USENET_ENABLED": "true",
+                "USENET_SERVER_HOST": "news.example",
+                "USENET_SERVER_PORT": "563",
+                "USENET_SERVER_SSL": "true",
+                "USENET_SERVER_USERNAME": "reader",
+                "USENET_SERVER_PASSWORD": "private-provider-password",
+                "USENET_SERVER_CONNECTIONS": "8",
+                "USENET_SERVER_RETENTION": "3000",
+            }
+
+            def requester(url):
+                if "mode=version" in url:
+                    return {"version": "5.0.4"}
+                if "mode=get_cats" in url:
+                    return {"categories": ["shelfarr"]}
+                return {
+                    "config": {
+                        "servers": [
+                            {
+                                "name": "WyseARR Primary",
+                                "displayname": "WyseARR Primary",
+                                "host": "news.example",
+                                "port": 563,
+                                "username": "reader",
+                                "password": "**********",
+                                "connections": 8,
+                                "ssl": 1,
+                                "ssl_verify": 3,
+                                "retention": 3000,
+                                "priority": 0,
+                                "enable": 1,
+                            }
+                        ]
+                    }
+                }
+
+            tester = mock.MagicMock(return_value={"value": {"result": True}})
+            checks = {
+                check.name: check
+                for check in validate.sabnzbd_configuration_checks(
+                    config,
+                    "8085",
+                    "operator",
+                    environment,
+                    requester=requester,
+                    server_tester=tester,
+                )
+            }
+            self.assertTrue(checks["sabnzbd:usenet-provider"].ok)
+            parameters = tester.call_args.args[2]
+            self.assertEqual(parameters["mode"], "config")
+            self.assertEqual(parameters["name"], "test_server")
+            self.assertNotIn(environment["USENET_SERVER_PASSWORD"], str(checks))
+
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    "api_logging = 0", "api_logging = 1"
+                ),
+                encoding="utf-8",
+            )
+            tester.reset_mock()
+            checks = {
+                check.name: check
+                for check in validate.sabnzbd_configuration_checks(
+                    config,
+                    "8085",
+                    "operator",
+                    environment,
+                    requester=requester,
+                    server_tester=tester,
+                )
+            }
+            self.assertFalse(checks["sabnzbd:authentication"].ok)
+            self.assertFalse(checks["sabnzbd:usenet-provider"].ok)
+            tester.assert_not_called()
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    "api_logging = 1", "api_logging = 0"
+                ),
+                encoding="utf-8",
+            )
+
+            tester.return_value = {
+                "value": {"result": False, "message": "rejected"}
+            }
+            checks = {
+                check.name: check
+                for check in validate.sabnzbd_configuration_checks(
+                    config,
+                    "8085",
+                    "operator",
+                    environment,
+                    requester=requester,
+                    server_tester=tester,
+                )
+            }
+            self.assertFalse(checks["sabnzbd:usenet-provider"].ok)
+
+            def duplicate_provider(url):
+                value = requester(url)
+                if "mode=get_config" in url:
+                    value["config"]["servers"].append(
+                        {**value["config"]["servers"][0], "name": "wysearr primary"}
+                    )
+                return value
+
+            checks = {
+                check.name: check
+                for check in validate.sabnzbd_configuration_checks(
+                    config,
+                    "8085",
+                    "operator",
+                    environment,
+                    requester=duplicate_provider,
+                    server_tester=tester,
+                )
+            }
+            self.assertFalse(checks["sabnzbd:usenet-provider"].ok)
+
+            def wrong_priority(url):
+                value = requester(url)
+                if "mode=get_config" in url:
+                    value["config"]["servers"][0]["priority"] = 99
+                return value
+
+            tester.return_value = {"value": {"result": True}}
+            checks = {
+                check.name: check
+                for check in validate.sabnzbd_configuration_checks(
+                    config,
+                    "8085",
+                    "operator",
+                    environment,
+                    requester=wrong_priority,
+                    server_tester=tester,
+                )
+            }
+            self.assertFalse(checks["sabnzbd:usenet-provider"].ok)
+
+    def test_sabnzbd_usenet_provider_rejects_partial_or_disabled_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "sabnzbd.ini"
+            config.write_text(
+                "[misc]\n"
+                "download_dir = /downloads/incomplete/usenet\n"
+                "complete_dir = /downloads/usenet\n"
+                "api_key = private\n"
+                "username = operator\n"
+                "password = private-password\n"
+                "api_logging = 0\n",
+                encoding="utf-8",
+            )
+
+            def requester(url):
+                if "mode=version" in url:
+                    return {"version": "5.0.4"}
+                if "mode=get_cats" in url:
+                    return {"categories": ["shelfarr"]}
+                return {
+                    "config": {
+                        "servers": [
+                            {
+                                "name": "WyseARR Primary",
+                                "host": "news.example",
+                                "enable": 1,
+                            }
+                        ]
+                    }
+                }
+
+            enabled = {
+                "WYSEARR_USENET_ENABLED": "true",
+                "USENET_SERVER_HOST": "news.example",
+            }
+            checks = {
+                check.name: check
+                for check in validate.sabnzbd_configuration_checks(
+                    config, "8085", "operator", enabled, requester=requester
+                )
+            }
+            self.assertFalse(checks["sabnzbd:usenet-provider"].ok)
+
+            checks = {
+                check.name: check
+                for check in validate.sabnzbd_configuration_checks(
+                    config,
+                    "8085",
+                    "operator",
+                    {"WYSEARR_USENET_ENABLED": "false"},
+                    requester=requester,
+                )
+            }
+            self.assertFalse(checks["sabnzbd:usenet-provider"].ok)
+
+    def test_managed_newznab_requires_live_tag_isolation_and_private_contract(self):
+        environment = {
+            "NEWZNAB_INDEXER_NAME": "WyseARR Books",
+            "NEWZNAB_BASE_URL": "https://indexer.example",
+            "NEWZNAB_API_PATH": "/api",
+            "NEWZNAB_API_KEY": "private-indexer-key",
+        }
+        indexer = {
+            "id": 17,
+            "name": "WyseARR Books",
+            "enable": True,
+            "implementation": "Newznab",
+            "configContract": "NewznabSettings",
+            "protocol": "usenet",
+            "priority": 20,
+            "tags": [4],
+            "capabilities": {
+                "categories": [
+                    {
+                        "id": 3000,
+                        "subCategories": [{"id": 3030, "subCategories": []}],
+                    },
+                    {
+                        "id": 7000,
+                        "subCategories": [{"id": 7020, "subCategories": []}],
+                    },
+                ]
+            },
+            "fields": [
+                {"name": "baseUrl", "value": "https://indexer.example/"},
+                {"name": "apiPath", "value": "/api"},
+                {"name": "apiKey", "value": "(removed)"},
+            ],
+        }
+        torrent = {
+            "id": 18,
+            "name": "Torrent Fallback",
+            "enable": True,
+            "implementation": "Cardigann",
+            "protocol": "torrent",
+            "tags": [5],
+        }
+        tags = [
+            {"id": 4, "label": "shelfarr"},
+            {"id": 5, "label": "wysearr-arr"},
+        ]
+        applications = [
+            {"name": name, "implementation": name, "tags": [5]}
+            for name in ("Sonarr", "Radarr", "Lidarr", "Whisparr")
+        ]
+        check = validate.prowlarr_managed_newznab_check(
+            [indexer, torrent],
+            tags,
+            applications,
+            {17},
+            environment,
+            enabled=True,
+        )
+        self.assertTrue(check.ok)
+        self.assertNotIn(environment["NEWZNAB_API_KEY"], check.detail)
+
+        for changed_indexers, changed_apps, live_ids in (
+            ([{**indexer, "tags": []}, torrent], applications, {17}),
+            ([indexer, {**torrent, "tags": []}], applications, {17}),
+            ([indexer, {**torrent, "tags": [4, 5]}], applications, {17}),
+            ([{**indexer, "priority": 99}, torrent], applications, {17}),
+            (
+                [indexer, torrent],
+                [
+                    {**app, "tags": []}
+                    if app["name"] == "Radarr"
+                    else app
+                    for app in applications
+                ],
+                {17},
+            ),
+            (
+                [{**indexer, "tags": [4, 9]}, torrent],
+                [
+                    {**app, "tags": [5, 9]}
+                    if app["name"] == "Sonarr"
+                    else app
+                    for app in applications
+                ],
+                {17},
+            ),
+            ([indexer, torrent], applications, set()),
+            (
+                [
+                    {
+                        **indexer,
+                        "capabilities": {
+                            "categories": [
+                                {"id": 2000, "subCategories": []}
+                            ]
+                        },
+                    },
+                    torrent,
+                ],
+                applications,
+                {17},
+            ),
+        ):
+            with self.subTest(
+                applications=changed_apps,
+                live=live_ids,
+            ):
+                self.assertFalse(
+                    validate.prowlarr_managed_newznab_check(
+                        changed_indexers,
+                        tags,
+                        changed_apps,
+                        live_ids,
+                        environment,
+                        enabled=True,
+                    ).ok
+                )
+
+    def test_managed_newznab_disabled_state_only_rejects_managed_indexer(self):
+        disabled = {
+            "id": 17,
+            "name": "WyseARR Books",
+            "enable": False,
+            "implementation": "Newznab",
+            "protocol": "usenet",
+        }
+        self.assertTrue(
+            validate.prowlarr_managed_newznab_check(
+                [disabled], [], [], set(), {}, enabled=False
+            ).ok
+        )
+        self.assertFalse(
+            validate.prowlarr_managed_newznab_check(
+                [disabled, {**disabled, "id": 18, "name": "wysearr books"}],
+                [],
+                [],
+                set(),
+                {},
+                enabled=False,
+            ).ok
+        )
+        self.assertFalse(
+            validate.prowlarr_managed_newznab_check(
+                [{**disabled, "enable": True}], [], [], set(), {}, enabled=False
+            ).ok
+        )
+        self.assertFalse(
+            validate.prowlarr_managed_newznab_check(
+                [disabled],
+                [],
+                [],
+                set(),
+                {"NEWZNAB_INDEXER_NAME": "Custom Books"},
+                enabled=False,
+            ).ok
+        )
+        self.assertTrue(
+            validate.prowlarr_managed_newznab_check(
+                [
+                    {
+                        **disabled,
+                        "name": "Unrelated Usenet",
+                        "enable": True,
+                    }
+                ],
+                [],
+                [],
+                set(),
+                {},
+                enabled=False,
+            ).ok
+        )
+
+    def test_stopped_sab_requires_managed_provider_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "sabnzbd.ini"
+            config.write_text(
+                "[misc]\n"
+                "api_key = private\n"
+                "[servers]\n"
+                "[[WyseARR Primary]]\n"
+                "displayname = WyseARR Primary\n"
+                "enable = 1\n"
+                "host = news.example\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                validate.sabnzbd_stopped_managed_provider_check(config).ok
+            )
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    "enable = 1", "enable = 0"
+                ),
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                validate.sabnzbd_stopped_managed_provider_check(config).ok
+            )
+
+            config.write_text(
+                "[servers]\n"
+                "[[Unrelated Provider]]\n"
+                "enable = 1\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                validate.sabnzbd_stopped_managed_provider_check(config).ok
+            )
     def test_shelfarr_runtime_parses_client_results_after_rails_logs(self):
         runner = mock.MagicMock()
         runner.return_value = mock.MagicMock(
@@ -793,10 +1337,32 @@ class ValidationTests(unittest.TestCase):
         checks = validate.shelfarr_runtime_checks(
             "5056",
             "shf_token",
+            True,
             runner=runner,
             requester=lambda *_args, **_kwargs: {"requests": []},
         )
         self.assertTrue(all(check.ok for check in checks))
+
+    def test_shelfarr_runtime_rejects_enabled_sab_when_usenet_is_disabled(self):
+        runner = mock.MagicMock()
+        runner.return_value = mock.MagicMock(
+            returncode=0,
+            stdout=(
+                "WYSEARR_CLIENT_RESULTS="
+                '[["qbittorrent","shelfarr",true],'
+                '["sabnzbd","shelfarr",true]]\n'
+            ),
+        )
+        checks = validate.shelfarr_runtime_checks(
+            "5056",
+            "shf_token",
+            False,
+            runner=runner,
+            requester=lambda *_args, **_kwargs: {"requests": []},
+        )
+        self.assertFalse(
+            next(check for check in checks if check.name == "shelfarr:client-connectivity").ok
+        )
 
     def test_arr_native_discord_check_reads_notification_database(self):
         with tempfile.TemporaryDirectory() as directory:
