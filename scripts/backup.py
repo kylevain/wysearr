@@ -23,6 +23,11 @@ MAX_QBITTORRENT_RESUME_FILES = 20_000
 MAX_QBITTORRENT_RESUME_FILE_BYTES = 32 * 1024 * 1024
 MAX_QBITTORRENT_RESUME_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+SHELFARR_STORAGE_RELATIVE = Path("config/shelfarr")
+MAX_SHELFARR_STORAGE_FILES = 100_000
+MAX_SHELFARR_STORAGE_FILE_BYTES = 8 * 1024 * 1024 * 1024
+MAX_SHELFARR_STORAGE_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
+SQLITE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
 
 
 def private_mkdir(path: Path, *, anchor: Path = BACKUP_ROOT) -> None:
@@ -165,6 +170,64 @@ def copy_qbittorrent_resume_state(
         copied.append({"path": str(relative), "sha256": sha256(destination)})
 
 
+def copy_shelfarr_storage(
+    output: Path,
+    copied: list[dict[str, str]],
+    sqlite_sources: set[Path],
+    *,
+    stack_root: Path = STACK_ROOT,
+) -> None:
+    """Checkpoint every persistent Shelfarr file outside live SQLite sidecars."""
+
+    source_root = stack_root / SHELFARR_STORAGE_RELATIVE
+    if not source_root.exists():
+        return
+    if source_root.is_symlink() or not source_root.is_dir():
+        raise RuntimeError(
+            f"Shelfarr storage source is not a directory: {source_root}"
+        )
+
+    entries = sorted(source_root.rglob("*"), key=lambda path: str(path))
+    if len(entries) > MAX_SHELFARR_STORAGE_FILES:
+        raise RuntimeError("Shelfarr storage exceeds the checkpoint file-count limit")
+
+    total_bytes = 0
+    for source in entries:
+        if source.is_symlink():
+            raise RuntimeError(f"Shelfarr storage contains a symbolic link: {source}")
+        if source.is_dir():
+            continue
+        if not source.is_file():
+            raise RuntimeError(
+                f"Shelfarr storage contains an unsupported file type: {source}"
+            )
+        # SQLite files are copied transactionally by sqlite_backup(). Their
+        # live journal sidecars must never be copied independently.
+        if source in sqlite_sources:
+            continue
+        if source.name.endswith(("-wal", "-shm")) and any(
+            Path(source.name.removesuffix(sidecar)).suffix.casefold()
+            in SQLITE_SUFFIXES
+            for sidecar in ("-wal", "-shm")
+            if source.name.endswith(sidecar)
+        ):
+            continue
+
+        relative = source.relative_to(stack_root)
+        destination = output / relative
+        copied_bytes = copy_stable_bounded_private(
+            source,
+            destination,
+            maximum_bytes=MAX_SHELFARR_STORAGE_FILE_BYTES,
+            anchor=output,
+        )
+        total_bytes += copied_bytes
+        if total_bytes > MAX_SHELFARR_STORAGE_TOTAL_BYTES:
+            destination.unlink(missing_ok=True)
+            raise RuntimeError("Shelfarr storage exceeds the checkpoint byte limit")
+        copied.append({"path": str(relative), "sha256": sha256(destination)})
+
+
 def git_head() -> str | None:
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -182,10 +245,24 @@ def create_backup(output: Path) -> dict[str, object]:
     private_mkdir(output, anchor=output)
     output.chmod(0o700)
     copied: list[dict[str, str]] = []
+    shelfarr_storage = STACK_ROOT / SHELFARR_STORAGE_RELATIVE
+    shelfarr_present = shelfarr_storage.is_dir()
 
-    sqlite_sources = sorted((STACK_ROOT / "config").glob("**/*.db"))
-    sqlite_sources += sorted((STACK_ROOT / "state").glob("**/*.db"))
-    for source in sqlite_sources:
+    sqlite_candidates = {
+        source
+        for root in (STACK_ROOT / "config", STACK_ROOT / "state")
+        for source in root.glob("**/*")
+        if source.suffix.casefold() in SQLITE_SUFFIXES
+    }
+    linked_databases = sorted(
+        source for source in sqlite_candidates if source.is_symlink()
+    )
+    if linked_databases:
+        raise RuntimeError(
+            f"checkpoint SQLite source is a symbolic link: {linked_databases[0]}"
+        )
+    sqlite_sources = {source for source in sqlite_candidates if source.is_file()}
+    for source in sorted(sqlite_sources):
         if not source.is_file():
             continue
         relative = source.relative_to(STACK_ROOT)
@@ -196,11 +273,14 @@ def create_backup(output: Path) -> dict[str, object]:
     config_patterns = (
         ".env",
         "docker-compose.yml",
+        "state/shelfarr-evaluation/*.json",
         "config/*/config.xml",
         "config/bazarr/config/config.yaml",
         "config/qbittorrent/qBittorrent/*.conf",
         "config/qbittorrent/qBittorrent/categories.json",
         "config/qbittorrent/qBittorrent/watched_folders.json",
+        "config/sabnzbd/sabnzbd.ini",
+        "config/sabnzbd/admin/*.sab",
     )
     seen: set[Path] = set()
     for pattern in config_patterns:
@@ -213,18 +293,30 @@ def create_backup(output: Path) -> dict[str, object]:
             copy_private(source, destination, anchor=output)
             copied.append({"path": str(relative), "sha256": sha256(destination)})
 
+    copy_shelfarr_storage(
+        output,
+        copied,
+        sqlite_sources,
+        stack_root=STACK_ROOT,
+    )
     copy_qbittorrent_resume_state(output, copied, stack_root=STACK_ROOT)
 
     manifest = {
-        "format_version": 1,
+        "format_version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "git_head": git_head(),
         "boundary": {
-            "includes": "selected configuration, SQLite-safe databases, and bounded qBittorrent resume metadata",
+            "includes": "selected configuration, SQLite-safe databases, complete bounded Shelfarr storage, and bounded qBittorrent resume metadata",
             "excludes": [
                 "state/torrents/** download payloads",
+                "state/shelfarr-staging/** direct-download staging payloads",
                 "/mnt/media/** library media",
             ],
+            "shelfarr_consistency": (
+                "service-stopped generation required for exact stateful rollback"
+                if shelfarr_present
+                else "not present"
+            ),
         },
         "files": copied,
     }
@@ -263,7 +355,7 @@ def verify_backup(checkpoint: Path) -> dict[str, object]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
         raise RuntimeError("checkpoint manifest has an invalid structure")
-    if manifest.get("format_version", 0) not in (0, 1):
+    if manifest.get("format_version", 0) not in (0, 1, 2):
         raise RuntimeError("checkpoint manifest uses an unsupported format")
 
     declared: set[str] = set()
@@ -278,7 +370,7 @@ def verify_backup(checkpoint: Path) -> dict[str, object]:
             raise RuntimeError(f"checkpoint file is missing or unsafe: {raw_path}")
         if sha256(target) != entry["sha256"]:
             raise RuntimeError(f"checkpoint hash mismatch: {raw_path}")
-        if target.suffix == ".db":
+        if target.suffix.casefold() in SQLITE_SUFFIXES:
             with closing(
                 sqlite3.connect(f"file:{target}?mode=ro&immutable=1", uri=True)
             ) as connection:

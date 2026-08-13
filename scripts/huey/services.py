@@ -9,10 +9,24 @@ from typing import Any
 
 try:
     from .acquisition import DirectAcquirer
-    from .clients import LidarrClient, ProwlarrClient, QBittorrentClient, RadarrClient, SonarrClient
+    from .clients import (
+        LidarrClient,
+        ProwlarrClient,
+        QBittorrentClient,
+        RadarrClient,
+        ShelfarrClient,
+        SonarrClient,
+    )
 except ImportError:  # pragma: no cover - direct container entrypoint
     from acquisition import DirectAcquirer
-    from clients import LidarrClient, ProwlarrClient, QBittorrentClient, RadarrClient, SonarrClient
+    from clients import (
+        LidarrClient,
+        ProwlarrClient,
+        QBittorrentClient,
+        RadarrClient,
+        ShelfarrClient,
+        SonarrClient,
+    )
 
 
 def _optional_int(value: str | None, label: str) -> int | None:
@@ -46,12 +60,35 @@ def _bounded_int(value: str, label: str, minimum: int, maximum: int) -> int:
     return parsed
 
 
+def _bounded_float(value: str, label: str, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise ValueError(f"{label} must be a number") from error
+    if not math.isfinite(parsed) or not minimum <= parsed <= maximum:
+        raise ValueError(f"{label} must be between {minimum} and {maximum}")
+    return parsed
+
+
+def _boolean(value: str, label: str) -> bool:
+    normalized = value.strip()
+    if normalized == "true":
+        return True
+    if normalized in {"false", ""}:
+        return False
+    raise ValueError(f"{label} must be literal true or false")
+
+
 class ServiceRegistry:
     """Construct service clients only when their request channel is used."""
 
     def __init__(self, environment: Mapping[str, str] | None = None):
         self.environment = dict(os.environ if environment is None else environment)
         self._clients: dict[str, Any] = {}
+        self.shelfarr_enabled = _boolean(
+            self.environment.get("SHELFARR_ENABLED", "false"),
+            "SHELFARR_ENABLED",
+        )
 
     def _env(self, name: str, default: str = "") -> str:
         return self.environment.get(name, default).strip()
@@ -82,6 +119,65 @@ class ServiceRegistry:
         )
         self._clients[service] = client
         return client
+
+    def shelfarr(self) -> ShelfarrClient:
+        """Return the Shelfarr client used for submissions and reconciliation.
+
+        The enabled flag controls only ownership of *new* book requests.  A
+        configured client remains callable after the flag is turned off so
+        already-submitted Shelfarr requests can be drained before rollback.
+        """
+
+        if "shelfarr" in self._clients:
+            return self._clients["shelfarr"]
+        client = ShelfarrClient(
+            self._env("SHELFARR_URL", "http://shelfarr"),
+            self._raw_env("SHELFARR_API_TOKEN"),
+            timeout=_positive_float(
+                self._env("SHELFARR_TIMEOUT_SECONDS", "20"),
+                "SHELFARR_TIMEOUT_SECONDS",
+            ),
+            search_limit=_bounded_int(
+                self._env("SHELFARR_SEARCH_LIMIT", "10"),
+                "SHELFARR_SEARCH_LIMIT",
+                1,
+                20,
+            ),
+            minimum_confidence=_bounded_float(
+                self._env("HUEY_SHELFARR_MINIMUM_CONFIDENCE", "0.80"),
+                "HUEY_SHELFARR_MINIMUM_CONFIDENCE",
+                0,
+                1,
+            ),
+            runner_up_gap=_bounded_float(
+                self._env("HUEY_SHELFARR_RUNNER_UP_GAP", "0.05"),
+                "HUEY_SHELFARR_RUNNER_UP_GAP",
+                0,
+                1,
+            ),
+            language=self._env("SHELFARR_LANGUAGE", "en"),
+        )
+        self._clients["shelfarr"] = client
+        return client
+
+    def book(self, request: Mapping[str, Any]):
+        """Submit an ebook/audiobook through the selected ownership path."""
+
+        if self.shelfarr_enabled:
+            return self.shelfarr().submit(
+                str(request["media_type"]),
+                str(request["title"]),
+                str(request["author"]) if request.get("author") else None,
+                int(request["id"]),
+                discord_user_id=request.get("discord_user_id"),
+                discord_channel_id=request.get("channel_id"),
+            )
+        return self.direct().submit(
+            str(request["media_type"]),
+            str(request["title"]),
+            str(request["author"]) if request.get("author") else None,
+            int(request["id"]),
+        )
 
     def direct(self) -> DirectAcquirer:
         if "direct" in self._clients:

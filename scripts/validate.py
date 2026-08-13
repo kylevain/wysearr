@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Read-only production validation for the WyseARR stack."""
+"""Non-acquiring production validation for the WyseARR stack."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.cookiejar
 import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,7 +22,7 @@ from pathlib import Path
 
 
 STACK_ROOT = Path(__file__).resolve().parents[1]
-SERVICES = (
+CORE_SERVICES = (
     "qbittorrent",
     "prowlarr",
     "sonarr",
@@ -31,8 +33,10 @@ SERVICES = (
     "bookbot",
     "huey",
 )
+EVALUATION_SERVICES = ("sabnzbd", "shelfarr")
 DIRECT_CATEGORIES = ("ebooks", "audiobooks", "manga-comics", "roms", "sheet-music")
 ARR_CATEGORIES = ("tv", "movies", "music", "spicy")
+SHELFARR_DOWNLOAD_CATEGORY = "shelfarr"
 BAZARR_PROVIDERS = {"embeddedsubtitles", "yifysubtitles", "subf2m"}
 REQUIRED_DISCORD_CHANNELS = {
     "requests": frozenset(
@@ -278,11 +282,17 @@ def bazarr_native_discord_check(database: Path, config: Path) -> Check:
     )
 
 
-def request_json(url: str, *, api_key: str | None = None, timeout: int = 15) -> object:
-    headers = {"Accept": "application/json"}
+def request_json(
+    url: str,
+    *,
+    api_key: str | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = 15,
+) -> object:
+    request_headers = {"Accept": "application/json", **dict(headers or {})}
     if api_key:
-        headers["X-Api-Key"] = api_key
-    request = urllib.request.Request(url, headers=headers)
+        request_headers["X-Api-Key"] = api_key
+    request = urllib.request.Request(url, headers=request_headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.load(response)
 
@@ -385,6 +395,51 @@ def container_check(service: str) -> Check:
     )
 
 
+def container_stopped_check(service: str) -> Check:
+    """Require an evaluation worker to be stopped when its owner flag is off."""
+
+    result = subprocess.run(
+        ["docker", "compose", "ps", "-a", "-q", service],
+        cwd=STACK_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    container = result.stdout.strip()
+    if result.returncode != 0:
+        stopped = False
+        detail = "container state unavailable"
+    elif not container:
+        stopped = True
+        detail = "not created"
+    else:
+        inspect = subprocess.run(
+            ["docker", "inspect", container],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        try:
+            state = json.loads(inspect.stdout)[0]["State"]
+            status = str(state.get("Status") or "")
+            stopped = bool(
+                inspect.returncode == 0
+                and status in {"created", "exited", "dead"}
+                and not state.get("Running")
+                and not state.get("Restarting")
+                and not state.get("Paused")
+            )
+            detail = status or "unknown"
+        except (ValueError, TypeError, KeyError, IndexError):
+            stopped = False
+            detail = "inspect failed"
+    return Check(
+        f"container:{service}:disabled",
+        stopped,
+        detail if stopped else f"unsafe state={detail} while Shelfarr ownership is disabled",
+    )
+
+
 def writable_check(path: Path, name: str) -> Check:
     try:
         with tempfile.NamedTemporaryFile(prefix=".wysearr-validate-", dir=path) as probe:
@@ -393,6 +448,590 @@ def writable_check(path: Path, name: str) -> Check:
         return Check(name, True, "writable")
     except OSError as error:
         return Check(name, False, f"not writable: {error.strerror}")
+
+
+def private_published_port_check(service: str) -> Check:
+    """Require every published admin port for a private service to be loopback."""
+
+    name = f"{service}:host-access"
+    result = subprocess.run(
+        ["docker", "compose", "ps", "-q", service],
+        cwd=STACK_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    container = result.stdout.strip()
+    if result.returncode or not container:
+        return Check(name, False, "container unavailable")
+    inspect = subprocess.run(
+        ["docker", "inspect", container],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if inspect.returncode:
+        return Check(name, False, "inspect failed")
+    bindings = json.loads(inspect.stdout)[0].get("HostConfig", {}).get(
+        "PortBindings", {}
+    )
+    host_ips = {
+        str(binding.get("HostIp", ""))
+        for values in bindings.values()
+        for binding in values or []
+    }
+    private = bool(host_ips) and host_ips <= {"127.0.0.1", "::1"}
+    return Check(
+        name,
+        private,
+        "loopback only" if private else "published beyond host loopback",
+    )
+
+
+def shelfarr_storage_checks(storage: Path) -> list[Check]:
+    """Validate Shelfarr's complete persistent state and notification boundary."""
+
+    checks: list[Check] = []
+    try:
+        storage_stat = storage.stat()
+        storage_private = bool(
+            storage.is_dir()
+            and storage_stat.st_uid == os.getuid()
+            and stat.S_IMODE(storage_stat.st_mode) & 0o077 == 0
+        )
+    except OSError:
+        storage_private = False
+    checks.append(
+        Check(
+            "shelfarr:storage-permissions",
+            storage_private,
+            "owner-only directory"
+            if storage_private
+            else "directory must be owned by the service user and mode 0700",
+        )
+    )
+    expected_databases = (
+        "production.sqlite3",
+        "production_cache.sqlite3",
+        "production_queue.sqlite3",
+        "production_cable.sqlite3",
+    )
+    database_results: list[bool] = []
+    for filename in expected_databases:
+        path = storage / filename
+        try:
+            with closing(_open_readonly_database(path)) as connection:
+                database_results.append(
+                    connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+                )
+        except (OSError, sqlite3.Error):
+            database_results.append(False)
+    checks.append(
+        Check(
+            "shelfarr:databases",
+            all(database_results),
+            f"integrity={sum(database_results)}/{len(expected_databases)}",
+        )
+    )
+
+    secret_results: list[bool] = []
+    for filename in (".secret_key_base", ".encryption_keys"):
+        path = storage / filename
+        try:
+            secret_results.append(
+                path.is_file()
+                and bool(path.read_text(encoding="utf-8").strip())
+                and stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
+            )
+        except (OSError, UnicodeError):
+            secret_results.append(False)
+    checks.append(
+        Check(
+            "shelfarr:secrets",
+            all(secret_results),
+            "persistent and private"
+            if all(secret_results)
+            else "missing, empty, or accessible outside owner",
+        )
+    )
+
+    discord_disabled = False
+    try:
+        with closing(_open_readonly_database(storage / "production.sqlite3")) as connection:
+            row = connection.execute(
+                "SELECT value FROM settings WHERE key = 'discord_enabled'"
+            ).fetchone()
+        discord_disabled = row is None or not _database_truthy(row[0])
+    except (OSError, sqlite3.Error):
+        pass
+    checks.append(
+        Check(
+            "shelfarr:native-discord",
+            discord_disabled,
+            "disabled" if discord_disabled else "enabled or unverifiable",
+        )
+    )
+    return checks
+
+
+def private_service_storage_check(path: Path, name: str) -> Check:
+    """Require service state containing history or credentials to be owner-only."""
+
+    try:
+        info = path.stat()
+        ok = bool(
+            path.is_dir()
+            and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) & 0o077 == 0
+        )
+    except OSError:
+        ok = False
+    return Check(
+        name,
+        ok,
+        "owner-only directory" if ok else "directory must be owned and mode 0700",
+    )
+
+
+def evaluation_report_permissions_check(path: Path) -> Check:
+    """Protect benchmark request titles and outcomes from other host users."""
+
+    try:
+        directory = path.stat()
+        reports = list(path.glob("*.json"))
+        ok = bool(
+            path.is_dir()
+            and not path.is_symlink()
+            and directory.st_uid == os.getuid()
+            and stat.S_IMODE(directory.st_mode) == 0o700
+            and reports
+            and all(
+                report.is_file()
+                and not report.is_symlink()
+                and report.stat().st_uid == os.getuid()
+                and stat.S_IMODE(report.stat().st_mode) == 0o600
+                for report in reports
+            )
+        )
+    except OSError:
+        ok = False
+    return Check(
+        "shelfarr:evaluation-report-permissions",
+        ok,
+        "private reports" if ok else "directory/reports must be owner-only",
+    )
+
+
+def shelfarr_direct_staging_check(path: Path) -> Check:
+    """Require Shelfarr's CIFS-incompatible private staging on local storage."""
+
+    try:
+        info = path.stat()
+        ok = bool(
+            path.is_dir()
+            and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o700
+            and os.access(path, os.W_OK | os.X_OK)
+        )
+    except OSError:
+        ok = False
+    return Check(
+        "shelfarr:direct-ebook-staging",
+        ok,
+        "local owner-only staging"
+        if ok
+        else "local staging must be writable, owned by the service user, and mode 0700",
+    )
+
+
+def shelfarr_configuration_checks(
+    storage: Path, environment: dict[str, str]
+) -> list[Check]:
+    """Validate the live evaluation boundary without decrypting stored secrets."""
+
+    checks: list[Check] = []
+    try:
+        with closing(_open_readonly_database(storage / "production.sqlite3")) as connection:
+            settings = {
+                str(row[0]): row[1]
+                for row in connection.execute("SELECT key, value FROM settings")
+            }
+            clients = connection.execute(
+                "SELECT client_type, url, category, download_path, enabled, "
+                "password, api_key "
+                "FROM download_clients"
+            ).fetchall()
+            token = environment.get("SHELFARR_API_TOKEN", "")
+            token_row = connection.execute(
+                "SELECT api_tokens.scopes FROM api_tokens "
+                "JOIN users ON users.id = api_tokens.user_id "
+                "WHERE token_digest = ? AND revoked_at IS NULL "
+                "AND users.deleted_at IS NULL AND users.role = 0 "
+                "AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
+                (hashlib.sha256(token.encode("utf-8")).hexdigest(),),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return [Check("shelfarr:configuration", False, "database unavailable")]
+
+    indexer_ok = bool(
+        settings.get("indexer_provider") == "prowlarr"
+        and str(settings.get("prowlarr_url") or "").rstrip("/")
+        == "http://prowlarr:9696"
+        and str(settings.get("prowlarr_api_key") or "").strip()
+    )
+    checks.append(
+        Check(
+            "shelfarr:prowlarr",
+            indexer_ok,
+            "internal provider configured" if indexer_ok else "configuration missing",
+        )
+    )
+
+    expected_clients = {
+        "qbittorrent": ("http://qbittorrent:8080", "/downloads/shelfarr"),
+        "sabnzbd": ("http://sabnzbd:8080", "/downloads/usenet"),
+    }
+    configured_clients: set[str] = set()
+    for row in clients:
+        client_type = str(row["client_type"] or "")
+        if (
+            _database_truthy(row["enabled"])
+            and client_type in expected_clients
+            and str(row["url"] or "").rstrip("/") == expected_clients[client_type][0]
+            and row["category"] == SHELFARR_DOWNLOAD_CATEGORY
+            and row["download_path"] == expected_clients[client_type][1]
+            and (
+                bool(row["api_key"])
+                if client_type == "sabnzbd"
+                else bool(row["password"])
+            )
+        ):
+            configured_clients.add(client_type)
+    clients_ok = configured_clients == set(expected_clients)
+    checks.append(
+        Check(
+            "shelfarr:download-clients",
+            clients_ok,
+            "qBittorrent and SABnzbd isolated"
+            if clients_ok
+            else "missing, disabled, or not using category shelfarr",
+        )
+    )
+
+    try:
+        preferred_types = json.loads(
+            str(settings.get("preferred_download_types") or "[]")
+        )
+    except json.JSONDecodeError:
+        preferred_types = []
+    order_ok = preferred_types == ["direct", "usenet", "torrent"]
+    checks.append(
+        Check(
+            "shelfarr:acquisition-order",
+            order_ok,
+            "direct, usenet, torrent"
+            if order_ok
+            else "expected direct, usenet, torrent",
+        )
+    )
+
+    paths_ok = bool(
+        settings.get("ebook_output_path") == "/ebooks"
+        and settings.get("audiobook_output_path") == "/audiobooks"
+        and settings.get("download_local_path") == "/downloads"
+    )
+    checks.append(
+        Check(
+            "shelfarr:paths",
+            paths_ok,
+            "downloads and final libraries mapped"
+            if paths_ok
+            else "output or download path mismatch",
+        )
+    )
+
+    automation_ok = bool(
+        _database_truthy(settings.get("immediate_search_enabled"))
+        and _database_truthy(settings.get("auto_approve_requests"))
+        and _database_truthy(settings.get("auto_select_enabled"))
+        and str(settings.get("auto_select_confidence_threshold")) == "90"
+        and str(settings.get("auto_select_min_seeders")) == "1"
+        and settings.get("completed_download_import_mode") == "copy"
+        and settings.get("default_language") == "en"
+        and not _database_truthy(settings.get("auth_disabled"))
+    )
+    checks.append(
+        Check(
+            "shelfarr:automation",
+            automation_ok,
+            "auto-approved search, selection policy, and copy import enabled"
+            if automation_ok
+            else "automation, selection, language, or import policy mismatch",
+        )
+    )
+
+    direct_ok = bool(
+        not _database_truthy(settings.get("librivox_enabled"))
+        and _database_truthy(settings.get("gutenberg_enabled"))
+        and not _database_truthy(settings.get("anna_archive_enabled"))
+        and not _database_truthy(settings.get("zlibrary_enabled"))
+        and not _database_truthy(settings.get("ebooks_com_enabled"))
+    )
+    checks.append(
+        Check(
+            "shelfarr:direct-sources",
+            direct_ok,
+            "Gutenberg enabled; CIFS-incompatible and credentialed sources disabled"
+            if direct_ok
+            else "direct-source evaluation policy mismatch",
+        )
+    )
+
+    outbound_disabled = bool(
+        not _database_truthy(settings.get("discord_enabled"))
+        and not str(settings.get("discord_webhook_url") or "").strip()
+        and not _database_truthy(settings.get("webhook_enabled"))
+        and not str(settings.get("webhook_url") or "").strip()
+        and not _database_truthy(settings.get("telegram_enabled"))
+    )
+    checks.append(
+        Check(
+            "shelfarr:outbound-notifications",
+            outbound_disabled,
+            "Discord, webhook, and Telegram disabled"
+            if outbound_disabled
+            else "Shelfarr outbound notification channel enabled or configured",
+        )
+    )
+
+    required_scopes = {"search:read", "requests:read", "requests:write"}
+    try:
+        token_scopes = set(json.loads(str(token_row[0]))) if token_row else set()
+    except (json.JSONDecodeError, TypeError):
+        token_scopes = set()
+    token_ok = token.startswith("shf_") and token_scopes == required_scopes
+    checks.append(
+        Check(
+            "shelfarr:huey-token",
+            token_ok,
+            "active least-privilege token"
+            if token_ok
+            else "token missing, inactive, or lacks required scopes",
+        )
+    )
+    return checks
+
+
+def _ini_section_values(path: Path, section: str) -> dict[str, str]:
+    """Read scalar values from one top-level INI section without its secrets."""
+
+    values: dict[str, str] = {}
+    current = ""
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip().casefold()
+            continue
+        if current == section.casefold() and "=" in line:
+            key, value = line.split("=", 1)
+            scalar = value.strip()
+            if (
+                len(scalar) >= 2
+                and scalar[0] == scalar[-1]
+                and scalar[0] in {"'", '"'}
+            ):
+                scalar = scalar[1:-1]
+            values[key.strip().casefold()] = scalar
+    return values
+
+
+def sabnzbd_configuration_checks(
+    config_path: Path,
+    port: str,
+    expected_username: str = "",
+    *,
+    requester: object = request_json,
+) -> list[Check]:
+    """Validate isolated SAB paths/API; report provider availability separately."""
+
+    try:
+        misc = _ini_section_values(config_path, "misc")
+    except (OSError, UnicodeError):
+        return [Check("sabnzbd:configuration", False, "configuration unavailable")]
+
+    paths_ok = bool(
+        misc.get("download_dir") == "/downloads/incomplete/usenet"
+        and misc.get("complete_dir") == "/downloads/usenet"
+    )
+    checks = [
+        Check(
+            "sabnzbd:paths",
+            paths_ok,
+            "isolated incomplete and complete paths"
+            if paths_ok
+            else "download paths do not match evaluation mounts",
+        )
+    ]
+    auth_ok = bool(
+        expected_username
+        and misc.get("username") == expected_username
+        and str(misc.get("password") or "").strip()
+        and not _database_truthy(misc.get("api_logging"))
+    )
+    checks.append(
+        Check(
+            "sabnzbd:authentication",
+            auth_ok,
+            "operator authentication configured"
+            if auth_ok
+            else "operator auth missing/mismatched or API parameter logging enabled",
+        )
+    )
+
+    api_key = misc.get("api_key", "")
+    try:
+        base_url = f"http://127.0.0.1:{int(port)}"
+        encoded_key = urllib.parse.quote(api_key, safe="")
+        version_payload = requester(
+            f"{base_url}/api?mode=version&output=json&apikey={encoded_key}"
+        )
+        categories_payload = requester(
+            f"{base_url}/api?mode=get_cats&output=json&apikey={encoded_key}"
+        )
+        servers_payload = requester(
+            f"{base_url}/api?mode=get_config&section=servers&output=json&apikey={encoded_key}"
+        )
+        raw_servers = (
+            servers_payload.get("config", {}).get("servers", [])
+            if isinstance(servers_payload, dict)
+            else []
+        )
+        servers = (
+            list(raw_servers.values())
+            if isinstance(raw_servers, dict)
+            else raw_servers
+        )
+        enabled_server = any(
+            isinstance(server, dict)
+            and _database_truthy(server.get("enable"))
+            and bool(str(server.get("host") or "").strip())
+            for server in servers
+        )
+        categories = (
+            categories_payload.get("categories", [])
+            if isinstance(categories_payload, dict)
+            else []
+        )
+        api_ok = bool(
+            api_key
+            and isinstance(version_payload, dict)
+            and version_payload.get("version")
+            and isinstance(categories, list)
+            and SHELFARR_DOWNLOAD_CATEGORY in categories
+        )
+        detail = (
+            f"version={version_payload.get('version')} category=shelfarr"
+            if api_ok
+            else "API unavailable or Shelfarr category missing"
+        )
+    except (TypeError, ValueError, OSError, urllib.error.URLError):
+        api_ok = False
+        enabled_server = False
+        detail = "API unavailable or Shelfarr category missing"
+    checks.append(Check("sabnzbd:api-category", api_ok, detail))
+    checks.append(
+        Check(
+            "sabnzbd:provider-observation",
+            True,
+            "enabled Usenet provider configured"
+            if enabled_server
+            else "no enabled provider; Usenet acquisition unavailable",
+        )
+    )
+    return checks
+
+
+def shelfarr_runtime_checks(
+    port: str,
+    api_token: str,
+    *,
+    runner: object = subprocess.run,
+    requester: object = request_json,
+) -> list[Check]:
+    """Verify Huey's scoped API token and Shelfarr's live client adapters."""
+
+    checks: list[Check] = []
+    try:
+        request_payload = requester(
+            f"http://127.0.0.1:{int(port)}/api/v1/requests?limit=1",
+            headers={"Authorization": f"Bearer {api_token}"},
+        )
+        api_ok = isinstance(request_payload, dict) and isinstance(
+            request_payload.get("requests"), list
+        )
+    except (TypeError, ValueError, OSError, urllib.error.URLError):
+        api_ok = False
+    checks.append(
+        Check(
+            "shelfarr:huey-api",
+            api_ok,
+            "scoped request API authenticated" if api_ok else "authentication failed",
+        )
+    )
+
+    sentinel = "WYSEARR_CLIENT_RESULTS="
+    code = (
+        "items=DownloadClient.enabled.order(:client_type).map{"
+        "|c| [c.client_type,c.category,c.test_connection]};"
+        f"puts({json.dumps(sentinel)}+JSON.generate(items))"
+    )
+    try:
+        result = runner(
+            [
+                "docker", "compose", "exec", "-T", "--user",
+                f"{os.getuid()}:{os.getgid()}", "shelfarr",
+                "ruby", "/opt/wysearr/shelfarr_exec.rb",
+                "bin/rails", "runner", code,
+            ],
+            cwd=STACK_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        payload_line = next(
+            (
+                line[len(sentinel):]
+                for line in reversed(result.stdout.splitlines())
+                if line.startswith(sentinel)
+            ),
+            "[]",
+        )
+        items = json.loads(payload_line) if result.returncode == 0 else []
+        expected = {"qbittorrent", "sabnzbd"}
+        working = {
+            str(item[0])
+            for item in items
+            if isinstance(item, list)
+            and len(item) == 3
+            and item[1] == SHELFARR_DOWNLOAD_CATEGORY
+            and item[2] is True
+        }
+        clients_ok = expected <= working
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        clients_ok = False
+    checks.append(
+        Check(
+            "shelfarr:client-connectivity",
+            clients_ok,
+            "qBittorrent and SABnzbd live tests passed"
+            if clients_ok
+            else "one or more client tests failed",
+        )
+    )
+    return checks
 
 
 def bazarr_acceptance(
@@ -451,13 +1090,81 @@ def validate() -> list[Check]:
         checks.append(Check("media:writable", False, "directory missing"))
     checks.append(writable_check(torrent_root, "torrents:writable") if torrent_root.is_dir() else Check("torrents:writable", False, "directory missing"))
 
-    expected_dirs = [torrent_root / "incomplete"]
+    expected_dirs = [
+        torrent_root / "incomplete",
+        torrent_root / "incomplete" / "usenet",
+        torrent_root / "usenet",
+        torrent_root / SHELFARR_DOWNLOAD_CATEGORY,
+    ]
     expected_dirs += [torrent_root / category for category in ARR_CATEGORIES + DIRECT_CATEGORIES]
     missing = [str(path) for path in expected_dirs if not path.is_dir()]
     checks.append(Check("torrents:paths", not missing, "all category paths exist" if not missing else f"{len(missing)} paths missing"))
 
-    for service in SERVICES:
+    feature_flag = env.get("SHELFARR_ENABLED", "false").strip()
+    feature_flag_ok = feature_flag in {"true", "false", ""}
+    checks.append(
+        Check(
+            "shelfarr:feature-flag",
+            feature_flag_ok,
+            f"literal {feature_flag or 'false'}"
+            if feature_flag_ok
+            else "must be literal true or false",
+        )
+    )
+    shelfarr_enabled = feature_flag == "true"
+    services = CORE_SERVICES + (EVALUATION_SERVICES if shelfarr_enabled else ())
+    for service in services:
         checks.append(container_check(service))
+    if not shelfarr_enabled:
+        for service in EVALUATION_SERVICES:
+            checks.append(container_stopped_check(service))
+    if shelfarr_enabled:
+        checks.append(private_published_port_check("sabnzbd"))
+        checks.append(private_published_port_check("shelfarr"))
+        for relative, name in (
+            (Path("ebooks") / "Books", "shelfarr:ebooks-output"),
+            (Path("audiobooks"), "shelfarr:audiobooks-output"),
+        ):
+            path = media_root / relative
+            checks.append(
+                writable_check(path, name)
+                if path.is_dir()
+                else Check(name, False, "directory missing")
+            )
+        checks.extend(shelfarr_storage_checks(STACK_ROOT / "config" / "shelfarr"))
+        checks.append(
+            shelfarr_direct_staging_check(
+                STACK_ROOT / "state" / "shelfarr-staging" / "ebooks"
+            )
+        )
+        checks.append(
+            evaluation_report_permissions_check(
+                STACK_ROOT / "state" / "shelfarr-evaluation"
+            )
+        )
+        checks.extend(
+            shelfarr_configuration_checks(
+                STACK_ROOT / "config" / "shelfarr", env
+            )
+        )
+        checks.extend(
+            sabnzbd_configuration_checks(
+                STACK_ROOT / "config" / "sabnzbd" / "sabnzbd.ini",
+                env.get("SABNZBD_ADMIN_PORT", "8085"),
+                env.get("SABNZBD_ADMIN_USERNAME", ""),
+            )
+        )
+        checks.append(
+            private_service_storage_check(
+                STACK_ROOT / "config" / "sabnzbd", "sabnzbd:storage-permissions"
+            )
+        )
+        checks.extend(
+            shelfarr_runtime_checks(
+                env.get("SHELFARR_ADMIN_PORT", "5056"),
+                env.get("SHELFARR_API_TOKEN", ""),
+            )
+        )
 
     try:
         qbit_url = f"http://{bind_address}:{env.get('QBITTORRENT_PORT', '8080')}"
@@ -472,6 +1179,7 @@ def validate() -> list[Check]:
             categories = json.load(response)
         expected = set(ARR_CATEGORIES + DIRECT_CATEGORIES)
         expected |= {f"{category}-imported" for category in expected}
+        expected.add(SHELFARR_DOWNLOAD_CATEGORY)
         missing_categories = sorted(expected - set(categories))
         wrong_category_paths = sorted(
             category
@@ -501,6 +1209,7 @@ def validate() -> list[Check]:
         checks.append(Check("prowlarr:api", bool(status.get("version")), f"version={status.get('version')}"))
         enabled_indexers = sum(bool(item.get("enable")) for item in indexers)
         live_indexer = False
+        live_protocols: set[str] = set()
         for indexer in indexers:
             if not indexer.get("enable"):
                 continue
@@ -512,7 +1221,11 @@ def validate() -> list[Check]:
                     timeout=60,
                 )
                 live_indexer = True
-                break
+                protocol = str(indexer.get("protocol", "")).strip().casefold()
+                if protocol in {"torrent", "usenet"}:
+                    live_protocols.add(protocol)
+                if {"torrent", "usenet"} <= live_protocols:
+                    break
             except Exception:
                 continue
         checks.append(Check(
@@ -520,6 +1233,17 @@ def validate() -> list[Check]:
             enabled_indexers > 0 and live_indexer,
             f"enabled={enabled_indexers} live_test={live_indexer}",
         ))
+        required_book_protocols = {"torrent"}
+        checks.append(
+            Check(
+                "prowlarr:book-protocols",
+                required_book_protocols <= live_protocols,
+                "live torrent indexer; "
+                + ("Usenet indexer available" if "usenet" in live_protocols else "Usenet indexer unavailable")
+                if required_book_protocols <= live_protocols
+                else "missing a live torrent indexer",
+            )
+        )
         checks.append(Check("prowlarr:applications", required_apps <= app_names, f"configured={len(app_names)}"))
     except Exception as error:
         checks.append(Check("prowlarr:api", False, type(error).__name__))
@@ -636,7 +1360,10 @@ def validate() -> list[Check]:
             delivery_indexes = list(
                 connection.execute("PRAGMA index_list(notification_deliveries)")
             )
-        required_columns = {"status", "updated_at", "service", "external_id", "error"}
+        required_columns = {
+            "status", "updated_at", "service", "external_id",
+            "external_status", "error",
+        }
         unique_message = any(row[2] for row in indexes)
         required_delivery_columns = {
             "request_id",

@@ -6,9 +6,10 @@
 its local SSD under `/home/wyseadmin/homelab/state/torrents`. Permanent media
 lives on the Pi-SSD/DAS CIFS share mounted at `/mnt/media`.
 
-qBittorrent intentionally has no DAS mount. ARR services and BookBot can read
-local downloads and write the DAS. This keeps active torrent I/O and disposable
-payloads off permanent storage.
+qBittorrent intentionally has no DAS mount. ARR services, BookBot, and the
+feature-gated Shelfarr evaluator can read local downloads and write their DAS
+destinations. This keeps active torrent I/O and disposable payloads off
+permanent storage.
 
 ## Managed media flow
 
@@ -40,19 +41,23 @@ routine subtitle activity.
 Discord request channel
         v
 Huey: parse -> deduplicate -> persist -> deterministic handler
-        |                         |
-        | movies/tv               | ebooks/audiobooks/comics/ROMs/sheet music
-        v                         v
-Sonarr or Radarr          Prowlarr search + conservative match
-        |                         v
-        | import probe    qBittorrent base category
-        |                         v
-        |                BookBot validates and atomically copies
-        |                         v
-        +--------------> confirmed DAS import
-                                  v
-                         Huey lifecycle router
+        |                |                         |
+        | movies/tv      | ebooks/audiobooks       | comics/ROMs/sheet music
+        v                v                         v
+Sonarr or Radarr   Shelfarr API             Prowlarr + qBittorrent
+        |          direct/SAB/qBittorrent           |
+        |                |                       BookBot
+        |                v                          |
+        +--------> confirmed DAS import <-----------+
+                         |
+                Huey lifecycle router
 ```
+
+The Shelfarr branch exists only while `SHELFARR_ENABLED=true`. Shelfarr owns
+book finalization directly; BookBot does not process its isolated `shelfarr`
+download category. When the flag is false, ebook/audiobook handlers return to
+the preserved Prowlarr/qBittorrent/BookBot branch. Movies and TV never depend on
+Shelfarr.
 
 Huey stores request and event state in `state/huey/huey.db`. Discord
 `message_id` plus durable delivery aliases make gateway redelivery idempotent.
@@ -80,7 +85,7 @@ format/size hints are shown; provider IDs, URLs, hashes, and credentials are
 never included. Poor or low-confidence metadata retains the generic refinement
 response.
 
-Direct qBittorrent jobs carry a `huey-<request-id>` tag so BookBot can reconcile
+BookBot-owned qBittorrent jobs carry a `huey-<request-id>` tag so BookBot can reconcile
 the terminal import with the original request. Huey records delivery per logical
 event and destination. Discord itself does not provide an atomic exactly-once
 send transaction, so a route is marked delivered only after its send succeeds.
@@ -106,11 +111,11 @@ Whisparr adult-media requests remain Web-UI-only.
 An ARR terminal completion currently means Sonarr or Radarr reports imported
 media on the DAS; Huey does not yet trigger or confirm a Plex scan, so the
 matching Plex library must be scanned manually until that integration is
-authorized. A direct terminal completion means BookBot validated and atomically
-copied the payload to its DAS destination. Neither boundary alone proves that a
-downstream playback or catalog application has indexed the item.
+authorized. A Shelfarr book completion proves Shelfarr's final DAS publication;
+a BookBot completion proves its validated atomic copy. None of those boundaries
+proves that a downstream playback or catalog application has indexed the item.
 
-Direct acquisition accepts only payloads whose BitTorrent v1 identity can be
+BookBot-owned direct acquisition accepts only payloads whose BitTorrent v1 identity can be
 derived and cross-checked from the magnet or exact torrent metadata. Pure v2
 and hybrid payloads are declined instead of trusting unverified indexer
 metadata; ARR-managed acquisition is unaffected by this direct-media boundary.
@@ -124,19 +129,27 @@ Direct destinations are:
 
 | Request type | DAS destination |
 | --- | --- |
-| ebooks | `/media/ebooks/Books` |
-| audiobooks | `/media/audiobooks` |
+| ebooks | `/media/ebooks/Books` (Shelfarr during evaluation; otherwise BookBot) |
+| audiobooks | `/media/audiobooks` (Shelfarr during evaluation; otherwise BookBot) |
 | manga/comics | `/media/ebooks/Comics` |
 | roms | `/media/roms` |
 | sheet-music | `/media/sheetmusic` |
 
 ## Lifecycle and safety
 
-Every qBittorrent media category has a base and `-imported` category. Payloads
+Every ARR/BookBot-owned qBittorrent media category has a base and `-imported`
+category. The isolated `shelfarr` category is owned and finalized by Shelfarr
+and deliberately has no BookBot `-imported` peer. Payloads
 remain in the base category when acquisition or import fails. Only a successful
 ARR/BookBot import moves a job to `-imported`; BookBot may delete that job and
 its local payload after the configured 14-day retention interval. This makes a
 failed import fail safe and preserves seeding after a successful import.
+
+Shelfarr uses a private local nested staging mount for Project Gutenberg ebook
+downloads before publishing to the CIFS DAS. Direct LibriVox audiobooks are
+disabled because Shelfarr requires atomic same-filesystem directory publication.
+Usenet preference is configured, but no NNTP provider or Usenet indexer was
+available for the initial evaluation.
 
 All containers use bind-mounted persistence, `restart: unless-stopped`, bounded
 JSON logs, and Docker healthchecks. Official images and Python build bases are

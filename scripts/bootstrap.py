@@ -43,6 +43,13 @@ BASE_CATEGORIES = (
     "roms",
     "sheet-music",
 )
+SHELFARR_DOWNLOAD_CATEGORY = "shelfarr"
+EXTRA_DOWNLOAD_DIRECTORIES = (
+    "incomplete",
+    "incomplete/usenet",
+    "usenet",
+    SHELFARR_DOWNLOAD_CATEGORY,
+)
 CATEGORIES = tuple(
     category
     for base in BASE_CATEGORIES
@@ -345,6 +352,17 @@ class QbittorrentClient:
             raise BootstrapError("qBittorrent returned invalid categories")
         return result
 
+    def torrents(self, category: str) -> list[dict[str, Any]]:
+        result = self.api.get_json(
+            "/api/v2/torrents/info?"
+            + urllib.parse.urlencode({"category": category})
+        )
+        if not isinstance(result, list) or any(
+            not isinstance(item, dict) for item in result
+        ):
+            raise BootstrapError("qBittorrent returned invalid torrent inventory")
+        return result
+
     def create_category(self, name: str, save_path: str) -> None:
         self.api.post_form_response(
             "/api/v2/torrents/createCategory",
@@ -529,7 +547,8 @@ def ensure_download_directories(
 ) -> tuple[Path, ...]:
     torrent_root = torrent_root_from_environment(root, environment)
     directories = tuple(
-        torrent_root / name for name in (*BASE_CATEGORIES, "incomplete")
+        torrent_root / name
+        for name in (*BASE_CATEGORIES, *EXTRA_DOWNLOAD_DIRECTORIES)
     )
     for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
@@ -667,7 +686,7 @@ def configure_qbittorrent(client: Any) -> tuple[int, int]:
 
     current_categories = client.categories()
     category_changes = 0
-    for category in CATEGORIES:
+    for category in (*CATEGORIES, SHELFARR_DOWNLOAD_CATEGORY):
         base_category = category.removesuffix("-imported")
         save_path = f"/downloads/{base_category}"
         current = current_categories.get(category)

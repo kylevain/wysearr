@@ -29,7 +29,7 @@ provider identifiers.
 
 For existing ARR items, Huey reports imported media immediately, leaves an
 already monitored item alone without starting a duplicate search, and monitors
-then searches an existing unmonitored item. For direct media, an exact torrent
+then searches an existing unmonitored item. For BookBot-owned direct media, an exact torrent
 already in the expected category is correlated rather than added again. An
 imported-category record is not called complete until BookBot verifies its safe
 import ledger; another category requires administrator review.
@@ -41,7 +41,7 @@ files. Accepted, rejected, completed, and failed request states go to
 `#download-queue`. ARR API failures remain queued for a later reconciliation
 pass rather than being guessed terminal.
 
-When an ARR or BookBot confirms a new DAS import, Huey publishes the new item to
+When an ARR, Shelfarr, or BookBot confirms a new DAS import, Huey publishes the new item to
 `#recent-additions` and the completed request state to `#request-status` as two
 distinct events. An import failure sends the failed request state to
 `#request-status` and the operator-facing failure or manual-action notice to
@@ -51,9 +51,11 @@ distinct events. An import failure sends the failed request state to
 For movies and TV, completion currently proves that Sonarr or Radarr reports an
 imported media file on the DAS. No Plex scan is yet requested or accepted as
 part of that state, and visibility in Plex is not established. Scan the matching
-Plex library manually until that integration is authorized. For direct media,
-completion proves BookBot's validated, atomic copy to the configured DAS path;
-it does not prove that the downstream library application has indexed the item.
+Plex library manually until that integration is authorized. For ebooks and
+audiobooks while the Shelfarr evaluation flag is enabled, completion proves
+Shelfarr's final DAS publication. For BookBot-owned direct media, it proves
+BookBot's validated atomic copy. Neither state proves that the downstream
+library application has indexed the item.
 
 Huey is the sole Discord notification producer. Native Discord integrations in
 Radarr, Sonarr, Lidarr, and Bazarr remain disabled so lifecycle events cannot
@@ -91,6 +93,12 @@ manual YAML editing or repeated Web UI configuration. `python3 scripts/validate.
 is the non-destructive production acceptance check; it performs live service
 connection tests but does not mutate managed configuration or media. See
 [recovery.md](recovery.md) before restoring databases or rolling back code.
+
+The current ebook/audiobook pilot is documented in
+[shelfarr-evaluation.md](shelfarr-evaluation.md). Shelfarr is never the family
+request UI; Discord and Huey remain the only request interface. Setting
+`SHELFARR_ENABLED=false`, recreating Huey, and stopping Shelfarr/SABnzbd restores
+the preserved BookBot path without changing movie/TV handling.
 
 No secrets are committed. `.env`, service configuration, request databases, and
 private runtime checkpoints remain local and ignored by Git.

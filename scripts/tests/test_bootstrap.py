@@ -136,8 +136,11 @@ class EnvironmentTests(unittest.TestCase):
         directories = bootstrap.ensure_download_directories(
             self.root, {"TORRENT_ROOT": str(torrent_root)}
         )
-        expected = {*bootstrap.BASE_CATEGORIES, "incomplete"}
-        self.assertEqual({path.name for path in directories}, expected)
+        expected = {
+            *(torrent_root / name for name in bootstrap.BASE_CATEGORIES),
+            *(torrent_root / name for name in bootstrap.EXTRA_DOWNLOAD_DIRECTORIES),
+        }
+        self.assertEqual(set(directories), expected)
         self.assertTrue(all(path.is_dir() for path in directories))
 
 
@@ -183,7 +186,7 @@ class QbittorrentTests(unittest.TestCase):
         client = FakeQbitConfigurationClient()
         preference_count, category_count = bootstrap.configure_qbittorrent(client)
         self.assertEqual(preference_count, 6)
-        self.assertEqual(category_count, len(bootstrap.CATEGORIES) - 1)
+        self.assertEqual(category_count, len(bootstrap.CATEGORIES))
         self.assertFalse(client.preference_calls[0]["max_ratio_enabled"])
         self.assertFalse(client.preference_calls[0]["max_seeding_time_enabled"])
         self.assertFalse(
@@ -196,6 +199,10 @@ class QbittorrentTests(unittest.TestCase):
             self.assertEqual(
                 client.current_categories[name]["savePath"], f"/downloads/{base_name}"
             )
+        self.assertEqual(
+            client.current_categories[bootstrap.SHELFARR_DOWNLOAD_CATEGORY]["savePath"],
+            "/downloads/shelfarr",
+        )
 
         mutations = (
             len(client.preference_calls), len(client.created), len(client.edited)

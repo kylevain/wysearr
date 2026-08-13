@@ -32,3 +32,12 @@ def handle_direct(request: dict[str, Any], services: Any | None = None):
     return direct_client(services).submit(
         request["media_type"], request["title"], request.get("author"), request.get("id")
     )
+
+
+def handle_book(request: dict[str, Any], services: Any | None = None):
+    """Use Shelfarr for books when enabled, otherwise preserve direct qBit."""
+
+    resolved = registry(services)
+    if hasattr(resolved, "book"):
+        return resolved.book(request)
+    return handle_direct(request, resolved)

@@ -8,7 +8,7 @@ from unittest.mock import Mock
 HUEY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HUEY_ROOT))
 
-from clients import ServiceError
+from clients import ServiceError, SubmissionUncertain
 from database import RequestStore
 from matching import request_target_key
 from orchestrator import RequestProcessor
@@ -57,6 +57,80 @@ class RequestProcessorTests(unittest.TestCase):
         self.assertEqual(
             [event["event_type"] for event in self.store.events_for(saved["id"])],
             ["received", "processing", "handler_queued"],
+        )
+
+    def test_shelfarr_request_id_and_initial_status_are_correlated(self):
+        dispatcher = Mock(
+            return_value=result(
+                "queued",
+                "Shelfarr accepted Dune",
+                service="shelfarr",
+                external_id="73",
+                external_title="Dune",
+                external_status="pending",
+            )
+        )
+
+        response = RequestProcessor(
+            self.store, services=object(), dispatcher=dispatcher
+        ).process(self.delivery)
+
+        saved = self.store.get_request(response["request_id"])
+        self.assertEqual(saved["service"], "shelfarr")
+        self.assertEqual(saved["external_id"], "73")
+        self.assertEqual(saved["external_status"], "pending")
+
+    def test_shelfarr_dispatch_marks_intended_service_before_remote_call(self):
+        observed = {}
+
+        class EnabledServices:
+            shelfarr_enabled = True
+
+        def dispatcher(request, _services):
+            observed.update(self.store.get_request(request["id"]))
+            return result(
+                "queued",
+                "Shelfarr accepted Dune",
+                service="shelfarr",
+                external_id="73",
+                external_title="Dune",
+                external_status="pending",
+            )
+
+        RequestProcessor(
+            self.store, services=EnabledServices(), dispatcher=dispatcher
+        ).process(self.delivery)
+
+        self.assertEqual(observed["status"], "processing")
+        self.assertEqual(observed["service"], "shelfarr")
+
+    def test_uncertain_shelfarr_submission_remains_active_for_recovery(self):
+        class EnabledServices:
+            shelfarr_enabled = True
+
+        def uncertain(_request, _services):
+            raise SubmissionUncertain("outcome unknown")
+
+        response = RequestProcessor(
+            self.store,
+            services=EnabledServices(),
+            dispatcher=uncertain,
+        ).process(self.delivery)
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["service"], "shelfarr")
+        self.assertEqual(response["external_status"], "submission_uncertain")
+        saved = self.store.get_request(response["request_id"])
+        self.assertEqual(saved["status"], "queued")
+        self.assertEqual(saved["service"], "shelfarr")
+        self.assertIsNone(saved["external_id"])
+        self.assertEqual(
+            self.store.events_for(saved["id"])[-1]["event_type"],
+            "shelfarr_submission_uncertain",
+        )
+        self.assertEqual(
+            [row["id"] for row in self.store.uncertain_shelfarr_requests()],
+            [saved["id"]],
         )
 
     def test_duplicate_delivery_returns_existing_without_dispatch(self):

@@ -23,8 +23,10 @@ from services import ServiceRegistry
 from huey import (
     build_client,
     notification_loop,
+    shelfarr_reconciliation_loop,
     reconcile_arr_requests,
     reconcile_notifications,
+    reconcile_shelfarr_requests,
     validate_discord_channels,
 )
 
@@ -222,6 +224,74 @@ class ServiceRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be positive"):
             services.direct()
 
+    def test_shelfarr_disabled_preserves_existing_direct_book_path(self):
+        services = ServiceRegistry({"SHELFARR_ENABLED": "false"})
+        direct = Mock()
+        direct.submit.return_value = result(
+            "queued", "Queued in qBittorrent", service="qbittorrent"
+        )
+        services._clients["direct"] = direct
+        request = {
+            "id": 42,
+            "media_type": "ebooks",
+            "title": "Dune",
+            "author": "Frank Herbert",
+        }
+
+        response = services.book(request)
+
+        self.assertEqual(response["service"], "qbittorrent")
+        direct.submit.assert_called_once_with(
+            "ebooks", "Dune", "Frank Herbert", 42
+        )
+        self.assertNotIn("shelfarr", services._clients)
+
+    def test_shelfarr_enabled_routes_only_book_requests(self):
+        services = ServiceRegistry(
+            {"SHELFARR_ENABLED": "true", "SHELFARR_API_TOKEN": "shf_secret"}
+        )
+        shelfarr = Mock()
+        shelfarr.submit.return_value = result(
+            "queued", "Queued in Shelfarr", service="shelfarr", external_id="73"
+        )
+        radarr = Mock()
+        radarr.submit.return_value = result(
+            "queued", "Queued in Radarr", service="radarr", external_id="44"
+        )
+        services._clients.update({"shelfarr": shelfarr, "radarr": radarr})
+
+        book = services.book(
+            {
+                "id": 42,
+                "media_type": "audiobooks",
+                "title": "Dune",
+                "author": "Frank Herbert",
+                "discord_user_id": "1001",
+                "channel_id": "2002",
+            }
+        )
+        movie = HANDLERS["movies-tv"](
+            {"kind": "movie", "title": "Arrival"}, services
+        )
+
+        self.assertEqual(book["service"], "shelfarr")
+        self.assertEqual(movie["service"], "radarr")
+        shelfarr.submit.assert_called_once_with(
+            "audiobooks",
+            "Dune",
+            "Frank Herbert",
+            42,
+            discord_user_id="1001",
+            discord_channel_id="2002",
+        )
+        radarr.submit.assert_called_once_with("Arrival")
+
+    def test_invalid_shelfarr_feature_flag_fails_closed(self):
+        for value in ("sometimes", "1", "yes", "on", "TRUE"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "SHELFARR_ENABLED"):
+                    ServiceRegistry({"SHELFARR_ENABLED": value})
+
 
 class FakeMessage:
     def __init__(self):
@@ -348,6 +418,31 @@ class FakeArrCompletionClient:
         return self.outcome
 
 
+class FakeShelfarrCompletionClient:
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.request_ids = []
+        self.cancelled_ids = []
+
+    def get_request(self, request_id):
+        self.request_ids.append(request_id)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+    def cancel_request(self, request_id):
+        self.cancelled_ids.append(request_id)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return {**self.outcome, "status": "failed", "attention_needed": False}
+
+    def recover_request(self, request_id):
+        self.request_ids.append(request_id)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
 class FakeServices:
     def __init__(self, clients):
         self.clients = clients
@@ -356,6 +451,10 @@ class FakeServices:
     def arr(self, service):
         self.requested.append(service)
         return self.clients[service]
+
+    def shelfarr(self):
+        self.requested.append("shelfarr")
+        return self.clients["shelfarr"]
 
 
 class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
@@ -385,6 +484,27 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         # default executor cannot shut down worker threads cleanly.
         with patch("huey.asyncio.to_thread", new=direct_call):
             return await reconcile_notifications(client, config, self.store)
+
+    def queue_shelfarr(self, external_status="pending"):
+        self.store.transition(
+            self.request["id"],
+            "queued",
+            "Queued in Shelfarr",
+            service="shelfarr",
+            external_id="73",
+            external_status=external_status,
+            external_title="Dune",
+        )
+
+    def queue_uncertain_shelfarr(self):
+        self.store.transition(
+            self.request["id"],
+            "queued",
+            "Shelfarr submission is awaiting correlation recovery",
+            event_type="shelfarr_submission_uncertain",
+            service="shelfarr",
+            external_status="submission_uncertain",
+        )
 
     async def test_bookbot_completion_routes_status_and_addition_once_without_reply(self):
         self.store.transition(
@@ -564,7 +684,633 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get_request(self.request["id"])["status"], "queued")
         self.assertTrue(any("deferred" in line for line in logs.output))
 
-    async def test_notification_loop_probes_arr_before_terminal_notifications(self):
+    async def test_shelfarr_intermediate_states_are_delivered_once(self):
+        self.queue_shelfarr()
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "downloading",
+                "attention_needed": False,
+                "issue_description": None,
+                "book": {"title": "Dune", "book_type": "ebook"},
+            }
+        )
+        services = FakeServices({"shelfarr": shelfarr})
+        queue_channel = FakeChannel()
+        config = validate_channel_config(channel_mapping())
+        client = FakeClient({20: queue_channel})
+
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 1)
+        await self.reconcile(client, config)
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 0)
+        await self.reconcile(client, config)
+        self.assertEqual(len(queue_channel.sent), 1)
+        self.assertIn("actively downloading", queue_channel.sent[0])
+
+        shelfarr.outcome = {
+            **shelfarr.outcome,
+            "status": "processing",
+        }
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 1)
+        await self.reconcile(client, config)
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 0)
+        await self.reconcile(client, config)
+        self.assertEqual(len(queue_channel.sent), 2)
+        self.assertIn("validating and importing", queue_channel.sent[1])
+        saved = self.store.get_request(self.request["id"])
+        self.assertEqual(saved["status"], "queued")
+        self.assertEqual(saved["external_status"], "processing")
+
+    async def test_interrupted_shelfarr_dispatch_recovers_original_request_id(self):
+        self.store.transition(
+            self.request["id"],
+            "processing",
+            "Dispatching to Shelfarr",
+            service="shelfarr",
+        )
+        self.store.initialize()
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "searching",
+                "attention_needed": False,
+                "issue_description": None,
+                "book": {"title": "Dune", "book_type": "ebook"},
+            }
+        )
+
+        self.assertEqual(
+            reconcile_shelfarr_requests(
+                self.store, FakeServices({"shelfarr": shelfarr})
+            ),
+            1,
+        )
+        saved = self.store.get_request(self.request["id"])
+        self.assertEqual(saved["status"], "queued")
+        self.assertEqual(saved["external_id"], "73")
+        self.assertEqual(saved["external_status"], "searching")
+        self.assertEqual(shelfarr.request_ids[0], self.request["id"])
+        self.assertEqual(
+            [event["event_type"] for event in self.store.events_for(self.request["id"])].count(
+                "shelfarr_recovered"
+            ),
+            1,
+        )
+        recovered_deliveries = self.store.pending_notification_deliveries()
+        self.assertCountEqual(
+            [row["event_key"] for row in recovered_deliveries],
+            ["request_accepted", "download_queued"],
+        )
+
+    async def test_interrupted_shelfarr_dispatch_repeated_absence_stays_owned_then_recovers(self):
+        self.store.transition(
+            self.request["id"],
+            "processing",
+            "Dispatching to Shelfarr",
+            service="shelfarr",
+        )
+        self.store.initialize()
+        shelfarr = FakeShelfarrCompletionClient(None)
+        services = FakeServices({"shelfarr": shelfarr})
+
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 0)
+        restarted = RequestStore(self.store.path)
+        restarted.initialize()
+        self.assertEqual(reconcile_shelfarr_requests(restarted, services), 0)
+
+        pending = restarted.get_request(self.request["id"])
+        self.assertEqual(pending["status"], "processing")
+        self.assertEqual(pending["service"], "shelfarr")
+        self.assertIsNone(pending["external_id"])
+        self.assertEqual(
+            [row["id"] for row in restarted.interrupted_shelfarr_requests()],
+            [self.request["id"]],
+        )
+        event_types = [
+            event["event_type"] for event in restarted.events_for(self.request["id"])
+        ]
+        self.assertNotIn("startup_reconciled", event_types)
+        self.assertNotIn("shelfarr_submission_failed", event_types)
+        self.assertEqual(restarted.pending_notifications(), [])
+        alerts = restarted.pending_notification_deliveries()
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["event_key"], "recovery_uncertain")
+        self.assertEqual(alerts[0]["route"], "system-health")
+
+        shelfarr.outcome = {
+            "id": 73,
+            "status": "searching",
+            "attention_needed": False,
+            "issue_description": None,
+            "book": {"title": "Dune", "book_type": "ebook"},
+        }
+        self.assertEqual(reconcile_shelfarr_requests(restarted, services), 1)
+        recovered = restarted.get_request(self.request["id"])
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["service"], "shelfarr")
+        self.assertEqual(recovered["external_id"], "73")
+        self.assertEqual(recovered["external_status"], "searching")
+        self.assertEqual(restarted.interrupted_shelfarr_requests(), [])
+        self.assertEqual(
+            [row["id"] for row in restarted.queued_shelfarr_requests()],
+            [self.request["id"]],
+        )
+        event_types = [
+            event["event_type"] for event in restarted.events_for(self.request["id"])
+        ]
+        self.assertEqual(event_types.count("shelfarr_recovered"), 1)
+        self.assertNotIn("startup_reconciled", event_types)
+        self.assertEqual(shelfarr.cancelled_ids, [])
+        self.assertCountEqual(
+            [
+                row["event_key"]
+                for row in restarted.pending_notification_deliveries()
+            ],
+            ["recovery_uncertain", "request_accepted", "download_queued"],
+        )
+        self.assertTrue(shelfarr.request_ids)
+        self.assertEqual(
+            set(shelfarr.request_ids),
+            {self.request["id"], "73"},
+        )
+
+    async def test_shelfarr_completion_routes_status_and_addition(self):
+        self.queue_shelfarr("processing")
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "completed",
+                "attention_needed": False,
+                "issue_description": None,
+                "book": {"title": "Dune"},
+            }
+        )
+        services = FakeServices({"shelfarr": shelfarr})
+
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 1)
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 0)
+        saved = self.store.get_request(self.request["id"])
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["external_status"], "completed")
+        self.assertEqual(
+            [event["event_type"] for event in self.store.events_for(self.request["id"])].count(
+                "shelfarr_completed"
+            ),
+            1,
+        )
+
+        status_channel = FakeChannel()
+        addition_channel = FakeChannel()
+        await self.reconcile(
+            FakeClient({21: status_channel, 22: addition_channel}),
+            validate_channel_config(channel_mapping()),
+        )
+        self.assertEqual(len(status_channel.sent), 1)
+        self.assertEqual(len(addition_channel.sent), 1)
+        self.assertIn("by Shelfarr", " ".join(status_channel.sent + addition_channel.sent))
+
+    async def test_shelfarr_attention_failure_routes_status_and_import_error(self):
+        self.queue_shelfarr("searching")
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "failed",
+                "attention_needed": True,
+                "issue_description": "All automatic candidates were exhausted",
+                "book": {"title": "Dune"},
+            }
+        )
+
+        self.assertEqual(
+            reconcile_shelfarr_requests(
+                self.store, FakeServices({"shelfarr": shelfarr})
+            ),
+            1,
+        )
+        saved = self.store.get_request(self.request["id"])
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["error"], "All automatic candidates were exhausted")
+        status_channel = FakeChannel()
+        error_channel = FakeChannel()
+        await self.reconcile(
+            FakeClient({21: status_channel, 30: error_channel}),
+            validate_channel_config(channel_mapping()),
+        )
+        self.assertEqual(len(status_channel.sent), 1)
+        self.assertEqual(len(error_channel.sent), 1)
+        self.assertIn("All automatic candidates were exhausted", error_channel.sent[0])
+
+    async def test_shelfarr_plain_acquisition_failure_is_request_status_only(self):
+        self.queue_shelfarr("searching")
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "failed",
+                "attention_needed": False,
+                "issue_description": "All automatic candidates were exhausted",
+                "book": {"title": "Dune"},
+            }
+        )
+
+        self.assertEqual(
+            reconcile_shelfarr_requests(
+                self.store, FakeServices({"shelfarr": shelfarr})
+            ),
+            1,
+        )
+        status_channel = FakeChannel()
+        error_channel = FakeChannel()
+        await self.reconcile(
+            FakeClient({21: status_channel, 30: error_channel}),
+            validate_channel_config(channel_mapping()),
+        )
+        self.assertEqual(len(status_channel.sent), 1)
+        self.assertEqual(error_channel.sent, [])
+
+    async def test_shelfarr_write_failure_routes_import_error_without_processing_poll(self):
+        self.queue_shelfarr("searching")
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "failed",
+                "attention_needed": False,
+                "issue_description": (
+                    "Direct download could not write to the configured library storage"
+                ),
+                "book": {"title": "Dune"},
+            }
+        )
+
+        self.assertEqual(
+            reconcile_shelfarr_requests(
+                self.store, FakeServices({"shelfarr": shelfarr})
+            ),
+            1,
+        )
+        status_channel = FakeChannel()
+        error_channel = FakeChannel()
+        await self.reconcile(
+            FakeClient({21: status_channel, 30: error_channel}),
+            validate_channel_config(channel_mapping()),
+        )
+        self.assertEqual(len(status_channel.sent), 1)
+        self.assertEqual(len(error_channel.sent), 1)
+
+    async def test_shelfarr_post_processing_failure_routes_import_error(self):
+        self.queue_shelfarr("processing")
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "failed",
+                "attention_needed": True,
+                "issue_description": "Final import validation failed",
+                "book": {"title": "Dune"},
+            }
+        )
+
+        self.assertEqual(
+            reconcile_shelfarr_requests(
+                self.store, FakeServices({"shelfarr": shelfarr})
+            ),
+            1,
+        )
+        status_channel = FakeChannel()
+        error_channel = FakeChannel()
+        await self.reconcile(
+            FakeClient({21: status_channel, 30: error_channel}),
+            validate_channel_config(channel_mapping()),
+        )
+        self.assertEqual(len(status_channel.sent), 1)
+        self.assertEqual(len(error_channel.sent), 1)
+        self.assertIn("Final import validation failed", error_channel.sent[0])
+
+    async def test_shelfarr_retryable_not_found_remains_queued(self):
+        self.queue_shelfarr("searching")
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "not_found",
+                "attention_needed": False,
+                "issue_description": None,
+                "book": {"title": "Dune"},
+            }
+        )
+        self.assertEqual(
+            reconcile_shelfarr_requests(
+                self.store, FakeServices({"shelfarr": shelfarr})
+            ),
+            1,
+        )
+        saved = self.store.get_request(self.request["id"])
+        self.assertEqual(saved["status"], "queued")
+        self.assertEqual(saved["external_status"], "not_found")
+        self.assertEqual(self.store.pending_notification_deliveries(), [])
+
+    async def test_shelfarr_purchase_only_result_is_cancelled_with_specific_reason(self):
+        self.queue_shelfarr("searching")
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "awaiting_purchase",
+                "attention_needed": True,
+                "issue_description": None,
+                "book": {"title": "Dune"},
+            }
+        )
+
+        self.assertEqual(
+            reconcile_shelfarr_requests(
+                self.store, FakeServices({"shelfarr": shelfarr})
+            ),
+            1,
+        )
+        saved = self.store.get_request(self.request["id"])
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["external_status"], "failed")
+        self.assertIn("purchase/manual-upload", saved["error"])
+
+    async def test_shelfarr_attention_is_cancelled_before_terminal_failure(self):
+        self.queue_shelfarr("searching")
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "searching",
+                "attention_needed": True,
+                "issue_description": "Administrator review required",
+                "book": {"title": "Dune"},
+            }
+        )
+
+        self.assertEqual(
+            reconcile_shelfarr_requests(
+                self.store, FakeServices({"shelfarr": shelfarr})
+            ),
+            1,
+        )
+        self.assertEqual(shelfarr.cancelled_ids, ["73"])
+        saved = self.store.get_request(self.request["id"])
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["external_status"], "failed")
+        self.assertEqual(saved["error"], "Administrator review required")
+        events = self.store.events_for(self.request["id"])
+        self.assertEqual(events[-1]["event_type"], "shelfarr_manual_intervention")
+        status_channel = FakeChannel()
+        error_channel = FakeChannel()
+        await self.reconcile(
+            FakeClient({21: status_channel, 30: error_channel}),
+            validate_channel_config(channel_mapping()),
+        )
+        self.assertEqual(len(status_channel.sent), 1)
+        self.assertEqual(len(error_channel.sent), 1)
+        self.assertIn("Manual review required", error_channel.sent[0])
+
+    async def test_uncertain_submission_recovers_original_huey_id_after_outage(self):
+        self.queue_uncertain_shelfarr()
+        shelfarr = FakeShelfarrCompletionClient(ServiceError("temporary outage"))
+        services = FakeServices({"shelfarr": shelfarr})
+
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 0)
+        pending = self.store.get_request(self.request["id"])
+        self.assertEqual(pending["external_status"], "submission_uncertain")
+        self.assertIsNone(pending["external_id"])
+
+        shelfarr.outcome = {
+            "id": 73,
+            "status": "pending",
+            "attention_needed": False,
+            "book": {"title": "Dune", "book_type": "ebook"},
+        }
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 1)
+        recovered = self.store.get_request(self.request["id"])
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["service"], "shelfarr")
+        self.assertEqual(recovered["external_id"], "73")
+        self.assertEqual(recovered["external_status"], "pending")
+        self.assertEqual(
+            self.store.events_for(self.request["id"])[-1]["event_type"],
+            "shelfarr_recovered",
+        )
+        self.assertCountEqual(
+            [
+                row["event_key"]
+                for row in self.store.pending_notification_deliveries()
+            ],
+            ["request_accepted", "download_queued"],
+        )
+
+    async def test_uncertain_submission_repeated_absence_stays_owned_then_recovers(self):
+        self.queue_uncertain_shelfarr()
+        shelfarr = FakeShelfarrCompletionClient(None)
+        services = FakeServices({"shelfarr": shelfarr})
+
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 0)
+        restarted = RequestStore(self.store.path)
+        restarted.initialize()
+        self.assertEqual(reconcile_shelfarr_requests(restarted, services), 0)
+
+        pending = restarted.get_request(self.request["id"])
+        self.assertEqual(pending["status"], "queued")
+        self.assertEqual(pending["service"], "shelfarr")
+        self.assertIsNone(pending["external_id"])
+        self.assertEqual(pending["external_status"], "submission_uncertain")
+        self.assertEqual(
+            [row["id"] for row in restarted.uncertain_shelfarr_requests()],
+            [self.request["id"]],
+        )
+        event_types = [
+            event["event_type"] for event in restarted.events_for(self.request["id"])
+        ]
+        self.assertNotIn("shelfarr_submission_failed", event_types)
+        self.assertNotIn("startup_reconciled", event_types)
+        self.assertEqual(restarted.pending_notifications(), [])
+        alerts = restarted.pending_notification_deliveries()
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["event_key"], "submission_uncertain")
+        self.assertEqual(alerts[0]["route"], "import-errors")
+
+        shelfarr.outcome = {
+            "id": 73,
+            "status": "pending",
+            "attention_needed": False,
+            "issue_description": None,
+            "book": {"title": "Dune", "book_type": "ebook"},
+        }
+        self.assertEqual(reconcile_shelfarr_requests(restarted, services), 1)
+        recovered = restarted.get_request(self.request["id"])
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["service"], "shelfarr")
+        self.assertEqual(recovered["external_id"], "73")
+        self.assertEqual(recovered["external_status"], "pending")
+        self.assertEqual(restarted.uncertain_shelfarr_requests(), [])
+        self.assertEqual(
+            [row["id"] for row in restarted.queued_shelfarr_requests()],
+            [self.request["id"]],
+        )
+        event_types = [
+            event["event_type"] for event in restarted.events_for(self.request["id"])
+        ]
+        self.assertEqual(
+            event_types.count("shelfarr_recovered"),
+            1,
+        )
+        self.assertNotIn("shelfarr_submission_failed", event_types)
+        self.assertEqual(shelfarr.cancelled_ids, [])
+        self.assertCountEqual(
+            [
+                row["event_key"]
+                for row in restarted.pending_notification_deliveries()
+            ],
+            ["submission_uncertain", "request_accepted", "download_queued"],
+        )
+        self.assertTrue(shelfarr.request_ids)
+        self.assertEqual(
+            set(shelfarr.request_ids),
+            {self.request["id"], "73"},
+        )
+
+    async def test_uncertain_submission_wrong_format_stays_quarantined(self):
+        self.queue_uncertain_shelfarr()
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "pending",
+                "attention_needed": False,
+                "book": {"title": "Dune", "book_type": "audiobook"},
+            }
+        )
+        services = FakeServices({"shelfarr": shelfarr})
+
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 0)
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 0)
+        pending = self.store.get_request(self.request["id"])
+        self.assertEqual(pending["status"], "queued")
+        self.assertEqual(pending["service"], "shelfarr")
+        self.assertIsNone(pending["external_id"])
+        self.assertEqual(pending["external_status"], "submission_uncertain")
+        self.assertEqual(
+            [row["id"] for row in self.store.uncertain_shelfarr_requests()],
+            [self.request["id"]],
+        )
+        deliveries = self.store.pending_notification_deliveries()
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(deliveries[0]["event_key"], "submission_uncertain")
+        self.assertEqual(deliveries[0]["route"], "import-errors")
+        self.assertIn("unexpected book format", deliveries[0]["message"])
+        self.assertEqual(shelfarr.cancelled_ids, [])
+
+    async def test_shelfarr_processing_attention_routes_import_error_if_poll_was_missed(self):
+        self.queue_shelfarr("downloading")
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "processing",
+                "attention_needed": True,
+                "issue_description": "Final import validation failed",
+                "book": {"title": "Dune"},
+            }
+        )
+
+        self.assertEqual(
+            reconcile_shelfarr_requests(
+                self.store, FakeServices({"shelfarr": shelfarr})
+            ),
+            1,
+        )
+        self.assertEqual(shelfarr.cancelled_ids, ["73"])
+        events = self.store.events_for(self.request["id"])
+        self.assertEqual(events[-1]["event_type"], "shelfarr_import_failed")
+        status_channel = FakeChannel()
+        error_channel = FakeChannel()
+        await self.reconcile(
+            FakeClient({21: status_channel, 30: error_channel}),
+            validate_channel_config(channel_mapping()),
+        )
+        self.assertEqual(len(status_channel.sent), 1)
+        self.assertEqual(len(error_channel.sent), 1)
+
+    async def test_recoverable_processing_attention_alerts_once_then_completes(self):
+        self.queue_shelfarr("downloading")
+
+        class RecoverableShelfarr(FakeShelfarrCompletionClient):
+            def __init__(self):
+                super().__init__(None)
+                self.completed = False
+
+            def get_request(self, request_id):
+                self.request_ids.append(request_id)
+                if self.completed:
+                    return {
+                        "id": 73,
+                        "status": "completed",
+                        "attention_needed": False,
+                        "book": {"title": "Dune"},
+                    }
+                return {
+                    "id": 73,
+                    "status": "processing",
+                    "attention_needed": True,
+                    "issue_description": "Final import validation failed",
+                    "book": {"title": "Dune"},
+                }
+
+            def cancel_request(self, request_id):
+                self.cancelled_ids.append(request_id)
+                raise ServiceError("recovery owner retained request")
+
+        shelfarr = RecoverableShelfarr()
+        services = FakeServices({"shelfarr": shelfarr})
+
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 1)
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 0)
+        pending = self.store.pending_notification_deliveries()
+        alerts = [row for row in pending if row["event_key"] == "import_failed"]
+        self.assertEqual(len(alerts), 1)
+        saved = self.store.get_request(self.request["id"])
+        self.assertEqual(saved["status"], "queued")
+        self.assertEqual(saved["external_status"], "processing")
+
+        shelfarr.completed = True
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 1)
+        completed = self.store.get_request(self.request["id"])
+        self.assertEqual(completed["status"], "completed")
+
+    async def test_unconfirmed_attention_cancellation_still_alerts_import_errors(self):
+        self.queue_shelfarr("downloading")
+
+        class UnconfirmedShelfarr(FakeShelfarrCompletionClient):
+            def cancel_request(self, request_id):
+                self.cancelled_ids.append(request_id)
+                return {
+                    "id": 73,
+                    "status": "processing",
+                    "attention_needed": True,
+                }
+
+        shelfarr = UnconfirmedShelfarr(
+            {
+                "id": 73,
+                "status": "processing",
+                "attention_needed": True,
+                "issue_description": "Final import validation failed",
+                "book": {"title": "Dune"},
+            }
+        )
+        self.assertEqual(
+            reconcile_shelfarr_requests(
+                self.store, FakeServices({"shelfarr": shelfarr})
+            ),
+            1,
+        )
+        saved = self.store.get_request(self.request["id"])
+        self.assertEqual(saved["status"], "queued")
+        alerts = [
+            row
+            for row in self.store.pending_notification_deliveries()
+            if row["event_key"] == "import_failed"
+        ]
+        self.assertEqual(len(alerts), 1)
+
+    async def test_notification_loop_delivers_arr_without_waiting_for_shelfarr(self):
         client = Mock()
         client.is_closed.return_value = False
         config = validate_channel_config(channel_mapping())
@@ -588,6 +1334,31 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await notification_loop(client, config, self.store, object(), 30)
         self.assertEqual(order, ["arr", "notifications"])
+
+    async def test_shelfarr_reconciliation_runs_in_independent_loop(self):
+        client = Mock()
+        client.is_closed.return_value = False
+        order = []
+
+        async def stop_after_cycle(_seconds):
+            raise asyncio.CancelledError
+
+        with (
+            patch(
+                "huey.reconcile_shelfarr_requests",
+                side_effect=lambda _store, _services: order.append("shelfarr"),
+            ),
+            patch(
+                "huey.asyncio.to_thread",
+                new=AsyncMock(side_effect=lambda fn, *args: fn(*args)),
+            ),
+            patch("huey.asyncio.sleep", side_effect=stop_after_cycle),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await shelfarr_reconciliation_loop(
+                    client, self.store, object(), 30
+                )
+        self.assertEqual(order, ["shelfarr"])
 
 
 class DiscordAcknowledgementTests(unittest.IsolatedAsyncioTestCase):

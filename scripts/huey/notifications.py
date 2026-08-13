@@ -28,6 +28,8 @@ EVENT_ROUTES = {
     "library_imported": "recent-additions",
     "import_failed": "import-errors",
     "manual_intervention": "import-errors",
+    "submission_uncertain": "import-errors",
+    "recovery_uncertain": "system-health",
     "system_health": "system-health",
 }
 
@@ -76,11 +78,106 @@ def _safe_failure_detail(request: Mapping[str, Any]) -> str:
     raw = request.get("error")
     detail = sanitize_display_text(raw, limit=500)
     if not detail or _SENSITIVE_DETAIL.search(str(raw or "")):
+        services = (
+            "Huey and Shelfarr"
+            if str(request.get("service") or "").casefold() == "shelfarr"
+            else "Huey and BookBot"
+        )
         return (
             "The import or acquisition failed. An administrator should review "
-            "Huey and BookBot logs."
+            f"{services} logs."
         )
     return detail
+
+
+def shelfarr_state_notifications(
+    request: Mapping[str, Any], external_status: str
+) -> tuple[RoutedNotification, ...]:
+    """Plan non-terminal Shelfarr download lifecycle updates.
+
+    Initial acceptance already stages ``download_queued``.  Only the first
+    observed download and post-processing states add another outbox event;
+    terminal status and library notifications remain the responsibility of
+    :func:`terminal_notifications`.
+    """
+
+    request_id = _request_id(request)
+    title = safe_display_title(request.get("external_title"), request.get("title"))
+    status = external_status.strip().casefold()
+    if status == "downloading":
+        return (
+            _plan(
+                "download_active",
+                f"⬇️ Request #{request_id} is actively downloading through Shelfarr: {title}.",
+            ),
+        )
+    if status == "processing":
+        return (
+            _plan(
+                "download_completed",
+                f"📥 Request #{request_id} finished downloading; Shelfarr is validating "
+                f"and importing {title}.",
+            ),
+        )
+    return ()
+
+
+def shelfarr_attention_notification(
+    request: Mapping[str, Any], *, import_failure: bool
+) -> RoutedNotification:
+    """Plan one durable alert while Shelfarr retains a recoverable request."""
+
+    request_id = _request_id(request)
+    title = safe_display_title(request.get("external_title"), request.get("title"))
+    detail = _safe_failure_detail(request)
+    if import_failure:
+        return _plan(
+            "import_failed",
+            f"🛠️ Import failure for request #{request_id}: {title}. "
+            f"Shelfarr retained the request for recovery. {detail}",
+        )
+    return _plan(
+        "manual_intervention",
+        f"🛠️ Manual review required for request #{request_id}: {title}. {detail}",
+    )
+
+
+def shelfarr_correlation_attention_notification(
+    request: Mapping[str, Any], *, startup: bool, format_mismatch: bool = False
+) -> RoutedNotification:
+    """Alert once while an ambiguous Shelfarr submission stays quarantined.
+
+    An empty correlation lookup cannot prove that Shelfarr rejected a request:
+    the request-creation transaction may still be completing.  Huey therefore
+    keeps the exact target active and blocks automatic resubmission until the
+    correlation appears or an administrator resolves it.
+    """
+
+    request_id = _request_id(request)
+    title = safe_display_title(request.get("external_title"), request.get("title"))
+    if startup:
+        problem = (
+            "Shelfarr restored a correlation with an unexpected book format"
+            if format_mismatch
+            else "Huey could not yet restore Shelfarr correlation"
+        )
+        return _plan(
+            "recovery_uncertain",
+            f"⚠️ {problem} for request #{request_id} after a restart: "
+            f"{title}. Automatic retry remains "
+            "blocked; an administrator should review Shelfarr and Huey health.",
+        )
+    problem = (
+        "Shelfarr returned a correlation with an unexpected book format for"
+        if format_mismatch
+        else "Huey cannot yet confirm whether Shelfarr created a request for"
+    )
+    return _plan(
+        "submission_uncertain",
+        f"🛠️ Manual review required for request #{request_id}: {problem} "
+        f"{title}. Automatic retry remains "
+        "blocked to prevent duplicate acquisition.",
+    )
 
 
 def response_notifications(
@@ -108,6 +205,19 @@ def response_notifications(
     service = _service_name({**dict(request), **dict(response)})
     response_detail = sanitize_display_text(response.get("message"), limit=500)
 
+    if (
+        status == "queued"
+        and str(response.get("external_status") or "").casefold()
+        == "submission_uncertain"
+    ):
+        # Huey owns and deduplicates the request, but Shelfarr acceptance is
+        # not yet known.  Do not claim an accepted/queued acquisition.
+        return (
+            shelfarr_correlation_attention_notification(
+                {**dict(request), **dict(response)}, startup=False
+            ),
+        )
+
     if status == "queued":
         accepted = _plan(
             "request_accepted",
@@ -118,7 +228,16 @@ def response_notifications(
             "download_queued",
             f"⬇️ Request #{request_id} queued for acquisition: {queue_detail}",
         )
-        return (accepted, queued)
+        plans = [accepted, queued]
+        if response.get("manual_intervention") is True:
+            plans.append(
+                _plan(
+                    "manual_intervention",
+                    f"🛠️ Manual review required for request #{request_id}: "
+                    f"{title}. {queue_detail}",
+                )
+            )
+        return tuple(plans)
     if status == "needs_selection":
         detail = response_detail or "The request needs a more specific title."
         plans = [
@@ -188,6 +307,11 @@ def terminal_notifications(
                 f"✅ Request #{request_id} complete: {title} was imported to its "
                 f"DAS library path by {service}."
             )
+        elif service_key == "shelfarr":
+            completed_message = (
+                f"✅ Request #{request_id} complete: {title} was imported to its "
+                "DAS library path by Shelfarr."
+            )
         else:
             completed_message = (
                 f"✅ Request #{request_id} complete: {title} was safely imported "
@@ -199,6 +323,11 @@ def terminal_notifications(
                 addition_message = (
                     f"📚 New library item from request #{request_id}: {title} was "
                     f"imported to its DAS library path by {service}."
+                )
+            elif service_key == "shelfarr":
+                addition_message = (
+                    f"📚 New library item from request #{request_id}: {title} was "
+                    "imported to its DAS library path by Shelfarr."
                 )
             else:
                 addition_message = (
@@ -215,7 +344,11 @@ def terminal_notifications(
             f"❌ Request #{request_id} failed: {title}. {detail}",
         )
     ]
-    is_import_failure = terminal_event in {"failed", "bookbot_failed"} or (
+    is_import_failure = terminal_event in {
+        "failed",
+        "bookbot_failed",
+        "shelfarr_import_failed",
+    } or (
         not terminal_event and service_key == "bookbot"
     )
     if is_import_failure:
@@ -224,6 +357,14 @@ def terminal_notifications(
                 "import_failed",
                 f"🛠️ Import failure for request #{request_id}: {title}. "
                 f"Manual review is required. {detail}",
+            )
+        )
+    elif terminal_event == "shelfarr_manual_intervention":
+        plans.append(
+            _plan(
+                "manual_intervention",
+                f"🛠️ Manual review required for request #{request_id}: {title}. "
+                f"{detail}",
             )
         )
     elif terminal_event == "startup_reconciled":

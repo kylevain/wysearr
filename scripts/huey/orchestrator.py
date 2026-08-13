@@ -7,7 +7,7 @@ import re
 from typing import Any, Callable, Mapping
 
 try:
-    from .clients import ServiceError
+    from .clients import ServiceError, SubmissionUncertain
     from .database import RequestStore
     from .handlers import dispatch
     from .matching import request_target_key
@@ -15,7 +15,7 @@ try:
     from .results import normalize_result, result
     from .services import ServiceRegistry
 except ImportError:  # pragma: no cover - direct container entrypoint
-    from clients import ServiceError
+    from clients import ServiceError, SubmissionUncertain
     from database import RequestStore
     from handlers import dispatch
     from matching import request_target_key
@@ -142,12 +142,34 @@ class RequestProcessor:
             return self._duplicate_result(record, message_id)
 
         request_id = record["id"]
-        self.store.transition(request_id, "processing", "Dispatching request to acquisition service")
+        intended_service = (
+            "shelfarr"
+            if media_type in {"ebooks", "audiobooks"}
+            and getattr(self.services, "shelfarr_enabled", False)
+            else None
+        )
+        self.store.transition(
+            request_id,
+            "processing",
+            "Dispatching request to acquisition service",
+            service=intended_service,
+        )
         request = dict(record)
         request.update(parsed)
 
         try:
             handler_result = normalize_result(dict(self.dispatcher(request, self.services)))
+        except SubmissionUncertain:
+            LOGGER.warning(
+                "Request %s Shelfarr submission outcome requires correlation recovery",
+                request_id,
+            )
+            handler_result = result(
+                "queued",
+                "Shelfarr submission is being reconciled before any retry is allowed.",
+                service="shelfarr",
+                external_status="submission_uncertain",
+            )
         except ServiceError as error:
             safe_message = _safe_service_message(error)
             LOGGER.warning("Request %s service failure: %s", request_id, safe_message)
@@ -168,14 +190,20 @@ class RequestProcessor:
             )
 
         error_message = handler_result["message"] if handler_result["status"] == "failed" else None
+        event_type = (
+            "shelfarr_submission_uncertain"
+            if handler_result["external_status"] == "submission_uncertain"
+            else f"handler_{handler_result['status']}"
+        )
         self.store.transition(
             request_id,
             handler_result["status"],
             handler_result["message"],
-            event_type=f"handler_{handler_result['status']}",
+            event_type=event_type,
             service=handler_result["service"],
             external_id=handler_result["external_id"],
             external_title=handler_result["external_title"],
+            external_status=handler_result["external_status"],
             error=error_message,
         )
         handler_result.update({"request_id": request_id, "duplicate": False})

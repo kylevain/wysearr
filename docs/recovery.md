@@ -14,21 +14,37 @@ git status --short
 Each deployment creates a matching `pre-deploy-<id>` checkpoint before changing
 containers and a `post-deploy-<id>` checkpoint only after production validation
 succeeds. A checkpoint contains a Git HEAD, selected configuration, `.env`,
-SQLite-backup-API copies, bounded qBittorrent `BT_backup` resume metadata, and a
-SHA-256 manifest. Verification checks every manifest hash, rejects extra files
-and links, and runs `PRAGMA integrity_check` on every copied database.
+SQLite-backup-API copies, the complete bounded Shelfarr storage tree, bounded
+qBittorrent `BT_backup` resume metadata, private Shelfarr evaluation reports,
+and a SHA-256 manifest. Verification
+checks every manifest hash, rejects extra files and links, and runs
+`PRAGMA integrity_check` on every copied database.
+
+Normal deployment stops Huey, Shelfarr, and SABnzbd around both checkpoints, so
+the Shelfarr/SAB portion is one stopped-owner generation and no Discord book
+submission can race it. A standalone `backup.py` call does not stop services;
+for an exact Shelfarr generation, stop those three services first and restart
+only the services appropriate to the current ownership flag afterward.
 
 The consistency boundary matters:
 
 - Each SQLite copy is transactionally consistent, but the collection is not an
   atomic snapshot across all services.
+- Shelfarr recovery requires its four transactional `.sqlite3` copies plus the
+  remaining `/rails/storage` generation, including encryption keys, queue state,
+  and Active Storage. Restore those from one checkpoint while Shelfarr is
+  stopped; never mix generations.
 - qBittorrent metadata is limited to 20,000 files, 32 MiB per file, and 512 MiB
   total. Every file must be regular and remain unchanged while copied.
 - A running qBittorrent checkpoint is not atomic across `.torrent` and
   `.fastresume` files. Stop qBittorrent before `backup.py` when an exact resume
   generation is required for a stateful upgrade.
 - `state/torrents/**` payloads and `/mnt/media/**` library media are never copied.
-  Resume metadata cannot recreate missing payload bytes.
+  `state/shelfarr-staging/**` direct-download payloads are also excluded. Resume
+  metadata and application state cannot recreate missing payload bytes. An exact
+  rollback of an active acquisition therefore requires a separately protected
+  payload generation; the normal deploy checkpoint is a coherent control-state
+  generation, not a media backup.
 
 These checkpoints are on the same host and are rollback aids, not independent
 disaster-recovery backups.
@@ -69,11 +85,15 @@ or migrated. Roll code, image, and owning state back as one unit:
    service yet.
 5. Move the current database main file and any same-generation `-wal` and `-shm`
    sidecars into a new private `backups/displaced-<timestamp>/...` directory.
-   Do not overwrite or delete them.
-6. Copy only the checkpoint's main `.db` to its repository-relative location,
-   mode `0600`, and restore its expected UID/GID. Checkpoints intentionally do
-   not contain WAL/SHM sidecars; never combine a restored main database with
-   sidecars from another generation.
+   Do not overwrite or delete them. For Shelfarr, move the complete current
+   `config/shelfarr` tree as one generation.
+6. Copy the checkpoint's transactionally copied main `.db`, `.sqlite`, or
+   `.sqlite3` file to its repository-relative location, mode `0600`, and restore
+   its expected UID/GID. Checkpoints intentionally do not contain WAL/SHM
+   sidecars; never combine a restored main database with sidecars from another
+   generation. For Shelfarr, restore the entire checkpointed
+   `config/shelfarr` tree—including all four `.sqlite3` databases, keys, queue
+   state, and Active Storage—before setting the directory to mode `0700`.
 7. Restore other service-owned configuration only when it is required by that
    version, using files from the same verified checkpoint. Keep the owner
    stopped throughout every state move and copy.

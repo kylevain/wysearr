@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS requests (
     status TEXT NOT NULL DEFAULT 'new',
     service TEXT,
     external_id TEXT,
+    external_status TEXT,
     external_title TEXT,
     error TEXT,
     notified_at TEXT

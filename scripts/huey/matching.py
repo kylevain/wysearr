@@ -241,3 +241,90 @@ def select_arr_candidate(title: str, items: Iterable[Mapping[str, Any]]) -> Mapp
     if len(scored) > 1 and scored[0][0] - scored[1][0] < 0.05:
         return None
     return scored[0][4]
+
+
+def select_shelfarr_candidate(
+    title: str,
+    author: str | None,
+    media_type: str,
+    items: Iterable[Mapping[str, Any]],
+    *,
+    minimum_confidence: float = 0.80,
+    runner_up_gap: float = 0.05,
+) -> Selection:
+    """Select one work-level Shelfarr metadata result conservatively.
+
+    Shelfarr request creation accepts a metadata ``work_id`` rather than a raw
+    title.  A wrong automatic choice therefore has a much larger blast radius
+    than a display-only search result: it controls every later acquisition
+    source and Shelfarr's final library placement.  Deduplicate identical work
+    IDs, require normal book results which support the requested book type, and
+    decline low-confidence or ambiguous matches for clarification in Discord.
+    """
+
+    book_type = {"ebooks": "ebook", "audiobooks": "audiobook"}.get(media_type)
+    if book_type is None:
+        raise ValueError(f"Unsupported Shelfarr media type: {media_type}")
+    if not 0 <= minimum_confidence <= 1:
+        raise ValueError("minimum_confidence must be between 0 and 1")
+    if not 0 <= runner_up_gap <= 1:
+        raise ValueError("runner_up_gap must be between 0 and 1")
+
+    unique: dict[str, Mapping[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        work_id = str(item.get("work_id") or "").strip()
+        candidate_title = str(item.get("title") or "").strip()
+        if not work_id or not candidate_title:
+            continue
+        content_kind = normalize_text(item.get("content_kind") or "book")
+        if content_kind != "book":
+            continue
+        available = item.get("available_book_types")
+        if isinstance(available, (list, tuple, set)) and book_type not in {
+            str(value).casefold() for value in available
+        }:
+            continue
+        unique.setdefault(work_id, item)
+
+    ranked: list[RankedCandidate] = []
+    wanted_author = normalize_text(author)
+    for work_id, item in unique.items():
+        title_score = title_similarity(title, str(item.get("title") or ""))
+        if author:
+            candidate_author = str(item.get("author") or "")
+            author_score = title_similarity(author, candidate_author)
+            score = (0.74 * title_score) + (0.26 * author_score)
+            if (
+                normalize_text(title) == normalize_text(item.get("title"))
+                and wanted_author
+                and wanted_author == normalize_text(candidate_author)
+            ):
+                score = 1.0
+        else:
+            score = title_score
+        ranked.append(
+            RankedCandidate(
+                item=item,
+                score=max(0.0, min(1.0, score)),
+                seeders=0,
+                stable_key=work_id,
+            )
+        )
+
+    ranked.sort(
+        key=lambda candidate: (
+            -candidate.score,
+            normalize_text(candidate.item.get("title")),
+            normalize_text(candidate.item.get("author")),
+            candidate.stable_key,
+        )
+    )
+    if not ranked:
+        return Selection(None, "no_results", ())
+    if ranked[0].score < minimum_confidence:
+        return Selection(None, "low_confidence", tuple(ranked))
+    if len(ranked) > 1 and ranked[0].score - ranked[1].score < runner_up_gap:
+        return Selection(None, "ambiguous", tuple(ranked))
+    return Selection(ranked[0].item, "selected", tuple(ranked))

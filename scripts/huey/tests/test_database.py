@@ -446,6 +446,37 @@ class DatabaseTests(unittest.TestCase):
             "startup_reconciled",
         )
 
+    def test_initialize_preserves_interrupted_shelfarr_dispatch_for_recovery(self):
+        self.store.initialize()
+        request, _ = self.store.create_request(**self.request_values())
+        self.store.transition(
+            request["id"],
+            "processing",
+            "Dispatching to Shelfarr",
+            service="shelfarr",
+        )
+
+        self.store.initialize()
+
+        saved = self.store.get_request(request["id"])
+        self.assertEqual(saved["status"], "processing")
+        self.assertEqual(saved["service"], "shelfarr")
+        self.assertEqual(
+            [row["id"] for row in self.store.interrupted_shelfarr_requests()],
+            [request["id"]],
+        )
+
+    def test_live_shelfarr_dispatch_is_not_a_startup_recovery_candidate(self):
+        self.store.initialize()
+        request, _ = self.store.create_request(**self.request_values())
+        self.store.transition(
+            request["id"],
+            "processing",
+            "Dispatching to Shelfarr",
+            service="shelfarr",
+        )
+        self.assertEqual(self.store.interrupted_shelfarr_requests(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

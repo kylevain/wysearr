@@ -16,6 +16,8 @@ from clients import (
     QBittorrentClient,
     RadarrClient,
     ServiceError,
+    SubmissionUncertain,
+    ShelfarrClient,
     SonarrClient,
 )
 
@@ -270,6 +272,395 @@ class ArrClientTests(unittest.TestCase):
             client.has_imported_media("not-an-id")
         with self.assertRaisesRegex(ServiceError, "invalid entity response"):
             client.has_imported_media(44)
+
+
+class ShelfarrClientTests(unittest.TestCase):
+    def metadata_result(self, **overrides):
+        value = {
+            "work_id": "openlibrary:OL893415W",
+            "title": "Dune",
+            "author": "Frank Herbert",
+            "year": 1965,
+            "content_kind": "book",
+            "available_book_types": ["ebook", "audiobook"],
+            "sources": [
+                {"work_id": "openlibrary:OL893415W"},
+                {"work_id": "hardcover:book:123"},
+            ],
+        }
+        value.update(overrides)
+        return value
+
+    def request_payload(self, **overrides):
+        value = {
+            "id": 73,
+            "status": "pending",
+            "attention_needed": False,
+            "issue_description": None,
+            "book": {
+                "id": 9,
+                "title": "Dune",
+                "author": "Frank Herbert",
+                "book_type": "ebook",
+            },
+        }
+        value.update(overrides)
+        return value
+
+    def test_search_match_and_create_preserve_huey_correlation(self):
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": [self.request_payload()]}),
+            ]
+        )
+        client = ShelfarrClient("http://shelfarr", "shf_secret", session=session)
+
+        response = client.submit(
+            "ebooks",
+            "Dune",
+            "Frank Herbert",
+            42,
+            discord_user_id="1001",
+            discord_channel_id="2002",
+        )
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["service"], "shelfarr")
+        self.assertEqual(response["external_id"], "73")
+        self.assertEqual(response["external_status"], "pending")
+        self.assertEqual(
+            [call[0] for call in session.calls], ["GET", "GET", "GET", "POST"]
+        )
+        search_call, recovery_call, work_call, create_call = session.calls
+        self.assertTrue(search_call[1].endswith("/api/v1/search"))
+        self.assertEqual(
+            search_call[2]["params"],
+            {"q": "Dune Frank Herbert", "limit": 10, "content_kind": "book"},
+        )
+        for call in session.calls:
+            self.assertEqual(
+                call[2]["headers"]["Authorization"], "Bearer shf_secret"
+            )
+        payload = create_call[2]["json"]
+        self.assertEqual(payload["work_id"], "openlibrary:OL893415W")
+        self.assertEqual(payload["book_type"], "ebook")
+        self.assertEqual(payload["notes"], "Huey request #42")
+        self.assertTrue(recovery_call[1].endswith("/api/v1/requests"))
+        self.assertEqual(work_call[2]["params"], {"limit": 100})
+        self.assertEqual(payload["external_source"], "huey:42")
+        self.assertEqual(payload["external_user_id"], "1001")
+        self.assertEqual(payload["external_chat_id"], "2002")
+        self.assertEqual(
+            payload["source_work_ids"],
+            ["openlibrary:OL893415W", "hardcover:book:123"],
+        )
+
+    def test_ambiguous_metadata_never_creates_request(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    json_value={
+                        "results": [
+                            self.metadata_result(author="Frank Herbert"),
+                            self.metadata_result(
+                                work_id="openlibrary:OTHER",
+                                author="Another Author",
+                            ),
+                        ]
+                    }
+                )
+            ]
+        )
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit("audiobooks", "Dune")
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["service"], "shelfarr")
+        self.assertEqual(len(session.calls), 1)
+
+    def test_requested_format_must_be_available_in_metadata_result(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    json_value={
+                        "results": [
+                            self.metadata_result(available_book_types=["ebook"])
+                        ]
+                    }
+                )
+            ]
+        )
+
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit("audiobooks", "Dune", "Frank Herbert", 42)
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(len(session.calls), 1)
+
+    def test_existing_correlation_recovers_without_duplicate_post(self):
+        correlated = self.request_payload(
+            request={"id": 73, "external_source": "huey:42"}
+        )
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": [correlated]}),
+            ]
+        )
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit("ebooks", "Dune", "Frank Herbert", 42)
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["external_id"], "73")
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+
+    def test_existing_malformed_correlation_remains_uncertain(self):
+        correlated = self.request_payload(
+            book={"title": "Dune", "book_type": "audiobook"},
+            request={"id": 73, "external_source": "huey:42"},
+        )
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": [correlated]}),
+            ]
+        )
+
+        with self.assertRaises(SubmissionUncertain):
+            ShelfarrClient(
+                "http://shelfarr", "shf_secret", session=session
+            ).submit("ebooks", "Dune", "Frank Herbert", 42)
+
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+
+    def test_duplicate_correlations_remain_uncertain(self):
+        first = self.request_payload(
+            request={"id": 73, "external_source": "huey:42"}
+        )
+        second = self.request_payload(
+            id=74, request={"id": 74, "external_source": "huey:42"}
+        )
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": [first, second]}),
+            ]
+        )
+
+        with self.assertRaisesRegex(SubmissionUncertain, "duplicate"):
+            ShelfarrClient(
+                "http://shelfarr", "shf_secret", session=session
+            ).submit("ebooks", "Dune", "Frank Herbert", 42)
+
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+
+    def test_completed_evaluation_work_is_reused_by_new_huey_request(self):
+        completed = self.request_payload(
+            status="completed",
+            request={"id": 7, "external_source": "huey:900200012"},
+        )
+        completed["book"] = {
+            **completed["book"],
+            "work_id": "openlibrary:OL893415W",
+        }
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": [completed]}),
+            ]
+        )
+
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit("ebooks", "Dune", "Frank Herbert", 42)
+
+        self.assertEqual(response["status"], "completed")
+        self.assertEqual(response["external_id"], "73")
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET", "GET"])
+
+    def test_completed_exact_work_wins_over_duplicate_active_match(self):
+        active = self.request_payload(id=80, status="downloading")
+        completed = self.request_payload(id=70, status="completed")
+        for request in (active, completed):
+            request["book"] = {
+                **request["book"],
+                "work_id": "openlibrary:OL893415W",
+            }
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": [active, completed]}),
+            ]
+        )
+
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit("ebooks", "Dune", "Frank Herbert", 42)
+
+        self.assertEqual(response["status"], "completed")
+        self.assertEqual(response["external_id"], "70")
+
+    def test_lost_create_response_recovers_by_correlation(self):
+        class LostPostSession(FakeSession):
+            def request(self, method, url, **kwargs):
+                self.calls.append((method, url, kwargs))
+                if len(self.calls) == 1:
+                    return FakeResponse(json_value={"results": [self_test.metadata_result()]})
+                if len(self.calls) == 2:
+                    return FakeResponse(json_value={"requests": []})
+                if len(self.calls) == 3:
+                    return FakeResponse(json_value={"requests": []})
+                if len(self.calls) == 4:
+                    raise requests.ReadTimeout("lost response")
+                return FakeResponse(
+                    json_value={
+                        "requests": [
+                            self_test.request_payload(
+                                request={"id": 73, "external_source": "huey:42"}
+                            )
+                        ]
+                    }
+                )
+
+        self_test = self
+        session = LostPostSession()
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit("ebooks", "Dune", "Frank Herbert", 42)
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["external_id"], "73")
+        self.assertEqual(
+            [call[0] for call in session.calls],
+            ["GET", "GET", "GET", "POST", "GET"],
+        )
+
+    def test_lost_create_and_unavailable_recovery_is_explicitly_uncertain(self):
+        class UncertainPostSession(FakeSession):
+            def request(self, method, url, **kwargs):
+                self.calls.append((method, url, kwargs))
+                if len(self.calls) == 1:
+                    return FakeResponse(json_value={"results": [self_test.metadata_result()]})
+                if len(self.calls) in {2, 3}:
+                    return FakeResponse(json_value={"requests": []})
+                raise requests.ReadTimeout("lost response")
+
+        self_test = self
+        client = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=UncertainPostSession()
+        )
+        with self.assertRaisesRegex(SubmissionUncertain, "correlation recovery"):
+            client.submit("ebooks", "Dune", "Frank Herbert", 42)
+
+    def test_server_error_post_is_uncertain_until_later_correlation(self):
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(status=500),
+                FakeResponse(json_value={"requests": []}),
+            ]
+        )
+        with self.assertRaises(SubmissionUncertain):
+            ShelfarrClient(
+                "http://shelfarr", "shf_secret", session=session
+            ).submit("ebooks", "Dune", "Frank Herbert", 42)
+
+    def test_malformed_success_post_is_uncertain_until_later_correlation(self):
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"unexpected": True}),
+                FakeResponse(json_value={"requests": []}),
+            ]
+        )
+        with self.assertRaises(SubmissionUncertain):
+            ShelfarrClient(
+                "http://shelfarr", "shf_secret", session=session
+            ).submit("ebooks", "Dune", "Frank Herbert", 42)
+
+    def test_lost_response_with_mismatched_correlation_remains_uncertain(self):
+        mismatched = self.request_payload(
+            book={"title": "Dune", "book_type": "audiobook"},
+            request={"id": 73, "external_source": "huey:42"},
+        )
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": [mismatched]}),
+                FakeResponse(json_value={"requests": [mismatched]}),
+            ]
+        )
+
+        with self.assertRaises(SubmissionUncertain):
+            ShelfarrClient(
+                "http://shelfarr", "shf_secret", session=session
+            ).submit("ebooks", "Dune", "Frank Herbert", 42)
+
+        self.assertEqual(
+            [call[0] for call in session.calls],
+            ["GET", "GET", "GET", "POST", "GET"],
+        )
+
+    def test_request_status_probe_is_read_only_and_validated(self):
+        session = FakeSession(
+            [FakeResponse(json_value=self.request_payload(status="processing"))]
+        )
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).get_request("73")
+        self.assertEqual(response["status"], "processing")
+        self.assertEqual(session.calls[0][0], "GET")
+        self.assertTrue(session.calls[0][1].endswith("/api/v1/requests/73"))
+
+        with self.assertRaisesRegex(ServiceError, "invalid request ID"):
+            ShelfarrClient("http://shelfarr", "shf_secret").get_request("bad")
+
+    def test_cancel_requires_confirmed_terminal_response(self):
+        session = FakeSession(
+            [FakeResponse(json_value=self.request_payload(status="failed"))]
+        )
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).cancel_request(73)
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(session.calls[0][0], "DELETE")
+
+    def test_terminal_attention_result_requires_manual_intervention_route(self):
+        response = ShelfarrClient._submission_result(
+            self.request_payload(status="failed", attention_needed=True),
+            book_type="ebook",
+            fallback_title="Dune",
+        )
+        self.assertEqual(response["status"], "failed")
+        self.assertTrue(response["manual_intervention"])
+
+    def test_invalid_or_unsupported_response_fails_closed(self):
+        for response in (
+            {"id": 73, "status": "unknown", "book": {}},
+            {"id": 73, "status": "pending", "book": None},
+        ):
+            with self.subTest(response=response):
+                client = ShelfarrClient(
+                    "http://shelfarr",
+                    "shf_secret",
+                    session=FakeSession([FakeResponse(json_value=response)]),
+                )
+                with self.assertRaisesRegex(ServiceError, "invalid request response"):
+                    client.get_request(73)
 
 
 class ProwlarrClientTests(unittest.TestCase):

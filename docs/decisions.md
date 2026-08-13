@@ -13,8 +13,8 @@
   `tv:` prefix. Channel identity alone cannot choose between Radarr and Sonarr.
 - 2026-08-11: Readarr is intentionally unsupported. It was never deployed in
   this repository, and no compatible production image/configuration was found.
-  Ebook acquisition is Huey -> Prowlarr -> qBittorrent -> BookBot -> Kavita's
-  `/media/ebooks/Books` library.
+  The original Huey -> Prowlarr -> qBittorrent -> BookBot book path remains
+  available as the rollback design.
 - 2026-08-11: Media without a suitable ARR manager uses conservative direct
   Prowlarr matching. Ambiguous or low-confidence results require a more specific
   request; automation must not choose arbitrarily.
@@ -41,6 +41,12 @@
 - 2026-08-12: A request completion and a newly imported library item are distinct
   events, not mirrored copies. Completion proves import to the DAS library path;
   it does not prove Plex or another catalog application has indexed the item.
+- 2026-08-12: A feature-gated Shelfarr 2026.08.09.1 evaluation owns ebook and
+  audiobook discovery, acquisition, and final DAS placement while
+  `SHELFARR_ENABLED=true`; it does not hand off to BookBot. The initial failed
+  cohort improved from 0/7 to 1/7 final DAS placements through Project
+  Gutenberg. Shelfarr remains a controlled pilot and BookBot remains deployed
+  for rollback. Catalog visibility and Usenet improvement are not yet proven.
 
 Huey, Dewey, and Louie follow the established Duck-nephew naming scheme. Huey is
 Discord intake; Dewey is the conversational library interface; Louie remains

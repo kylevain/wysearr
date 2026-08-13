@@ -1,4 +1,7 @@
+import hashlib
 import json
+import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -57,7 +60,8 @@ class BackupTests(unittest.TestCase):
             parent = Path(directory)
             parent.chmod(0o755)
             output = parent / "checkpoint"
-            backup.create_backup(output)
+            with mock.patch.object(backup, "STACK_ROOT", parent):
+                backup.create_backup(output)
             self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
             self.assertEqual(output.stat().st_mode & 0o777, 0o700)
 
@@ -86,6 +90,44 @@ class BackupTests(unittest.TestCase):
             self.assertNotIn("state/torrents/complete/movie.mkv", paths)
             self.assertIn(
                 "state/torrents/** download payloads",
+                manifest["boundary"]["excludes"],
+            )
+            self.assertEqual(backup.verify_backup(output), manifest)
+
+    def test_checkpoint_includes_complete_shelfarr_storage_without_sqlite_sidecars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage = root / backup.SHELFARR_STORAGE_RELATIVE
+            blob = storage / "blobs/ab/cd/book.epub"
+            blob.parent.mkdir(parents=True)
+            blob.write_bytes(b"active storage payload")
+            (storage / ".secret_key_base").write_text(
+                "private-secret\n", encoding="utf-8"
+            )
+            evaluation = root / "state" / "shelfarr-evaluation"
+            evaluation.mkdir(parents=True)
+            (evaluation / "results.json").write_text(
+                '{"records":[]}\n', encoding="utf-8"
+            )
+            database = storage / "production.sqlite3"
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("CREATE TABLE requests (title TEXT)")
+                connection.execute("INSERT INTO requests VALUES ('kept')")
+            output = root / "checkpoint"
+
+            with mock.patch.object(backup, "STACK_ROOT", root):
+                manifest = backup.create_backup(output)
+
+            paths = {entry["path"] for entry in manifest["files"]}
+            self.assertIn("config/shelfarr/.secret_key_base", paths)
+            self.assertIn("config/shelfarr/blobs/ab/cd/book.epub", paths)
+            self.assertIn("config/shelfarr/production.sqlite3", paths)
+            self.assertIn("state/shelfarr-evaluation/results.json", paths)
+            self.assertNotIn("config/shelfarr/production.sqlite3-wal", paths)
+            self.assertNotIn("config/shelfarr/production.sqlite3-shm", paths)
+            self.assertIn(
+                "state/shelfarr-staging/** direct-download staging payloads",
                 manifest["boundary"]["excludes"],
             )
             self.assertEqual(backup.verify_backup(output), manifest)
@@ -246,6 +288,190 @@ class DeploymentCheckpointTests(unittest.TestCase):
         self.assertLess(validation, post)
         self.assertLess(post, success)
 
+    def test_deploy_quiesces_owners_and_gates_shelfarr_before_start(self):
+        deploy = (SCRIPTS.parent / "deploy.sh").read_text(encoding="utf-8")
+        self.assertIn('case "$feature_flag" in', deploy)
+        self.assertIn("evaluation_services=(sabnzbd shelfarr)", deploy)
+        self.assertIn('if [ "${#evaluation_services[@]}" -gt 0 ]', deploy)
+        pre_stop = deploy.index(
+            "docker compose stop huey shelfarr sabnzbd",
+            deploy.index("trap restore_previous_runtime EXIT"),
+        )
+        # Ignore the recovery hint in the EXIT trap and select the operational
+        # pre-deploy checkpoint created after the owners are quiesced.
+        pre_checkpoint = deploy.index("pre-deploy-$deployment_id", pre_stop)
+        drain_check = deploy.index(
+            "python3 scripts/bootstrap_shelfarr.py --check-drain-only"
+        )
+        start_sabnzbd = deploy.index(
+            "docker compose up -d --remove-orphans sabnzbd", drain_check
+        )
+        stop_sabnzbd = deploy.index("docker compose stop sabnzbd", start_sabnzbd)
+        prepare_sabnzbd = deploy.index(
+            "python3 scripts/bootstrap_shelfarr.py --prepare-sab-config",
+            stop_sabnzbd,
+        )
+        restart_sabnzbd = deploy.index("docker compose start sabnzbd", prepare_sabnzbd)
+        start_shelfarr = deploy.index(
+            "docker compose up -d --remove-orphans shelfarr", restart_sabnzbd
+        )
+        bootstrap_shelfarr = deploy.index(
+            "python3 scripts/bootstrap_shelfarr.py\n", start_shelfarr
+        )
+        start_huey = deploy.index("docker compose up -d --build --remove-orphans bookbot huey")
+        first_validation = deploy.index("python3 scripts/validate.py")
+        post_stop = deploy.index(
+            "docker compose stop huey shelfarr sabnzbd", pre_stop + 1
+        )
+        post_checkpoint = deploy.index("post-deploy-$deployment_id")
+        restart_evaluation = deploy.index(
+            "docker compose start sabnzbd shelfarr", post_checkpoint
+        )
+        restart_huey = deploy.index("docker compose start huey", post_checkpoint)
+        second_validation = deploy.index(
+            "python3 scripts/validate.py", first_validation + 1
+        )
+
+        self.assertLess(pre_stop, pre_checkpoint)
+        self.assertLess(pre_checkpoint, drain_check)
+        self.assertLess(drain_check, start_sabnzbd)
+        self.assertLess(start_sabnzbd, stop_sabnzbd)
+        self.assertLess(stop_sabnzbd, prepare_sabnzbd)
+        self.assertLess(prepare_sabnzbd, restart_sabnzbd)
+        self.assertLess(restart_sabnzbd, start_shelfarr)
+        self.assertLess(start_shelfarr, bootstrap_shelfarr)
+        self.assertLess(bootstrap_shelfarr, start_huey)
+        self.assertLess(start_huey, first_validation)
+        self.assertLess(first_validation, post_stop)
+        self.assertLess(post_stop, post_checkpoint)
+        self.assertLess(post_checkpoint, restart_evaluation)
+        self.assertLess(restart_evaluation, restart_huey)
+        self.assertLess(restart_huey, second_validation)
+
+    def test_deploy_failure_trap_tracks_all_evaluation_and_intake_services(self):
+        deploy = (SCRIPTS.parent / "deploy.sh").read_text(encoding="utf-8")
+        self.assertIn("trap restore_previous_runtime EXIT", deploy)
+        restore = deploy.split("restore_previous_runtime() {", 1)[1].split(
+            "\n}\ntrap restore_previous_runtime EXIT", 1
+        )[0]
+        self.assertIn('if [ "$runtime_replaced" -eq 0 ]', restore)
+        self.assertIn(
+            "deployment failed after runtime replacement; Huey/Shelfarr/SABnzbd are left stopped",
+            restore,
+        )
+        self.assertIn("docker compose stop huey shelfarr sabnzbd", restore)
+        for service in ("huey", "sabnzbd", "shelfarr"):
+            self.assertIn(f"{service}_was_running=0", deploy)
+            self.assertIn(f"service_is_running {service}", deploy)
+            self.assertIn(f'if [ "${service}_was_running" -eq 1 ]', restore)
+            self.assertIn(f"docker compose start {service}", restore)
+            self.assertIn(f"docker compose stop {service}", restore)
+
+
+class ShelfarrDeploymentTests(unittest.TestCase):
+    def test_evaluation_services_are_immutable_private_and_persistent(self):
+        compose = (SCRIPTS.parent / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "ghcr.io/pedro-revez-silva/shelfarr:2026.08.09.1@sha256:"
+            "5e331192a8a7b55e3bee055d28403f83fd9d4977f52b6dcb11c86adcdbb70083",
+            compose,
+        )
+        self.assertIn(
+            "lscr.io/linuxserver/sabnzbd:version-5.0.4@sha256:"
+            "4307a4ef4a1687c6f7dfa36fc745c1fc10b78db9916b64970b9ff682539dd03b",
+            compose,
+        )
+        self.assertIn('"127.0.0.1:${SHELFARR_ADMIN_PORT:-5056}:80"', compose)
+        self.assertIn('"127.0.0.1:${SABNZBD_ADMIN_PORT:-8085}:8080"', compose)
+        self.assertIn("./config/shelfarr:/rails/storage", compose)
+        self.assertIn(
+            "./state/shelfarr-staging/ebooks:/ebooks/.shelfarr-staging", compose
+        )
+        self.assertIn("/ebooks/Books:/ebooks", compose)
+        self.assertIn("/audiobooks:/audiobooks", compose)
+        shelfarr = re.search(r"(?ms)^  shelfarr:\n(.*?)(?=^  \S|\Z)", compose)
+        sabnzbd = re.search(r"(?ms)^  sabnzbd:\n(.*?)(?=^  \S|\Z)", compose)
+        self.assertIsNotNone(shelfarr)
+        self.assertIsNotNone(sabnzbd)
+        self.assertNotIn("}:/downloads\n", shelfarr.group(1))
+        self.assertNotIn("}:/downloads\n", sabnzbd.group(1))
+        self.assertIn("/shelfarr:/downloads/shelfarr", shelfarr.group(1))
+        self.assertIn("/usenet:/downloads/usenet", shelfarr.group(1))
+        self.assertIn(
+            "/incomplete/usenet:/downloads/incomplete/usenet",
+            sabnzbd.group(1),
+        )
+        self.assertIn("/usenet:/downloads/usenet", sabnzbd.group(1))
+
+    def test_huey_defaults_to_shelfarr_disabled_and_bookbot_remains_deployed(self):
+        compose = (SCRIPTS.parent / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("SHELFARR_ENABLED: ${SHELFARR_ENABLED:-false}", compose)
+        self.assertIn("  bookbot:\n", compose)
+        self.assertIn("dockerfile: docker/bookbot/Dockerfile", compose)
+
+    def test_huey_is_not_health_coupled_to_evaluation_services(self):
+        compose = (SCRIPTS.parent / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(r"(?ms)^  huey:\n(.*?)(?=^  \S|\Z)", compose)
+        self.assertIsNotNone(match)
+        huey = match.group(1)
+        self.assertNotIn("shelfarr:", huey)
+        self.assertNotIn("sabnzbd:", huey)
+
+    def test_bookbot_does_not_claim_shelfarr_category(self):
+        sys.path.insert(0, str(SCRIPTS / "processing"))
+        from bookbot_lib.config import CATEGORY_SPECS
+
+        self.assertNotIn("shelfarr", CATEGORY_SPECS)
+
+    def test_disabled_container_check_rejects_restart_loop(self):
+        compose_result = mock.MagicMock(returncode=0, stdout="container-id\n")
+        restarting_result = mock.MagicMock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "State": {
+                        "Status": "restarting",
+                        "Running": True,
+                        "Restarting": True,
+                        "Paused": False,
+                    }
+                }
+            ).join(["[", "]"]),
+        )
+        with mock.patch.object(
+            validate.subprocess, "run", side_effect=[compose_result, restarting_result]
+        ):
+            check = validate.container_stopped_check("shelfarr")
+        self.assertFalse(check.ok)
+        self.assertIn("restarting", check.detail)
+
+    def test_disabled_container_check_accepts_compose_stopped(self):
+        compose_result = mock.MagicMock(returncode=0, stdout="container-id\n")
+        stopped_result = mock.MagicMock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "State": {
+                        "Status": "exited",
+                        "Running": False,
+                        "Restarting": False,
+                        "Paused": False,
+                    }
+                }
+            ).join(["[", "]"]),
+        )
+        with mock.patch.object(
+            validate.subprocess, "run", side_effect=[compose_result, stopped_result]
+        ):
+            check = validate.container_stopped_check("shelfarr")
+        self.assertTrue(check.ok)
+
 
 class ValidationTests(unittest.TestCase):
     def test_env_parser_ignores_comments_and_preserves_equals(self):
@@ -259,6 +485,29 @@ class ValidationTests(unittest.TestCase):
             check = validate.writable_check(Path(directory), "test")
             self.assertTrue(check.ok)
             self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_private_service_storage_rejects_group_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sabnzbd"
+            path.mkdir(mode=0o700)
+            self.assertTrue(
+                validate.private_service_storage_check(path, "sabnzbd:test").ok
+            )
+            path.chmod(0o750)
+            self.assertFalse(
+                validate.private_service_storage_check(path, "sabnzbd:test").ok
+            )
+
+    def test_evaluation_reports_must_be_owner_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "evaluation"
+            path.mkdir(mode=0o700)
+            report = path / "results.json"
+            report.write_text("{}\n", encoding="utf-8")
+            report.chmod(0o600)
+            self.assertTrue(validate.evaluation_report_permissions_check(path).ok)
+            report.chmod(0o640)
+            self.assertFalse(validate.evaluation_report_permissions_check(path).ok)
 
     def test_channel_inventory_requires_unique_positive_request_and_lifecycle_ids(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -290,6 +539,264 @@ class ValidationTests(unittest.TestCase):
             self.assertFalse(validate.huey_ready_check(marker).ok)
             marker.write_text("ready\n", encoding="utf-8")
             self.assertTrue(validate.huey_ready_check(marker).ok)
+
+    def test_shelfarr_storage_requires_all_databases_private_keys_and_no_discord(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory)
+            os.chmod(storage, 0o700)
+            for filename in (
+                "production.sqlite3",
+                "production_cache.sqlite3",
+                "production_queue.sqlite3",
+                "production_cable.sqlite3",
+            ):
+                with closing(sqlite3.connect(storage / filename)) as connection, connection:
+                    connection.execute("CREATE TABLE example (value TEXT)")
+            with closing(
+                sqlite3.connect(storage / "production.sqlite3")
+            ) as connection, connection:
+                connection.execute(
+                    "CREATE TABLE settings (key TEXT UNIQUE, value TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO settings VALUES ('discord_enabled', 'false')"
+                )
+            for filename in (".secret_key_base", ".encryption_keys"):
+                path = storage / filename
+                path.write_text("private\n", encoding="utf-8")
+                os.chmod(path, 0o600)
+
+            checks = {
+                check.name: check for check in validate.shelfarr_storage_checks(storage)
+            }
+            self.assertTrue(all(check.ok for check in checks.values()))
+
+            with closing(
+                sqlite3.connect(storage / "production.sqlite3")
+            ) as connection, connection:
+                connection.execute(
+                    "UPDATE settings SET value = 'true' WHERE key = 'discord_enabled'"
+                )
+            checks = {
+                check.name: check for check in validate.shelfarr_storage_checks(storage)
+            }
+            self.assertFalse(checks["shelfarr:native-discord"].ok)
+
+            os.chmod(storage, 0o755)
+            checks = {
+                check.name: check for check in validate.shelfarr_storage_checks(storage)
+            }
+            self.assertFalse(checks["shelfarr:storage-permissions"].ok)
+
+    def test_shelfarr_evaluation_configuration_enforces_isolated_clients_and_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory)
+            token = "shf_test_token"
+            with closing(
+                sqlite3.connect(storage / "production.sqlite3")
+            ) as connection, connection:
+                connection.execute("CREATE TABLE settings (key TEXT, value TEXT)")
+                connection.executemany(
+                    "INSERT INTO settings VALUES (?, ?)",
+                    (
+                        ("indexer_provider", "prowlarr"),
+                        ("prowlarr_url", "http://prowlarr:9696"),
+                        ("prowlarr_api_key", "configured"),
+                        ("preferred_download_types", '["direct","usenet","torrent"]'),
+                        ("ebook_output_path", "/ebooks"),
+                        ("audiobook_output_path", "/audiobooks"),
+                        ("download_local_path", "/downloads"),
+                        ("immediate_search_enabled", "true"),
+                        ("auto_approve_requests", "true"),
+                        ("auto_select_enabled", "true"),
+                        ("auto_select_confidence_threshold", "90"),
+                        ("auto_select_min_seeders", "1"),
+                        ("completed_download_import_mode", "copy"),
+                        ("default_language", "en"),
+                        ("auth_disabled", "false"),
+                        ("librivox_enabled", "false"),
+                        ("gutenberg_enabled", "true"),
+                        ("anna_archive_enabled", "false"),
+                        ("zlibrary_enabled", "false"),
+                        ("ebooks_com_enabled", "false"),
+                        ("discord_enabled", "false"),
+                        ("discord_webhook_url", ""),
+                        ("webhook_enabled", "false"),
+                        ("webhook_url", ""),
+                        ("telegram_enabled", "false"),
+                    ),
+                )
+                connection.execute(
+                    "CREATE TABLE download_clients "
+                    "(client_type TEXT, url TEXT, category TEXT, download_path TEXT, enabled INTEGER, "
+                    "password TEXT, api_key TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO download_clients VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        (
+                            "qbittorrent",
+                            "http://qbittorrent:8080",
+                            "shelfarr",
+                            "/downloads/shelfarr",
+                            1,
+                            "encrypted",
+                            None,
+                        ),
+                        (
+                            "sabnzbd",
+                            "http://sabnzbd:8080",
+                            "shelfarr",
+                            "/downloads/usenet",
+                            1,
+                            None,
+                            "encrypted",
+                        ),
+                    ),
+                )
+                connection.execute(
+                    "CREATE TABLE api_tokens "
+                    "(token_digest TEXT, scopes TEXT, revoked_at TEXT, expires_at TEXT, user_id INTEGER)"
+                )
+                connection.execute(
+                    "CREATE TABLE users (id INTEGER, role INTEGER, deleted_at TEXT)"
+                )
+                connection.execute("INSERT INTO users VALUES (1, 0, NULL)")
+                connection.execute(
+                    "INSERT INTO api_tokens VALUES (?, ?, NULL, NULL, 1)",
+                    (
+                        hashlib.sha256(token.encode()).hexdigest(),
+                        '["search:read","requests:read","requests:write"]',
+                    ),
+                )
+
+            checks = validate.shelfarr_configuration_checks(
+                storage, {"SHELFARR_API_TOKEN": token}
+            )
+            self.assertTrue(all(check.ok for check in checks))
+
+            with closing(
+                sqlite3.connect(storage / "production.sqlite3")
+            ) as connection, connection:
+                connection.execute(
+                    "UPDATE download_clients SET category = 'ebooks' "
+                    "WHERE client_type = 'qbittorrent'"
+                )
+            checks = {
+                check.name: check
+                for check in validate.shelfarr_configuration_checks(
+                    storage, {"SHELFARR_API_TOKEN": token}
+                )
+            }
+            self.assertFalse(checks["shelfarr:download-clients"].ok)
+
+    def test_shelfarr_direct_staging_requires_owner_only_local_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            staging = Path(directory) / "staging"
+            staging.mkdir(mode=0o700)
+            self.assertTrue(validate.shelfarr_direct_staging_check(staging).ok)
+            os.chmod(staging, 0o775)
+            self.assertFalse(validate.shelfarr_direct_staging_check(staging).ok)
+
+    def test_sabnzbd_evaluation_requires_isolated_paths_and_category(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "sabnzbd.ini"
+            config.write_text(
+                "[misc]\n"
+                "download_dir = /downloads/incomplete/usenet\n"
+                "complete_dir = /downloads/usenet\n"
+                "api_key = private\n"
+                "username = operator\n"
+                "password = private-password\n"
+                "api_logging = 0\n"
+                "[servers]\n",
+                encoding="utf-8",
+            )
+
+            def requester(url):
+                if "mode=version" in url:
+                    return {"version": "5.0.4"}
+                if "mode=get_cats" in url:
+                    return {"categories": ["*", "shelfarr"]}
+                return {
+                    "config": {
+                        "servers": [{"host": "news.example", "enable": 1}]
+                    }
+                }
+
+            checks = validate.sabnzbd_configuration_checks(
+                config, "8085", "operator", requester=requester
+            )
+            self.assertTrue(all(check.ok for check in checks))
+
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    "/downloads/usenet", "/wrong"
+                ),
+                encoding="utf-8",
+            )
+            checks = {
+                check.name: check
+                for check in validate.sabnzbd_configuration_checks(
+                    config, "8085", "operator", requester=requester
+                )
+            }
+            self.assertFalse(checks["sabnzbd:paths"].ok)
+
+            config.write_text(
+                "[misc]\n"
+                "download_dir = /downloads/incomplete/usenet\n"
+                "complete_dir = /downloads/usenet\n"
+                "api_key = private\n"
+                "username = operator\n"
+                'password = ""\n'
+                "api_logging = 1\n",
+                encoding="utf-8",
+            )
+            checks = {
+                check.name: check
+                for check in validate.sabnzbd_configuration_checks(
+                    config, "8085", "operator", requester=requester
+                )
+            }
+            self.assertFalse(checks["sabnzbd:authentication"].ok)
+
+            def no_provider(url):
+                if "mode=version" in url:
+                    return {"version": "5.0.4"}
+                if "mode=get_cats" in url:
+                    return {"categories": ["shelfarr"]}
+                return {"config": {"servers": []}}
+
+            checks = validate.sabnzbd_configuration_checks(
+                config, "8085", "operator", requester=no_provider
+            )
+            provider = next(
+                check for check in checks
+                if check.name == "sabnzbd:provider-observation"
+            )
+            self.assertTrue(provider.ok)
+            self.assertIn("unavailable", provider.detail)
+
+    def test_shelfarr_runtime_parses_client_results_after_rails_logs(self):
+        runner = mock.MagicMock()
+        runner.return_value = mock.MagicMock(
+            returncode=0,
+            stdout=(
+                "[info] qBittorrent connection successful\n"
+                "[info] SABnzbd connection successful\n"
+                "WYSEARR_CLIENT_RESULTS="
+                '[["qbittorrent","shelfarr",true],'
+                '["sabnzbd","shelfarr",true]]\n'
+            ),
+        )
+        checks = validate.shelfarr_runtime_checks(
+            "5056",
+            "shf_token",
+            runner=runner,
+            requester=lambda *_args, **_kwargs: {"requests": []},
+        )
+        self.assertTrue(all(check.ok for check in checks))
 
     def test_arr_native_discord_check_reads_notification_database(self):
         with tempfile.TemporaryDirectory() as directory:

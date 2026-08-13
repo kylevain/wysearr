@@ -18,7 +18,21 @@ _REQUEST_COLUMNS = {
     "error": "TEXT",
     "notified_at": "TEXT",
     "target_key": "TEXT",
+    "external_status": "TEXT",
 }
+
+SHELFARR_STATUSES = frozenset(
+    {
+        "pending",
+        "searching",
+        "awaiting_purchase",
+        "not_found",
+        "downloading",
+        "processing",
+        "completed",
+        "failed",
+    }
+)
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -56,6 +70,7 @@ class RequestStore:
             )
             self._merge_duplicate_messages(connection)
             self._ensure_unique_message_index(connection)
+            self._mark_interrupted_shelfarr_requests(connection)
             self._fail_interrupted_requests(connection)
             self._backfill_target_keys(connection)
             connection.executescript(
@@ -74,13 +89,44 @@ class RequestStore:
             )
 
     @staticmethod
+    def _mark_interrupted_shelfarr_requests(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            """
+            SELECT id FROM requests
+            WHERE status = 'processing' AND service = 'shelfarr'
+              AND external_id IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            exists = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE request_id = ? AND event_type = 'startup_shelfarr_recovery'
+                """,
+                (row["id"],),
+            ).fetchone()
+            if exists is None:
+                connection.execute(
+                    "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                    (
+                        row["id"],
+                        "startup_shelfarr_recovery",
+                        "Huey restarted during a Shelfarr dispatch; recovering correlation",
+                    ),
+                )
+
+    @staticmethod
     def _fail_interrupted_requests(connection: sqlite3.Connection) -> None:
         message = (
             "Huey restarted before this request reached a durable queued state; "
             "review acquisition services before resubmitting"
         )
         rows = connection.execute(
-            "SELECT id FROM requests WHERE status IN ('new', 'processing')"
+            """
+            SELECT id FROM requests
+            WHERE status IN ('new', 'processing')
+              AND NOT (status = 'processing' AND service = 'shelfarr')
+            """
         ).fetchall()
         for row in rows:
             connection.execute(
@@ -95,6 +141,28 @@ class RequestStore:
                 "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
                 (row["id"], "startup_reconciled", message),
             )
+
+    def interrupted_shelfarr_requests(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return dispatches whose Shelfarr POST may have crossed a crash window."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE status = 'processing'
+                  AND service = 'shelfarr'
+                  AND external_id IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM events
+                      WHERE events.request_id = requests.id
+                        AND events.event_type = 'startup_shelfarr_recovery'
+                  )
+                ORDER BY updated_at, id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _add_missing_columns(connection: sqlite3.Connection) -> None:
@@ -201,6 +269,7 @@ class RequestStore:
                     author = COALESCE(?, author), status = ?,
                     service = COALESCE(?, service),
                     external_id = COALESCE(?, external_id),
+                    external_status = COALESCE(?, external_status),
                     external_title = COALESCE(?, external_title),
                     error = COALESCE(?, error),
                     notified_at = COALESCE(?, notified_at)
@@ -213,6 +282,7 @@ class RequestStore:
                     latest["status"],
                     latest["service"],
                     latest["external_id"],
+                    latest["external_status"],
                     latest["external_title"],
                     latest["error"],
                     latest["notified_at"],
@@ -401,6 +471,7 @@ class RequestStore:
         service: str | None = None,
         external_id: str | int | None = None,
         external_title: str | None = None,
+        external_status: str | None = None,
         error: str | None = None,
     ) -> dict[str, Any]:
         """Atomically update request state and append its corresponding event."""
@@ -414,7 +485,8 @@ class RequestStore:
                 """
                 UPDATE requests
                 SET status = ?, updated_at = CURRENT_TIMESTAMP,
-                    service = ?, external_id = ?, external_title = ?, error = ?
+                    service = ?, external_id = ?, external_title = ?,
+                    external_status = ?, error = ?
                 WHERE id = ?
                 """,
                 (
@@ -422,6 +494,7 @@ class RequestStore:
                     service,
                     str(external_id) if external_id is not None else None,
                     external_title,
+                    external_status,
                     error,
                     request_id,
                 ),
@@ -458,6 +531,9 @@ class RequestStore:
                              AND events.event_type IN (
                                  'handler_complete', 'handler_completed',
                                  'handler_failed', 'arr_completed',
+                                 'shelfarr_completed', 'shelfarr_failed',
+                                 'shelfarr_import_failed',
+                                 'shelfarr_manual_intervention',
                                  'complete', 'completed', 'failed',
                                  'startup_reconciled'
                              )
@@ -610,6 +686,97 @@ class RequestStore:
             connection.execute(
                 "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
                 (request_id, "arr_completed", message.strip()[:2000]),
+            )
+            return True
+
+    def queued_shelfarr_requests(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return active Huey requests owned by Shelfarr."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE status = 'queued'
+                  AND service = 'shelfarr'
+                  AND external_id IS NOT NULL
+                ORDER BY updated_at, id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def uncertain_shelfarr_requests(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return lost-response submissions awaiting durable correlation."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE status = 'queued'
+                  AND service = 'shelfarr'
+                  AND external_id IS NULL
+                  AND external_status = 'submission_uncertain'
+                  AND EXISTS (
+                      SELECT 1 FROM events
+                      WHERE events.request_id = requests.id
+                        AND events.event_type = 'shelfarr_submission_uncertain'
+                  )
+                ORDER BY updated_at, id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_shelfarr_state(
+        self,
+        request_id: int,
+        external_status: str,
+        message: str,
+        *,
+        event_type: str,
+        terminal_status: str | None = None,
+        error: str | None = None,
+    ) -> bool:
+        """Persist one observed Shelfarr state, with atomic terminalization."""
+
+        normalized = external_status.strip().casefold()
+        if normalized not in SHELFARR_STATUSES:
+            raise ValueError(f"Invalid Shelfarr status: {external_status}")
+        if terminal_status not in {None, "completed", "failed"}:
+            raise ValueError(f"Invalid Shelfarr terminal status: {terminal_status}")
+        if not event_type or not message or not message.strip():
+            raise ValueError("Shelfarr state observations require an event and message")
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT status, external_status FROM requests
+                WHERE id = ? AND status = 'queued' AND service = 'shelfarr'
+                """,
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["external_status"] == normalized and terminal_status is None:
+                return False
+
+            next_status = terminal_status or "queued"
+            next_error = error if terminal_status == "failed" else None
+            connection.execute(
+                """
+                UPDATE requests
+                SET status = ?, external_status = ?, error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'queued' AND service = 'shelfarr'
+                """,
+                (next_status, normalized, next_error, request_id),
+            )
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (request_id, event_type, message.strip()[:2000]),
             )
             return True
 

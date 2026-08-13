@@ -2,7 +2,8 @@
 
 WyseARR is the production media-acquisition node on `wysearr`. It runs the ARR
 applications, qBittorrent, subtitle automation, Huey's Discord request intake,
-and BookBot's non-ARR importer. Downloads stay on the local SSD; finished
+Shelfarr's feature-gated book evaluator, and BookBot's preserved non-ARR
+importer. Downloads stay on the local SSD; finished
 library files are copied to the Pi-SSD/DAS mounted at `/mnt/media`.
 
 ## Request media
@@ -12,8 +13,8 @@ Post one request per message in the matching Discord request channel:
 | Channel | Request syntax | Workflow |
 | --- | --- | --- |
 | `#movies-tv` | `movie: The Thing 1982` or `tv: Slow Horses 2022` | Radarr or Sonarr |
-| `#ebooks` | `The Left Hand of Darkness by Ursula K. Le Guin` | Prowlarr, qBittorrent, BookBot |
-| `#audiobooks` | `Piranesi by Susanna Clarke` | Prowlarr, qBittorrent, BookBot |
+| `#ebooks` | `The Left Hand of Darkness by Ursula K. Le Guin` | Shelfarr while evaluation is enabled; otherwise preserved BookBot path |
+| `#audiobooks` | `Piranesi by Susanna Clarke` | Shelfarr while evaluation is enabled; otherwise preserved BookBot path |
 | `#manga-comics` | `Saga Volume 1` | Prowlarr, qBittorrent, BookBot |
 | `#roms` | `Game Title platform` | Prowlarr, qBittorrent, BookBot |
 | `#sheet-music` | `Work Title composer instrument` | Prowlarr, qBittorrent, BookBot |
@@ -53,10 +54,11 @@ create duplicates.
 For movies and TV, `complete` currently means Sonarr or Radarr confirms that it
 imported a media file to the DAS. Huey does not yet trigger or confirm a Plex
 scan, so this does not claim that the title is visible in Plex; until the Plex
-integration is authorized, scan the matching Plex library manually. For direct
-media, `complete` means BookBot safely copied the validated payload to its
-configured DAS library path; it does not confirm that Kavita, Audiobookshelf,
-or RomM has indexed it.
+integration is authorized, scan the matching Plex library manually. For an
+evaluation ebook/audiobook, `complete` means Shelfarr published the item to its
+configured DAS path. For BookBot-owned direct media, it means BookBot safely
+copied the validated payload. Neither state confirms that Kavita,
+Audiobookshelf, or RomM has indexed it.
 
 `#automation-admin` remains outside the lifecycle route set. Bazarr does not post
 routine subtitle activity to Discord; any future Bazarr runtime health event must
@@ -94,4 +96,6 @@ ports to the Internet. Runtime credentials and databases are deliberately kept
 out of Git in `.env`, `config/`, and `state/`.
 
 See [docs/architecture.md](docs/architecture.md) for the data flow and
-[docs/recovery.md](docs/recovery.md) for rollback and restoration.
+[docs/recovery.md](docs/recovery.md) for rollback and restoration. The controlled
+Shelfarr outcome and feature-flag rollback are in
+[docs/shelfarr-evaluation.md](docs/shelfarr-evaluation.md).

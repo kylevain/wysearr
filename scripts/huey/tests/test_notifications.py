@@ -10,6 +10,8 @@ from notifications import (  # noqa: E402
     EVENT_ROUTES,
     RoutedNotification,
     response_notifications,
+    shelfarr_state_notifications,
+    shelfarr_correlation_attention_notification,
     terminal_notifications,
 )
 
@@ -70,6 +72,24 @@ class NotificationPolicyTests(unittest.TestCase):
             ["request-status", "download-queue"],
         )
         self.assertEqual(2, len(plans))
+
+    def test_uncertain_submission_does_not_claim_acceptance_or_download(self):
+        plans = response_notifications(
+            "ebooks",
+            self.response(
+                "queued",
+                service="shelfarr",
+                external_status="submission_uncertain",
+                message="Shelfarr submission is being reconciled.",
+            ),
+            self.request(media_type="ebooks", service="shelfarr", title="Dune"),
+        )
+
+        self.assert_valid_plans(plans)
+        self.assertEqual([plan.event_key for plan in plans], ["submission_uncertain"])
+        self.assertEqual([plan.route for plan in plans], ["import-errors"])
+        self.assertNotIn("accepted", plans[0].message.casefold())
+        self.assertNotIn("queued for acquisition", plans[0].message.casefold())
 
     def test_needs_selection_is_a_rejected_request_status_only(self):
         plans = response_notifications(
@@ -156,6 +176,64 @@ class NotificationPolicyTests(unittest.TestCase):
                 combined = " ".join(plan.message for plan in plans)
                 self.assertIn("DAS library path", combined)
                 self.assertNotIn("Plex", combined)
+
+    def test_shelfarr_intermediate_events_stay_in_download_queue(self):
+        for status, event_key in (
+            ("downloading", "download_active"),
+            ("processing", "download_completed"),
+        ):
+            with self.subTest(status=status):
+                plans = shelfarr_state_notifications(
+                    self.request(
+                        media_type="ebooks",
+                        service="shelfarr",
+                        title="Dune",
+                        external_title="Dune",
+                    ),
+                    status,
+                )
+                self.assert_valid_plans(plans)
+                self.assertEqual([plan.route for plan in plans], ["download-queue"])
+                self.assertEqual([plan.event_key for plan in plans], [event_key])
+
+    def test_uncertain_shelfarr_submission_requires_manual_review(self):
+        plan = shelfarr_correlation_attention_notification(
+            self.request(media_type="ebooks", service="shelfarr", title="Dune"),
+            startup=False,
+        )
+
+        self.assert_valid_plans((plan,))
+        self.assertEqual(plan.event_key, "submission_uncertain")
+        self.assertEqual(plan.route, "import-errors")
+        self.assertIn("Automatic retry remains blocked", plan.message)
+
+    def test_uncertain_startup_recovery_is_a_system_health_event(self):
+        plan = shelfarr_correlation_attention_notification(
+            self.request(media_type="ebooks", service="shelfarr", title="Dune"),
+            startup=True,
+        )
+
+        self.assert_valid_plans((plan,))
+        self.assertEqual(plan.event_key, "recovery_uncertain")
+        self.assertEqual(plan.route, "system-health")
+        self.assertIn("Automatic retry remains blocked", plan.message)
+
+    def test_shelfarr_terminal_success_has_status_and_addition(self):
+        plans = terminal_notifications(
+            self.request(
+                media_type="ebooks",
+                service="shelfarr",
+                title="Dune",
+                external_title="Dune",
+                status="completed",
+                terminal_event_type="shelfarr_completed",
+            )
+        )
+        self.assert_valid_plans(plans)
+        self.assertCountEqual(
+            [plan.route for plan in plans], ["request-status", "recent-additions"]
+        )
+        self.assertIn("by Shelfarr", " ".join(plan.message for plan in plans))
 
     def test_bookbot_terminal_success_has_distinct_status_and_addition_events(self):
         plans = terminal_notifications(

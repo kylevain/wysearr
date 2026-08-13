@@ -12,15 +12,23 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 try:  # Support both package imports and direct container script execution.
-    from .matching import select_arr_candidate
+    from .matching import select_arr_candidate, select_shelfarr_candidate
     from .results import result, safe_display_title
 except ImportError:  # pragma: no cover - exercised by the container entrypoint
-    from matching import select_arr_candidate
+    from matching import select_arr_candidate, select_shelfarr_candidate
     from results import result, safe_display_title
 
 
 class ServiceError(RuntimeError):
     """A deliberately sanitized integration error safe for logs and Discord."""
+
+
+class ServiceRejected(ServiceError):
+    """The remote service returned a definite non-success response."""
+
+
+class SubmissionUncertain(ServiceError):
+    """A non-idempotent request may have succeeded despite a lost response."""
 
 
 LOGGER = logging.getLogger("huey.clients")
@@ -76,7 +84,13 @@ class JsonClient:
         except requests.RequestException as error:
             raise ServiceError(f"{self.service} is unavailable.") from error
         if response.status_code not in set(expected):
-            raise ServiceError(
+            error_type = (
+                ServiceRejected
+                if 400 <= response.status_code < 500
+                and response.status_code != 408
+                else ServiceError
+            )
+            raise error_type(
                 f"{self.service} rejected the request (HTTP {response.status_code})."
             )
         if not parse_json:
@@ -378,6 +392,400 @@ class RadarrClient(ArrClient):
 class LidarrClient(ArrClient):
     def __init__(self, base_url: str, api_key: str, **kwargs: Any):
         super().__init__("lidarr", base_url, api_key, **kwargs)
+
+
+class ShelfarrClient(JsonClient):
+    """Work-level ebook/audiobook request and lifecycle client."""
+
+    BOOK_TYPES = {"ebooks": "ebook", "audiobooks": "audiobook"}
+    STATUSES = frozenset(
+        {
+            "pending",
+            "searching",
+            "awaiting_purchase",
+            "not_found",
+            "downloading",
+            "processing",
+            "completed",
+            "failed",
+        }
+    )
+
+    def __init__(
+        self,
+        base_url: str,
+        api_token: str,
+        *,
+        session: requests.Session | Any | None = None,
+        timeout: float = 20,
+        search_limit: int = 10,
+        minimum_confidence: float = 0.80,
+        runner_up_gap: float = 0.05,
+        language: str = "en",
+    ):
+        if not api_token or not api_token.strip():
+            raise ServiceError("Shelfarr API token is not configured.")
+        if not 1 <= int(search_limit) <= 20:
+            raise ValueError("Shelfarr search_limit must be between 1 and 20")
+        if not 0 <= minimum_confidence <= 1:
+            raise ValueError("Shelfarr minimum_confidence must be between 0 and 1")
+        if not 0 <= runner_up_gap <= 1:
+            raise ValueError("Shelfarr runner_up_gap must be between 0 and 1")
+        if not language or not language.strip():
+            raise ValueError("Shelfarr language cannot be empty")
+        super().__init__(
+            "Shelfarr",
+            base_url,
+            session=session,
+            timeout=timeout,
+            headers={
+                "Authorization": f"Bearer {api_token.strip()}",
+                "Accept": "application/json",
+            },
+        )
+        self.search_limit = int(search_limit)
+        self.minimum_confidence = minimum_confidence
+        self.runner_up_gap = runner_up_gap
+        self.language = language.strip()
+
+    @staticmethod
+    def _request_payload(value: Any) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ServiceError("Shelfarr returned an invalid request response.")
+        request_id = value.get("id")
+        status = str(value.get("status") or "").casefold()
+        book = value.get("book")
+        if (
+            isinstance(request_id, bool)
+            or not str(request_id or "").isdigit()
+            or int(request_id) <= 0
+            or status not in ShelfarrClient.STATUSES
+            or not isinstance(book, Mapping)
+        ):
+            raise ServiceError("Shelfarr returned an invalid request response.")
+        return value
+
+    def search(self, title: str, author: str | None = None) -> list[Mapping[str, Any]]:
+        query = f"{title} {author}" if author else title
+        value = self._request(
+            "GET",
+            "/api/v1/search",
+            params={"q": query, "limit": self.search_limit, "content_kind": "book"},
+        )
+        if not isinstance(value, Mapping) or not isinstance(value.get("results"), list):
+            raise ServiceError("Shelfarr returned an invalid search response.")
+        if any(not isinstance(item, Mapping) for item in value["results"]):
+            raise ServiceError("Shelfarr returned an invalid search response.")
+        return value["results"]
+
+    def get_request(self, request_id: str | int) -> Mapping[str, Any]:
+        if isinstance(request_id, bool) or not str(request_id or "").isdigit():
+            raise ServiceError("Shelfarr request has an invalid request ID.")
+        normalized_id = int(request_id)
+        if normalized_id <= 0:
+            raise ServiceError("Shelfarr request has an invalid request ID.")
+        return self._request_payload(
+            self._request("GET", f"/api/v1/requests/{normalized_id}")
+        )
+
+    def cancel_request(self, request_id: str | int) -> Mapping[str, Any]:
+        """Cancel one nonterminal Shelfarr request before Huey fails it."""
+
+        if isinstance(request_id, bool) or not str(request_id or "").isdigit():
+            raise ServiceError("Shelfarr request has an invalid request ID.")
+        normalized_id = int(request_id)
+        if normalized_id <= 0:
+            raise ServiceError("Shelfarr request has an invalid request ID.")
+        return self._request_payload(
+            self._request("DELETE", f"/api/v1/requests/{normalized_id}")
+        )
+
+    def _find_correlated_request(self, request_id: int) -> Mapping[str, Any] | None:
+        """Recover an API request accepted before a lost POST response."""
+
+        marker = f"huey:{int(request_id)}"
+        value = self._request(
+            "GET",
+            "/api/v1/requests",
+            params={"created_via": "api", "limit": 100},
+        )
+        if not isinstance(value, Mapping) or not isinstance(value.get("requests"), list):
+            raise ServiceError("Shelfarr returned an invalid request list.")
+        matches = []
+        for item in value["requests"]:
+            if not isinstance(item, Mapping):
+                continue
+            nested = item.get("request")
+            if isinstance(nested, Mapping) and nested.get("external_source") == marker:
+                try:
+                    matches.append(self._request_payload(item))
+                except ServiceError as error:
+                    raise SubmissionUncertain(
+                        "Shelfarr returned a malformed Huey correlation."
+                    ) from error
+        if len(matches) > 1:
+            raise SubmissionUncertain(
+                "Shelfarr returned duplicate Huey correlations."
+            )
+        return matches[0] if matches else None
+
+    def _find_existing_work_request(
+        self, work_id: str, book_type: str
+    ) -> Mapping[str, Any] | None:
+        """Reuse a completed/active exact work already owned by this API user."""
+
+        value = self._request(
+            "GET",
+            "/api/v1/requests",
+            params={"limit": 100},
+        )
+        if not isinstance(value, Mapping) or not isinstance(value.get("requests"), list):
+            raise ServiceError("Shelfarr returned an invalid request list.")
+        matches = []
+        for item in value["requests"]:
+            if not isinstance(item, Mapping):
+                continue
+            request = self._request_payload(item)
+            book = request["book"]
+            if (
+                str(book.get("work_id") or "") == work_id
+                and str(book.get("book_type") or "").casefold() == book_type
+                and str(request.get("status") or "").casefold()
+                in {"pending", "searching", "downloading", "processing", "completed"}
+            ):
+                matches.append(request)
+        priority = {
+            "completed": 0,
+            "processing": 1,
+            "downloading": 2,
+            "searching": 3,
+            "pending": 4,
+        }
+
+        def request_id(request: Mapping[str, Any]) -> int:
+            try:
+                return int(request.get("id") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        matches.sort(
+            key=lambda request: (
+                priority.get(str(request.get("status") or "").casefold(), 99),
+                -request_id(request),
+            )
+        )
+        return matches[0] if matches else None
+
+    def recover_request(self, request_id: int) -> Mapping[str, Any] | None:
+        """Find a request accepted under Huey's durable correlation marker."""
+
+        return self._find_correlated_request(request_id)
+
+    @staticmethod
+    def _submission_result(
+        created_request: Mapping[str, Any],
+        *,
+        book_type: str,
+        fallback_title: str,
+    ) -> dict[str, str | bool | None]:
+        shelfarr_id = str(created_request["id"])
+        shelfarr_status = str(created_request["status"]).casefold()
+        returned_book = created_request["book"]
+        if str(returned_book.get("book_type") or "").casefold() != book_type:
+            raise ServiceError("Shelfarr returned a mismatched book request.")
+        returned_title = safe_display_title(returned_book.get("title"), fallback_title)
+
+        if shelfarr_status == "completed":
+            return result(
+                "completed",
+                f"Shelfarr already has {returned_title} in its DAS library path.",
+                service="shelfarr",
+                external_id=shelfarr_id,
+                external_title=returned_title,
+                external_status=shelfarr_status,
+            )
+        if shelfarr_status == "failed":
+            return result(
+                "failed",
+                f"Shelfarr could not accept {returned_title} for automatic acquisition.",
+                service="shelfarr",
+                external_id=shelfarr_id,
+                external_title=returned_title,
+                external_status=shelfarr_status,
+                manual_intervention=created_request.get("attention_needed") is True,
+            )
+        if created_request.get("attention_needed") is True:
+            return result(
+                "queued",
+                f"Shelfarr accepted {returned_title} but requires administrator review.",
+                service="shelfarr",
+                external_id=shelfarr_id,
+                external_title=returned_title,
+                external_status=shelfarr_status,
+                manual_intervention=True,
+            )
+        if shelfarr_status == "awaiting_purchase":
+            return result(
+                "queued",
+                f"Shelfarr found only a purchase/manual-upload path for {returned_title}; "
+                "Huey will close this automatic acquisition attempt.",
+                service="shelfarr",
+                external_id=shelfarr_id,
+                external_title=returned_title,
+                external_status=shelfarr_status,
+                manual_intervention=True,
+            )
+        return result(
+            "queued",
+            f"Shelfarr accepted {returned_title} for automatic acquisition.",
+            service="shelfarr",
+            external_id=shelfarr_id,
+            external_title=returned_title,
+            external_status=shelfarr_status,
+        )
+
+    def submit(
+        self,
+        media_type: str,
+        title: str,
+        author: str | None = None,
+        request_id: int | None = None,
+        *,
+        discord_user_id: str | int | None = None,
+        discord_channel_id: str | int | None = None,
+    ) -> dict[str, str | bool | None]:
+        book_type = self.BOOK_TYPES.get(media_type)
+        if book_type is None:
+            raise ValueError(f"Unsupported Shelfarr media type: {media_type}")
+
+        candidates = self.search(title, author)
+        selection = select_shelfarr_candidate(
+            title,
+            author,
+            media_type,
+            candidates,
+            minimum_confidence=self.minimum_confidence,
+            runner_up_gap=self.runner_up_gap,
+        )
+        if selection.selected is None:
+            if selection.reason == "no_results":
+                message = (
+                    "Shelfarr could not identify this title in its metadata sources. "
+                    "Check the title and author."
+                )
+            elif selection.reason == "ambiguous":
+                message = (
+                    "Shelfarr found multiple close title matches. "
+                    "Add or correct the author or edition details."
+                )
+            else:
+                message = (
+                    "Shelfarr could not identify one title with enough confidence. "
+                    "Add or correct the author or edition details."
+                )
+            return result("needs_selection", message, service="shelfarr")
+
+        selected = selection.selected
+        selected_title = safe_display_title(selected.get("title"), title)
+        selected_work_id = str(selected["work_id"])
+        source_work_ids = []
+        sources = selected.get("sources")
+        if isinstance(sources, list):
+            source_work_ids = list(
+                dict.fromkeys(
+                    str(source.get("work_id") or "").strip()
+                    for source in sources
+                    if isinstance(source, Mapping) and source.get("work_id")
+                )
+            )[:20]
+
+        if request_id is not None:
+            recovered = self._find_correlated_request(int(request_id))
+            if recovered is not None:
+                try:
+                    return self._submission_result(
+                        recovered,
+                        book_type=book_type,
+                        fallback_title=selected_title,
+                    )
+                except ServiceError as error:
+                    raise SubmissionUncertain(
+                        "Shelfarr correlation exists but its state is awaiting validation."
+                    ) from error
+        existing_work = self._find_existing_work_request(
+            selected_work_id, book_type
+        )
+        if existing_work is not None:
+            return self._submission_result(
+                existing_work,
+                book_type=book_type,
+                fallback_title=selected_title,
+            )
+
+        payload: dict[str, Any] = {
+            "work_id": selected_work_id,
+            "book_type": book_type,
+            "title": str(selected.get("title") or title),
+            "author": str(selected.get("author") or author or ""),
+            "content_kind": "book",
+            "language": self.language,
+            "external_source": (
+                f"huey:{int(request_id)}" if request_id is not None else "huey"
+            ),
+            "source_work_ids": source_work_ids,
+        }
+        if request_id is not None:
+            payload["notes"] = f"Huey request #{int(request_id)}"
+        if discord_user_id is not None:
+            payload["external_user_id"] = str(discord_user_id)
+        if discord_channel_id is not None:
+            payload["external_chat_id"] = str(discord_channel_id)
+        if selected.get("year") is not None:
+            payload["year"] = selected["year"]
+
+        try:
+            value = self._request("POST", "/api/v1/requests", json=payload)
+            if not isinstance(value, Mapping) or not isinstance(
+                value.get("requests"), list
+            ):
+                raise SubmissionUncertain(
+                    "Shelfarr returned an ambiguous request confirmation."
+                )
+            created = value["requests"]
+            if len(created) != 1:
+                raise SubmissionUncertain(
+                    "Shelfarr returned an ambiguous request confirmation."
+                )
+            return self._submission_result(
+                self._request_payload(created[0]),
+                book_type=book_type,
+                fallback_title=selected_title,
+            )
+        except ServiceError as submission_error:
+            if request_id is None:
+                raise
+            try:
+                recovered = self._find_correlated_request(int(request_id))
+            except ServiceError as recovery_error:
+                raise SubmissionUncertain(
+                    "Shelfarr submission outcome is awaiting correlation recovery."
+                ) from recovery_error
+            if recovered is None:
+                if isinstance(submission_error, ServiceRejected):
+                    raise submission_error
+                raise SubmissionUncertain(
+                    "Shelfarr submission outcome is awaiting correlation recovery."
+                ) from submission_error
+            try:
+                return self._submission_result(
+                    recovered,
+                    book_type=book_type,
+                    fallback_title=selected_title,
+                )
+            except ServiceError as recovery_error:
+                raise SubmissionUncertain(
+                    "Shelfarr correlation exists but its state is awaiting validation."
+                ) from recovery_error
 
 
 class ProwlarrClient(JsonClient):

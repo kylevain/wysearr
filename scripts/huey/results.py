@@ -53,6 +53,7 @@ def result(
     service: str | None = None,
     external_id: str | int | None = None,
     external_title: str | None = None,
+    external_status: str | None = None,
     manual_intervention: bool = False,
 ) -> dict[str, str | bool | None]:
     if status not in RESULT_STATUSES:
@@ -65,6 +66,7 @@ def result(
         "service": service,
         "external_id": str(external_id) if external_id is not None else None,
         "external_title": external_title,
+        "external_status": external_status,
         "manual_intervention": bool(manual_intervention),
     }
 
@@ -78,5 +80,6 @@ def normalize_result(value: Any) -> dict[str, str | bool | None]:
         service=value.get("service"),
         external_id=value.get("external_id"),
         external_title=value.get("external_title"),
+        external_status=value.get("external_status"),
         manual_intervention=value.get("manual_intervention") is True,
     )
