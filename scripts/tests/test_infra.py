@@ -475,6 +475,10 @@ class ShelfarrDeploymentTests(unittest.TestCase):
         self.assertIn("SHELFARR_ENABLED: ${SHELFARR_ENABLED:-false}", compose)
         self.assertIn("  bookbot:\n", compose)
         self.assertIn("dockerfile: docker/bookbot/Dockerfile", compose)
+        self.assertIn(
+            "HUEY_SELECTION_TTL_SECONDS: ${HUEY_SELECTION_TTL_SECONDS:-900}",
+            compose,
+        )
 
     def test_huey_is_not_health_coupled_to_evaluation_services(self):
         compose = (SCRIPTS.parent / "docker-compose.yml").read_text(
@@ -641,6 +645,48 @@ class ValidationTests(unittest.TestCase):
             self.assertFalse(validate.huey_ready_check(marker).ok)
             marker.write_text("ready\n", encoding="utf-8")
             self.assertTrue(validate.huey_ready_check(marker).ok)
+
+    def test_huey_selection_ttl_is_literal_and_bounded(self):
+        self.assertTrue(validate.huey_selection_ttl_check({}).ok)
+        for value in ("1", "900", "86400"):
+            with self.subTest(value=value):
+                self.assertTrue(
+                    validate.huey_selection_ttl_check(
+                        {"HUEY_SELECTION_TTL_SECONDS": value}
+                    ).ok
+                )
+        for value in ("", "0", "86401", " 900 ", "15m", "1.0", "+900"):
+            with self.subTest(value=value):
+                self.assertFalse(
+                    validate.huey_selection_ttl_check(
+                        {"HUEY_SELECTION_TTL_SECONDS": value}
+                    ).ok
+                )
+
+    def test_huey_database_requires_candidate_confirmation_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "huey.db"
+            schema = (SCRIPTS / "huey" / "schema.sql").read_text(encoding="utf-8")
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.executescript(schema)
+                connection.executescript(
+                    """
+                    CREATE UNIQUE INDEX requests_message_id_uq
+                        ON requests(message_id);
+                    CREATE UNIQUE INDEX requests_active_target_uq
+                        ON requests(target_key)
+                        WHERE target_key IS NOT NULL
+                          AND status IN (
+                              'new', 'processing', 'awaiting_selection',
+                              'queued', 'complete', 'completed'
+                          );
+                    """
+                )
+
+            self.assertTrue(validate.huey_database_check(database).ok)
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute("DROP INDEX candidate_confirmations_expiry_idx")
+            self.assertFalse(validate.huey_database_check(database).ok)
 
     def test_shelfarr_storage_requires_all_databases_private_keys_and_no_discord(self):
         with tempfile.TemporaryDirectory() as directory:

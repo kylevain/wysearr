@@ -157,7 +157,8 @@ def shelfarr_correlation_attention_notification(
     title = safe_display_title(request.get("external_title"), request.get("title"))
     if startup:
         problem = (
-            "Shelfarr restored a correlation with an unexpected book format"
+            "Shelfarr restored a correlation with an unexpected book format or "
+            "confirmed identity"
             if format_mismatch
             else "Huey could not yet restore Shelfarr correlation"
         )
@@ -168,7 +169,8 @@ def shelfarr_correlation_attention_notification(
             "blocked; an administrator should review Shelfarr and Huey health.",
         )
     problem = (
-        "Shelfarr returned a correlation with an unexpected book format for"
+        "Shelfarr returned a correlation with an unexpected book format or "
+        "confirmed identity for"
         if format_mismatch
         else "Huey cannot yet confirm whether Shelfarr created a request for"
     )
@@ -204,6 +206,13 @@ def response_notifications(
     status = str(response.get("status") or "").casefold()
     service = _service_name({**dict(request), **dict(response)})
     response_detail = sanitize_display_text(response.get("message"), limit=500)
+
+    if status == "awaiting_selection":
+        # This is an intake conversation, not an accepted, rejected, or queued
+        # lifecycle event.  Huey replies to the original request with the
+        # persisted candidate prompt and emits lifecycle notifications only
+        # after the requester confirms one candidate.
+        return ()
 
     if (
         status == "queued"

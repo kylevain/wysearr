@@ -110,6 +110,24 @@ class NotificationPolicyTests(unittest.TestCase):
         self.assert_valid_plans(plans)
         self.assertEqual(["request-status"], [plan.route for plan in plans])
 
+    def test_awaiting_candidate_selection_has_no_lifecycle_notification(self):
+        plans = response_notifications(
+            "ebooks",
+            self.response(
+                "awaiting_selection",
+                message="Choose one verified metadata candidate.",
+            ),
+            self.request(
+                media_type="ebooks",
+                title="Dune",
+                external_title=None,
+                status="awaiting_selection",
+                service="shelfarr",
+            ),
+        )
+
+        self.assertEqual((), plans)
+
     def test_immediate_handler_terminal_response_uses_request_status_only(self):
         for status in ("failed", "complete", "completed"):
             with self.subTest(status=status):
@@ -152,7 +170,13 @@ class NotificationPolicyTests(unittest.TestCase):
         self.assertEqual(2, len({plan.message for plan in plans}))
 
     def test_duplicate_response_does_not_repeat_any_lifecycle_event(self):
-        for status in ("queued", "needs_selection", "failed", "completed"):
+        for status in (
+            "queued",
+            "awaiting_selection",
+            "needs_selection",
+            "failed",
+            "completed",
+        ):
             with self.subTest(status=status):
                 plans = response_notifications(
                     "movies-tv",

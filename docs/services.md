@@ -38,6 +38,15 @@ during every deployment. When the Shelfarr feature flag is enabled,
 `scripts/bootstrap_shelfarr.py` additionally converges its scoped API identity,
 clients, source policy, output paths, and notification boundary.
 
+Huey remains the only book request interface. While `SHELFARR_ENABLED=true`, an
+ambiguous Shelfarr ebook/audiobook metadata search can produce a persisted
+two-or-three-option Discord prompt. The same Discord user must reply directly
+to the Huey prompt in the same channel with one integer within 15 minutes by
+default. Huey freshly revalidates the selected metadata work before creating a
+Shelfarr request; it never uses Shelfarr's acquisition-result `/grab` API for
+this choice. This continuation is unavailable to legacy `needs_selection`
+records and is never enabled for movies, TV, or direct-media handlers.
+
 Useful health commands:
 
 ```bash

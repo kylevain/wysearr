@@ -15,6 +15,39 @@ from orchestrator import RequestProcessor
 from results import result
 
 
+def selection_proposal():
+    return tuple(
+        {
+            "fingerprint": character * 64,
+            "label": label,
+            "work_id": work_id,
+            "source_work_ids": (work_id,),
+            "title": "Dune",
+            "author": author,
+            "year": year,
+            "content_kind": "book",
+            "media_type": "ebooks",
+            "book_type": "ebook",
+        }
+        for character, label, work_id, author, year in (
+            (
+                "a",
+                "Dune · by Frank Herbert · (1965) · Ebook · Open Library",
+                "openlibrary:OL893415W",
+                "Frank Herbert",
+                1965,
+            ),
+            (
+                "b",
+                "Dune · by Brian Herbert · (2005) · Ebook · Open Library",
+                "openlibrary:OL2W",
+                "Brian Herbert",
+                2005,
+            ),
+        )
+    )
+
+
 class RequestProcessorTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -57,6 +90,13 @@ class RequestProcessorTests(unittest.TestCase):
         self.assertEqual(
             [event["event_type"] for event in self.store.events_for(saved["id"])],
             ["received", "processing", "handler_queued"],
+        )
+        self.assertCountEqual(
+            [
+                delivery["event_key"]
+                for delivery in self.store.pending_notification_deliveries()
+            ],
+            ["request_accepted", "download_queued"],
         )
 
     def test_shelfarr_request_id_and_initial_status_are_correlated(self):
@@ -103,6 +143,313 @@ class RequestProcessorTests(unittest.TestCase):
 
         self.assertEqual(observed["status"], "processing")
         self.assertEqual(observed["service"], "shelfarr")
+
+    def test_ambiguous_shelfarr_result_persists_active_confirmation(self):
+        class EnabledServices:
+            shelfarr_enabled = True
+
+        response = RequestProcessor(
+            self.store,
+            services=EnabledServices(),
+            dispatcher=Mock(
+                return_value=result(
+                    "awaiting_selection",
+                    "Choose one candidate.",
+                    service="shelfarr",
+                    selection_proposal=selection_proposal(),
+                )
+            ),
+            selection_ttl_seconds=900,
+        ).process(self.delivery)
+
+        self.assertEqual(response["status"], "awaiting_selection")
+        saved = self.store.get_request(response["request_id"])
+        self.assertEqual(saved["status"], "awaiting_selection")
+        self.assertEqual(saved["service"], "shelfarr")
+        confirmation = self.store.get_candidate_confirmation(saved["id"])
+        self.assertEqual(len(confirmation["options"]), 2)
+        self.assertEqual(confirmation["options"][0]["ordinal"], 1)
+        duplicate = RequestProcessor(
+            self.store,
+            services=EnabledServices(),
+            dispatcher=Mock(),
+        ).process(self.delivery)
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["status"], "needs_selection")
+
+    def test_candidate_reply_dispatches_selected_snapshot_once(self):
+        class EnabledServices:
+            shelfarr_enabled = True
+
+            def __init__(self):
+                def selected(_request, _candidate, *, before_create):
+                    before_create()
+                    return result(
+                        "queued",
+                        "Shelfarr accepted Dune.",
+                        service="shelfarr",
+                        external_id="73",
+                        external_title="Dune",
+                        external_status="pending",
+                    )
+
+                self.book_selected = Mock(side_effect=selected)
+
+        services = EnabledServices()
+        processor = RequestProcessor(
+            self.store,
+            services=services,
+            dispatcher=Mock(
+                return_value=result(
+                    "awaiting_selection",
+                    "Choose one candidate.",
+                    service="shelfarr",
+                    selection_proposal=selection_proposal(),
+                )
+            ),
+        )
+        intake = processor.process(self.delivery)
+        self.assertTrue(
+            self.store.bind_candidate_prompt(intake["request_id"], "500")
+        )
+        selection = {
+            "prompt_message_id": "500",
+            "message_id": "600",
+            "discord_user_id": "1",
+            "channel_id": "2",
+            "ordinal": 2,
+        }
+
+        response = processor.process_candidate_reply(selection)
+        duplicate = processor.process_candidate_reply(selection)
+
+        self.assertEqual(response["selection_outcome"], "claimed")
+        self.assertEqual(response["status"], "queued")
+        self.assertIn("Confirmed. Continuing request.", response["message"])
+        self.assertEqual(response["request_id"], intake["request_id"])
+        self.assertEqual(duplicate["selection_outcome"], "duplicate")
+        services.book_selected.assert_called_once()
+        continued_request, selected = services.book_selected.call_args.args
+        self.assertEqual(continued_request["id"], intake["request_id"])
+        self.assertEqual(selected["work_id"], "openlibrary:OL2W")
+        self.assertTrue(callable(services.book_selected.call_args.kwargs["before_create"]))
+        self.assertIsNotNone(
+            self.store.get_candidate_confirmation(intake["request_id"])[
+                "dispatch_started_at"
+            ]
+        )
+        self.assertEqual(self.store.get_request(intake["request_id"])["status"], "queued")
+        self.assertCountEqual(
+            [
+                (delivery["event_key"], delivery["route"])
+                for delivery in self.store.pending_notification_deliveries()
+            ],
+            [
+                ("request_accepted", "request-status"),
+                ("download_queued", "download-queue"),
+            ],
+        )
+
+    def test_claimed_candidate_reply_redelivery_without_reference_reuses_canonical_request(self):
+        class EnabledServices:
+            shelfarr_enabled = True
+
+            def __init__(self):
+                def selected(_request, _candidate, *, before_create):
+                    before_create()
+                    return result(
+                        "queued",
+                        "Shelfarr accepted Dune.",
+                        service="shelfarr",
+                        external_id="73",
+                        external_title="Dune",
+                        external_status="pending",
+                    )
+
+                self.book_selected = Mock(side_effect=selected)
+
+        services = EnabledServices()
+        dispatcher = Mock(
+            return_value=result(
+                "awaiting_selection",
+                "Choose one candidate.",
+                service="shelfarr",
+                selection_proposal=selection_proposal(),
+            )
+        )
+        processor = RequestProcessor(
+            self.store, services=services, dispatcher=dispatcher
+        )
+        intake = processor.process(self.delivery)
+        self.assertTrue(
+            self.store.bind_candidate_prompt(intake["request_id"], "500")
+        )
+        selection = {
+            "prompt_message_id": "500",
+            "message_id": "600",
+            "discord_user_id": "1",
+            "channel_id": "2",
+            "ordinal": 2,
+        }
+
+        claimed = processor.process_candidate_reply(selection)
+        redelivery_without_reference = processor.process(
+            {
+                **self.delivery,
+                "message_id": "600",
+                "content": "2",
+            }
+        )
+
+        self.assertEqual(claimed["selection_outcome"], "claimed")
+        self.assertTrue(redelivery_without_reference["duplicate"])
+        self.assertEqual(
+            redelivery_without_reference["request_id"], intake["request_id"]
+        )
+        self.assertEqual(
+            self.store.get_by_message_id("600")["id"], intake["request_id"]
+        )
+        self.assertEqual(dispatcher.call_count, 1)
+        services.book_selected.assert_called_once()
+        with self.store.connect() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM requests").fetchone()[0],
+                1,
+            )
+
+    def test_invalid_candidate_reply_never_dispatches(self):
+        class EnabledServices:
+            shelfarr_enabled = True
+            book_selected = Mock()
+
+        services = EnabledServices()
+        processor = RequestProcessor(
+            self.store,
+            services=services,
+            dispatcher=Mock(
+                return_value=result(
+                    "awaiting_selection",
+                    "Choose one candidate.",
+                    service="shelfarr",
+                    selection_proposal=selection_proposal(),
+                )
+            ),
+        )
+        intake = processor.process(self.delivery)
+        self.store.bind_candidate_prompt(intake["request_id"], "500")
+
+        response = processor.process_candidate_reply(
+            {
+                "prompt_message_id": "500",
+                "message_id": "601",
+                "discord_user_id": "1",
+                "channel_id": "2",
+                "ordinal": 99,
+            }
+        )
+
+        self.assertEqual(response["selection_outcome"], "invalid")
+        services.book_selected.assert_not_called()
+        self.assertEqual(
+            self.store.get_request(intake["request_id"])["status"],
+            "awaiting_selection",
+        )
+
+    def test_invalid_candidate_reply_redelivery_without_reference_reuses_canonical_request(self):
+        class EnabledServices:
+            shelfarr_enabled = True
+            book_selected = Mock()
+
+        services = EnabledServices()
+        dispatcher = Mock(
+            return_value=result(
+                "awaiting_selection",
+                "Choose one candidate.",
+                service="shelfarr",
+                selection_proposal=selection_proposal(),
+            )
+        )
+        processor = RequestProcessor(
+            self.store, services=services, dispatcher=dispatcher
+        )
+        intake = processor.process(self.delivery)
+        self.assertTrue(
+            self.store.bind_candidate_prompt(intake["request_id"], "500")
+        )
+        selection = {
+            "prompt_message_id": "500",
+            "message_id": "601",
+            "discord_user_id": "1",
+            "channel_id": "2",
+            "ordinal": 99,
+        }
+
+        invalid = processor.process_candidate_reply(selection)
+        redelivery_without_reference = processor.process(
+            {
+                **self.delivery,
+                "message_id": "601",
+                "content": "99",
+            }
+        )
+
+        self.assertEqual(invalid["selection_outcome"], "invalid")
+        self.assertTrue(redelivery_without_reference["duplicate"])
+        self.assertEqual(
+            redelivery_without_reference["request_id"], intake["request_id"]
+        )
+        self.assertEqual(
+            self.store.get_by_message_id("601")["id"], intake["request_id"]
+        )
+        self.assertEqual(dispatcher.call_count, 1)
+        services.book_selected.assert_not_called()
+        with self.store.connect() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM requests").fetchone()[0],
+                1,
+            )
+
+    def test_stale_candidate_does_not_claim_acquisition_continued(self):
+        class EnabledServices:
+            shelfarr_enabled = True
+
+            @staticmethod
+            def book_selected(_request, _candidate, *, before_create):
+                before_create()
+                return result(
+                    "needs_selection",
+                    "Shelfarr's metadata choices changed.",
+                    service="shelfarr",
+                )
+
+        processor = RequestProcessor(
+            self.store,
+            services=EnabledServices(),
+            dispatcher=Mock(
+                return_value=result(
+                    "awaiting_selection",
+                    "Choose one candidate.",
+                    service="shelfarr",
+                    selection_proposal=selection_proposal(),
+                )
+            ),
+        )
+        intake = processor.process(self.delivery)
+        self.store.bind_candidate_prompt(intake["request_id"], "500")
+
+        response = processor.process_candidate_reply(
+            {
+                "prompt_message_id": "500",
+                "message_id": "602",
+                "discord_user_id": "1",
+                "channel_id": "2",
+                "ordinal": 1,
+            }
+        )
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertTrue(response["message"].startswith("Selection received, but"))
+        self.assertNotIn("Confirmed. Continuing request.", response["message"])
 
     def test_uncertain_shelfarr_submission_remains_active_for_recovery(self):
         class EnabledServices:
@@ -234,6 +581,10 @@ class RequestProcessorTests(unittest.TestCase):
         saved = self.store.get_request(response["request_id"])
         self.assertEqual(saved["status"], "needs_selection")
         self.assertIsNotNone(saved["error"])
+        deliveries = self.store.pending_notification_deliveries()
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(deliveries[0]["event_key"], "request_rejected")
+        self.assertEqual(deliveries[0]["route"], "request-status")
         dispatcher.assert_not_called()
 
     def test_movie_kind_reaches_dispatcher(self):

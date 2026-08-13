@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urljoin, urlparse
 
 import requests
 
 try:  # Support both package imports and direct container script execution.
-    from .matching import select_arr_candidate, select_shelfarr_candidate
-    from .results import result, safe_display_title
+    from .matching import (
+        normalize_identity_text,
+        select_arr_candidate,
+        select_shelfarr_candidate,
+    )
+    from .results import result, safe_display_title, sanitize_display_text
 except ImportError:  # pragma: no cover - exercised by the container entrypoint
-    from matching import select_arr_candidate, select_shelfarr_candidate
-    from results import result, safe_display_title
+    from matching import normalize_identity_text, select_arr_candidate, select_shelfarr_candidate
+    from results import result, safe_display_title, sanitize_display_text
 
 
 class ServiceError(RuntimeError):
@@ -410,6 +418,20 @@ class ShelfarrClient(JsonClient):
             "failed",
         }
     )
+    MAX_PROPOSAL_CANDIDATES = 3
+    MAX_SOURCE_WORK_IDS = 8
+    _WORK_ID = re.compile(
+        r"\A(?:hardcover|google_books|openlibrary):[A-Za-z0-9][A-Za-z0-9._:-]{0,230}\Z"
+    )
+    _FINGERPRINT = re.compile(r"\A[0-9a-f]{64}\Z")
+    _SENSITIVE_IDENTITY = re.compile(
+        r"(?:api[_-]?key|token|password|secret|authorization)", re.IGNORECASE
+    )
+    _SOURCE_LABELS = {
+        "hardcover": "Hardcover",
+        "google_books": "Google Books",
+        "openlibrary": "Open Library",
+    }
 
     def __init__(
         self,
@@ -448,22 +470,265 @@ class ShelfarrClient(JsonClient):
         self.runner_up_gap = runner_up_gap
         self.language = language.strip()
 
-    @staticmethod
-    def _request_payload(value: Any) -> Mapping[str, Any]:
+    @classmethod
+    def _safe_work_id(cls, value: object) -> str | None:
+        text = unicodedata.normalize("NFKC", str(value or "")).strip()
+        if (
+            not text
+            or len(text.encode("utf-8")) > 255
+            or not cls._WORK_ID.fullmatch(text)
+            or cls._SENSITIVE_IDENTITY.search(text)
+        ):
+            return None
+        return text
+
+    @classmethod
+    def _candidate_snapshot(
+        cls, candidate: Mapping[str, Any], media_type: str
+    ) -> dict[str, Any] | None:
+        """Return the bounded identity that may cross a Discord confirmation gap."""
+
+        book_type = cls.BOOK_TYPES.get(media_type)
+        if book_type is None or not isinstance(candidate, Mapping):
+            return None
+        if str(candidate.get("content_kind") or "").strip().casefold() != "book":
+            return None
+        available = candidate.get("available_book_types")
+        if not isinstance(available, (list, tuple, set)) or book_type not in {
+            str(value).strip().casefold() for value in available
+        }:
+            return None
+
+        work_id = cls._safe_work_id(candidate.get("work_id"))
+        sources = candidate.get("sources")
+        if work_id is None or not isinstance(sources, list):
+            return None
+        source_work_ids: list[str] = []
+        for source in sources:
+            if not isinstance(source, Mapping):
+                return None
+            source_work_id = cls._safe_work_id(source.get("work_id"))
+            if source_work_id is None:
+                return None
+            if source_work_id not in source_work_ids:
+                source_work_ids.append(source_work_id)
+            if len(source_work_ids) > cls.MAX_SOURCE_WORK_IDS:
+                return None
+        if not source_work_ids or source_work_ids[0] != work_id:
+            return None
+
+        title = sanitize_display_text(candidate.get("title"), limit=160)
+        raw_author = candidate.get("author")
+        author = (
+            sanitize_display_text(raw_author, limit=160)
+            if raw_author not in (None, "")
+            else None
+        )
+        if title is None or (raw_author not in (None, "") and author is None):
+            return None
+
+        raw_year = candidate.get("year")
+        if raw_year in (None, ""):
+            year = None
+        elif isinstance(raw_year, bool):
+            return None
+        else:
+            try:
+                year = int(raw_year)
+            except (TypeError, ValueError):
+                return None
+            if not 0 <= year <= 9999:
+                return None
+
+        fingerprint_payload = {
+            "version": 1,
+            "media_type": media_type,
+            "book_type": book_type,
+            "content_kind": "book",
+            "work_id": work_id,
+            "source_work_ids": source_work_ids,
+            "title": normalize_identity_text(title),
+            "author": normalize_identity_text(author),
+            "year": year,
+        }
+        encoded = json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        fingerprint = hashlib.sha256(encoded).hexdigest()
+
+        source = work_id.split(":", 1)[0]
+        format_label = "Ebook" if book_type == "ebook" else "Audiobook"
+        label_parts = [title]
+        if author:
+            label_parts.append(f"by {author}")
+        if year is not None:
+            label_parts.append(f"({year})")
+        label_parts.extend((format_label, cls._SOURCE_LABELS[source]))
+        label = sanitize_display_text(" · ".join(label_parts), limit=300)
+        if label is None:
+            return None
+
+        return {
+            "fingerprint": fingerprint,
+            "label": label,
+            "work_id": work_id,
+            "source_work_ids": tuple(source_work_ids),
+            "title": title,
+            "author": author,
+            "year": year,
+            "content_kind": "book",
+            "media_type": media_type,
+            "book_type": book_type,
+        }
+
+    @classmethod
+    def _validated_proposal_snapshot(
+        cls, selected_candidate: object, media_type: str
+    ) -> dict[str, Any] | None:
+        """Recompute a persisted proposal fingerprint instead of trusting it."""
+
+        if not isinstance(selected_candidate, Mapping):
+            return None
+        if (
+            selected_candidate.get("media_type") != media_type
+            or selected_candidate.get("book_type") != cls.BOOK_TYPES.get(media_type)
+            or selected_candidate.get("content_kind") != "book"
+        ):
+            return None
+        source_work_ids = selected_candidate.get("source_work_ids")
+        if not isinstance(source_work_ids, (list, tuple)):
+            return None
+        rebuilt = cls._candidate_snapshot(
+            {
+                "work_id": selected_candidate.get("work_id"),
+                "title": selected_candidate.get("title"),
+                "author": selected_candidate.get("author"),
+                "year": selected_candidate.get("year"),
+                "content_kind": selected_candidate.get("content_kind"),
+                "available_book_types": [selected_candidate.get("book_type")],
+                "sources": [
+                    {"work_id": source_work_id} for source_work_id in source_work_ids
+                ],
+            },
+            media_type,
+        )
+        supplied_fingerprint = str(selected_candidate.get("fingerprint") or "")
+        if (
+            rebuilt is None
+            or not cls._FINGERPRINT.fullmatch(supplied_fingerprint)
+            or not hmac.compare_digest(rebuilt["fingerprint"], supplied_fingerprint)
+            or rebuilt["label"] != selected_candidate.get("label")
+        ):
+            return None
+        return rebuilt
+
+    def _selection_proposal(self, selection: Any, media_type: str) -> tuple[dict[str, Any], ...]:
+        if selection.reason != "ambiguous" or not selection.ranked:
+            return ()
+        top_score = selection.ranked[0].score
+        proposals: list[dict[str, Any]] = []
+        fingerprints: set[str] = set()
+        labels: set[str] = set()
+        for ranked in selection.ranked:
+            if ranked.score < self.minimum_confidence:
+                continue
+            if top_score - ranked.score >= self.runner_up_gap:
+                continue
+            snapshot = self._candidate_snapshot(ranked.item, media_type)
+            if snapshot is None or snapshot["fingerprint"] in fingerprints:
+                continue
+            if snapshot["label"] in labels:
+                return ()
+            fingerprints.add(snapshot["fingerprint"])
+            labels.add(snapshot["label"])
+            proposals.append(snapshot)
+            if len(proposals) == self.MAX_PROPOSAL_CANDIDATES:
+                break
+        return tuple(proposals) if len(proposals) >= 2 else ()
+
+    @classmethod
+    def _request_payload(cls, value: Any) -> Mapping[str, Any]:
         if not isinstance(value, Mapping):
             raise ServiceError("Shelfarr returned an invalid request response.")
         request_id = value.get("id")
-        status = str(value.get("status") or "").casefold()
+        status = value.get("status")
+        attention_needed = value.get("attention_needed")
+        nested_request = value.get("request")
         book = value.get("book")
         if (
             isinstance(request_id, bool)
             or not str(request_id or "").isdigit()
             or int(request_id) <= 0
-            or status not in ShelfarrClient.STATUSES
+            or not isinstance(status, str)
+            or status not in cls.STATUSES
+            or not isinstance(attention_needed, bool)
+            or not isinstance(nested_request, Mapping)
             or not isinstance(book, Mapping)
         ):
             raise ServiceError("Shelfarr returned an invalid request response.")
+        nested_id = nested_request.get("id")
+        nested_status = nested_request.get("status")
+        nested_attention = nested_request.get("attention_needed")
+        book_id = book.get("id")
+        book_title = book.get("title")
+        book_type = book.get("book_type")
+        book_work_id = book.get("work_id")
+        if (
+            isinstance(nested_id, bool)
+            or not str(nested_id or "").isdigit()
+            or int(nested_id) != int(request_id)
+            or nested_status != status
+            or nested_attention is not attention_needed
+            or nested_request.get("created_via") not in {"api", "web", "telegram"}
+            or nested_request.get("request_scope") not in {"single", "collection"}
+            or isinstance(book_id, bool)
+            or not str(book_id or "").isdigit()
+            or int(book_id) <= 0
+            or not isinstance(book_title, str)
+            or not book_title.strip()
+            or book_type not in {"ebook", "audiobook"}
+            or book.get("content_kind") != "book"
+            or cls._safe_work_id(book_work_id) != book_work_id
+        ):
+            raise ServiceError("Shelfarr returned an invalid request response.")
         return value
+
+    @classmethod
+    def _created_request_payload(
+        cls,
+        value: Any,
+        *,
+        expected_external_source: str,
+    ) -> Mapping[str, Any]:
+        """Validate Shelfarr's pinned synchronous single-create contract."""
+
+        if (
+            not isinstance(value, Mapping)
+            or value.get("queued") is not False
+            or not isinstance(value.get("warnings"), list)
+            or value["warnings"]
+            or not isinstance(value.get("errors"), list)
+            or value["errors"]
+            or not isinstance(value.get("requests"), list)
+            or len(value["requests"]) != 1
+        ):
+            raise SubmissionUncertain(
+                "Shelfarr returned an ambiguous request confirmation."
+            )
+        created = cls._request_payload(value["requests"][0])
+        nested_request = created["request"]
+        if (
+            nested_request.get("created_via") != "api"
+            or nested_request.get("external_source") != expected_external_source
+            or nested_request.get("request_scope") != "single"
+        ):
+            raise SubmissionUncertain(
+                "Shelfarr returned an ambiguous request confirmation."
+            )
+        return created
 
     def search(self, title: str, author: str | None = None) -> list[Mapping[str, Any]]:
         query = f"{title} {author}" if author else title
@@ -513,16 +778,19 @@ class ShelfarrClient(JsonClient):
             raise ServiceError("Shelfarr returned an invalid request list.")
         matches = []
         for item in value["requests"]:
-            if not isinstance(item, Mapping):
-                continue
-            nested = item.get("request")
-            if isinstance(nested, Mapping) and nested.get("external_source") == marker:
-                try:
-                    matches.append(self._request_payload(item))
-                except ServiceError as error:
-                    raise SubmissionUncertain(
-                        "Shelfarr returned a malformed Huey correlation."
-                    ) from error
+            try:
+                request = self._request_payload(item)
+            except ServiceError as error:
+                raise SubmissionUncertain(
+                    "Shelfarr returned a malformed Huey correlation list."
+                ) from error
+            nested = request["request"]
+            if nested.get("created_via") != "api":
+                raise SubmissionUncertain(
+                    "Shelfarr returned a malformed Huey correlation list."
+                )
+            if nested.get("external_source") == marker:
+                matches.append(request)
         if len(matches) > 1:
             raise SubmissionUncertain(
                 "Shelfarr returned duplicate Huey correlations."
@@ -530,7 +798,7 @@ class ShelfarrClient(JsonClient):
         return matches[0] if matches else None
 
     def _find_existing_work_request(
-        self, work_id: str, book_type: str
+        self, work_ids: Iterable[str], book_type: str
     ) -> Mapping[str, Any] | None:
         """Reuse a completed/active exact work already owned by this API user."""
 
@@ -541,6 +809,7 @@ class ShelfarrClient(JsonClient):
         )
         if not isinstance(value, Mapping) or not isinstance(value.get("requests"), list):
             raise ServiceError("Shelfarr returned an invalid request list.")
+        expected_work_ids = set(work_ids)
         matches = []
         for item in value["requests"]:
             if not isinstance(item, Mapping):
@@ -548,7 +817,7 @@ class ShelfarrClient(JsonClient):
             request = self._request_payload(item)
             book = request["book"]
             if (
-                str(book.get("work_id") or "") == work_id
+                str(book.get("work_id") or "") in expected_work_ids
                 and str(book.get("book_type") or "").casefold() == book_type
                 and str(request.get("status") or "").casefold()
                 in {"pending", "searching", "downloading", "processing", "completed"}
@@ -581,17 +850,51 @@ class ShelfarrClient(JsonClient):
 
         return self._find_correlated_request(request_id)
 
+    @classmethod
+    def recovered_request_matches_candidate(
+        cls,
+        remote: object,
+        selected_candidate: object,
+        media_type: str,
+    ) -> bool:
+        """Bind crash recovery to the exact work the requester confirmed.
+
+        ``recover_request`` separately establishes the durable ``huey:<id>``
+        correlation.  This check lets the reconciler require that the recovered
+        request also has the confirmed format and one of the candidate's exact,
+        bounded provider aliases before it accepts the correlation.
+        """
+
+        selected = cls._validated_proposal_snapshot(selected_candidate, media_type)
+        if selected is None:
+            return False
+        try:
+            request = cls._request_payload(remote)
+        except ServiceError:
+            return False
+        book = request["book"]
+        return bool(
+            book["book_type"] == selected["book_type"]
+            and book["content_kind"] == "book"
+            and book["work_id"] in set(selected["source_work_ids"])
+        )
+
     @staticmethod
     def _submission_result(
         created_request: Mapping[str, Any],
         *,
         book_type: str,
         fallback_title: str,
-    ) -> dict[str, str | bool | None]:
+        expected_work_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
         shelfarr_id = str(created_request["id"])
         shelfarr_status = str(created_request["status"]).casefold()
         returned_book = created_request["book"]
         if str(returned_book.get("book_type") or "").casefold() != book_type:
+            raise ServiceError("Shelfarr returned a mismatched book request.")
+        if expected_work_ids is not None and str(returned_book.get("work_id") or "") not in set(
+            expected_work_ids
+        ):
             raise ServiceError("Shelfarr returned a mismatched book request.")
         returned_title = safe_display_title(returned_book.get("title"), fallback_title)
 
@@ -644,60 +947,30 @@ class ShelfarrClient(JsonClient):
             external_status=shelfarr_status,
         )
 
-    def submit(
-        self,
-        media_type: str,
-        title: str,
-        author: str | None = None,
-        request_id: int | None = None,
-        *,
-        discord_user_id: str | int | None = None,
-        discord_channel_id: str | int | None = None,
-    ) -> dict[str, str | bool | None]:
-        book_type = self.BOOK_TYPES.get(media_type)
-        if book_type is None:
-            raise ValueError(f"Unsupported Shelfarr media type: {media_type}")
-
-        candidates = self.search(title, author)
-        selection = select_shelfarr_candidate(
-            title,
-            author,
-            media_type,
-            candidates,
-            minimum_confidence=self.minimum_confidence,
-            runner_up_gap=self.runner_up_gap,
+    @staticmethod
+    def _selection_refresh_result() -> dict[str, Any]:
+        return result(
+            "needs_selection",
+            "Shelfarr's metadata choices changed or could not be verified. "
+            "Search again before confirming a title.",
+            service="shelfarr",
         )
-        if selection.selected is None:
-            if selection.reason == "no_results":
-                message = (
-                    "Shelfarr could not identify this title in its metadata sources. "
-                    "Check the title and author."
-                )
-            elif selection.reason == "ambiguous":
-                message = (
-                    "Shelfarr found multiple close title matches. "
-                    "Add or correct the author or edition details."
-                )
-            else:
-                message = (
-                    "Shelfarr could not identify one title with enough confidence. "
-                    "Add or correct the author or edition details."
-                )
-            return result("needs_selection", message, service="shelfarr")
 
-        selected = selection.selected
-        selected_title = safe_display_title(selected.get("title"), title)
+    def _submit_candidate(
+        self,
+        selected: Mapping[str, Any],
+        *,
+        request_id: int | None,
+        discord_user_id: str | int | None,
+        discord_channel_id: str | int | None,
+        before_create: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        """Use the existing correlation boundary for one verified work."""
+
+        book_type = str(selected["book_type"])
+        selected_title = str(selected["title"])
         selected_work_id = str(selected["work_id"])
-        source_work_ids = []
-        sources = selected.get("sources")
-        if isinstance(sources, list):
-            source_work_ids = list(
-                dict.fromkeys(
-                    str(source.get("work_id") or "").strip()
-                    for source in sources
-                    if isinstance(source, Mapping) and source.get("work_id")
-                )
-            )[:20]
+        source_work_ids = tuple(str(value) for value in selected["source_work_ids"])
 
         if request_id is not None:
             recovered = self._find_correlated_request(int(request_id))
@@ -707,32 +980,32 @@ class ShelfarrClient(JsonClient):
                         recovered,
                         book_type=book_type,
                         fallback_title=selected_title,
+                        expected_work_ids=source_work_ids,
                     )
                 except ServiceError as error:
                     raise SubmissionUncertain(
                         "Shelfarr correlation exists but its state is awaiting validation."
                     ) from error
-        existing_work = self._find_existing_work_request(
-            selected_work_id, book_type
-        )
+        existing_work = self._find_existing_work_request(source_work_ids, book_type)
         if existing_work is not None:
             return self._submission_result(
                 existing_work,
                 book_type=book_type,
                 fallback_title=selected_title,
+                expected_work_ids=source_work_ids,
             )
 
         payload: dict[str, Any] = {
             "work_id": selected_work_id,
             "book_type": book_type,
-            "title": str(selected.get("title") or title),
-            "author": str(selected.get("author") or author or ""),
+            "title": selected_title,
+            "author": str(selected.get("author") or ""),
             "content_kind": "book",
             "language": self.language,
             "external_source": (
                 f"huey:{int(request_id)}" if request_id is not None else "huey"
             ),
-            "source_work_ids": source_work_ids,
+            "source_work_ids": list(source_work_ids),
         }
         if request_id is not None:
             payload["notes"] = f"Huey request #{int(request_id)}"
@@ -743,23 +1016,24 @@ class ShelfarrClient(JsonClient):
         if selected.get("year") is not None:
             payload["year"] = selected["year"]
 
+        if before_create is not None:
+            before_create()
         try:
-            value = self._request("POST", "/api/v1/requests", json=payload)
-            if not isinstance(value, Mapping) or not isinstance(
-                value.get("requests"), list
-            ):
-                raise SubmissionUncertain(
-                    "Shelfarr returned an ambiguous request confirmation."
-                )
-            created = value["requests"]
-            if len(created) != 1:
-                raise SubmissionUncertain(
-                    "Shelfarr returned an ambiguous request confirmation."
-                )
+            value = self._request(
+                "POST",
+                "/api/v1/requests",
+                expected=(201,),
+                json=payload,
+            )
+            created = self._created_request_payload(
+                value,
+                expected_external_source=str(payload["external_source"]),
+            )
             return self._submission_result(
-                self._request_payload(created[0]),
+                created,
                 book_type=book_type,
                 fallback_title=selected_title,
+                expected_work_ids=source_work_ids,
             )
         except ServiceError as submission_error:
             if request_id is None:
@@ -781,11 +1055,127 @@ class ShelfarrClient(JsonClient):
                     recovered,
                     book_type=book_type,
                     fallback_title=selected_title,
+                    expected_work_ids=source_work_ids,
                 )
             except ServiceError as recovery_error:
                 raise SubmissionUncertain(
                     "Shelfarr correlation exists but its state is awaiting validation."
                 ) from recovery_error
+
+    def submit(
+        self,
+        media_type: str,
+        title: str,
+        author: str | None = None,
+        request_id: int | None = None,
+        *,
+        discord_user_id: str | int | None = None,
+        discord_channel_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        book_type = self.BOOK_TYPES.get(media_type)
+        if book_type is None:
+            raise ValueError(f"Unsupported Shelfarr media type: {media_type}")
+
+        candidates = self.search(title, author)
+        selection = select_shelfarr_candidate(
+            title,
+            author,
+            media_type,
+            candidates,
+            minimum_confidence=self.minimum_confidence,
+            runner_up_gap=self.runner_up_gap,
+        )
+        if selection.selected is None:
+            proposal = self._selection_proposal(selection, media_type)
+            if proposal:
+                return result(
+                    "awaiting_selection",
+                    "Shelfarr found multiple close metadata matches. "
+                    "Choose one of the verified title options before acquisition starts.",
+                    service="shelfarr",
+                    selection_proposal=proposal,
+                )
+            if selection.reason == "no_results":
+                message = (
+                    "Shelfarr could not identify this title in its metadata sources. "
+                    "Check the title and author."
+                )
+            elif selection.reason == "ambiguous":
+                message = (
+                    "Shelfarr found multiple close title matches. "
+                    "Add or correct the author or edition details."
+                )
+            else:
+                message = (
+                    "Shelfarr could not identify one title with enough confidence. "
+                    "Add or correct the author or edition details."
+                )
+            return result("needs_selection", message, service="shelfarr")
+
+        selected = self._candidate_snapshot(selection.selected, media_type)
+        if selected is None:
+            return self._selection_refresh_result()
+        return self._submit_candidate(
+            selected,
+            request_id=request_id,
+            discord_user_id=discord_user_id,
+            discord_channel_id=discord_channel_id,
+        )
+
+    def submit_selected(
+        self,
+        media_type: str,
+        title: str,
+        author: str | None,
+        request_id: int,
+        *,
+        selected_candidate: Mapping[str, Any],
+        discord_user_id: str | int | None = None,
+        discord_channel_id: str | int | None = None,
+        before_create: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        """Continue one human-selected work only after a fresh exact recheck."""
+
+        if self.BOOK_TYPES.get(media_type) is None:
+            raise ValueError(f"Unsupported Shelfarr media type: {media_type}")
+        if (
+            isinstance(request_id, bool)
+            or not str(request_id or "").isdigit()
+            or int(request_id) <= 0
+        ):
+            raise ValueError("Shelfarr continuation requires a positive Huey request ID")
+        persisted = self._validated_proposal_snapshot(selected_candidate, media_type)
+        if persisted is None:
+            return self._selection_refresh_result()
+
+        fresh_candidates = self.search(title, author)
+        fresh_selection = select_shelfarr_candidate(
+            title,
+            author,
+            media_type,
+            fresh_candidates,
+            minimum_confidence=self.minimum_confidence,
+            runner_up_gap=self.runner_up_gap,
+        )
+        matches: list[dict[str, Any]] = []
+        for ranked in fresh_selection.ranked:
+            if ranked.score < self.minimum_confidence:
+                continue
+            snapshot = self._candidate_snapshot(ranked.item, media_type)
+            if snapshot is not None and hmac.compare_digest(
+                snapshot["fingerprint"], persisted["fingerprint"]
+            ):
+                matches.append(snapshot)
+        if len(matches) != 1:
+            return self._selection_refresh_result()
+
+        return self._submit_candidate(
+            matches[0],
+            request_id=int(request_id),
+            discord_user_id=discord_user_id,
+            discord_channel_id=discord_channel_id,
+            before_create=before_create,
+        )
 
 
 class ProwlarrClient(JsonClient):

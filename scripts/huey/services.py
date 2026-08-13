@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 try:
@@ -177,6 +177,35 @@ class ServiceRegistry:
             str(request["title"]),
             str(request["author"]) if request.get("author") else None,
             int(request["id"]),
+        )
+
+    def book_selected(
+        self,
+        request: Mapping[str, Any],
+        selected_candidate: Mapping[str, Any],
+        *,
+        before_create: Callable[[], None] | None = None,
+    ):
+        """Continue a persisted Shelfarr metadata confirmation.
+
+        Candidate confirmation is an evaluation-only Shelfarr capability.  It
+        must never fall back to the legacy direct/qBittorrent path if Shelfarr
+        ownership is later disabled while a Discord prompt is outstanding.
+        """
+
+        if not self.shelfarr_enabled:
+            raise RuntimeError(
+                "Shelfarr ownership was disabled before candidate confirmation."
+            )
+        return self.shelfarr().submit_selected(
+            str(request["media_type"]),
+            str(request["title"]),
+            str(request["author"]) if request.get("author") else None,
+            int(request["id"]),
+            selected_candidate=selected_candidate,
+            discord_user_id=request.get("discord_user_id"),
+            discord_channel_id=request.get("channel_id"),
+            before_create=before_create,
         )
 
     def direct(self) -> DirectAcquirer:

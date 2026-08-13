@@ -99,6 +99,45 @@ operations without printing secrets:
 - disables LibriVox, credentialed direct sources, Discord, generic webhooks,
   and Telegram.
 
+## Discord metadata confirmation
+
+Shelfarr metadata selection remains inside Discord; its UI is not exposed as a
+family request interface. For a newly submitted ebook or audiobook, Huey still
+automatically uses one unambiguous high-confidence work. If two or three safe
+metadata works fall inside the configured ambiguity band, Huey instead:
+
+1. persists at most three bounded candidate snapshots and reserves the exact
+   request target as `awaiting_selection`;
+2. replies to the original request with a numbered candidate list;
+3. accepts only a strict positive integer sent as a direct reply to that exact
+   Huey prompt by the original Discord user in the original request channel;
+4. atomically claims the first valid Discord reply and ignores gateway
+   redelivery without a second dispatch;
+5. searches Shelfarr metadata again and requires the persisted candidate
+   fingerprint to match exactly; and
+6. creates the Shelfarr request using the original Huey request ID and
+   `huey:<id>` correlation, then starts the normal request-status/download
+   lifecycle routing.
+
+The default reply lifetime is 15 minutes. Set
+`HUEY_SELECTION_TTL_SECONDS` to a literal integer from 1 through 86400 seconds
+to change it. Expiration releases the target for a new request and durably
+routes one clarification/rejection to request-status. A malformed,
+out-of-range, wrong-user, or wrong-channel reply is corrective only: it cannot
+dispatch acquisition or emit lifecycle events. If Discord cannot return and
+persist the prompt message ID, Huey releases the target without acquisition.
+
+This flow is enabled only for Shelfarr-owned ebooks/audiobooks. Existing
+`needs_selection` rows from parse failures, no metadata results, low-confidence
+matches, and non-Shelfarr handlers cannot be resumed. Candidate confirmation is
+metadata-work selection; Huey does not call Shelfarr's `/grab` endpoint, which
+selects a downloadable acquisition result only after a Shelfarr request exists.
+Request-channel `read_message_history` permission is already required by Huey's
+readiness check and is sufficient for Discord reply references; no slash-command
+or application-command permission is introduced.
+
+## Deployment procedure
+
 Use the repository deployment as the only enable procedure. It quiesces Huey
 and both evaluation services, checkpoints state, quarantines any persisted NNTP
 server before SAB can start, handles first-run INI creation, converges Prowlarr
@@ -227,12 +266,13 @@ Newznab indexer. Do not count a retry as successful unless Shelfarr completes
 the import and a readable, nonempty expected-format artifact exists in the
 confined final DAS path.
 
-Huey currently fails closed on ambiguous work metadata and does not expose an
-interactive Discord candidate-selection state. Shelfarr exposes release-level
-selection APIs, but those APIs do not independently enforce the requested
-author or format. Do not auto-grab ambiguous or mismatched candidates. A future
-confirmation workflow must bind a fresh candidate fingerprint to the original
-Huey request before any write.
+Huey now fails closed into its interactive Discord confirmation state only when
+Shelfarr returns two or three safe work-level metadata candidates. The selected
+work is freshly fingerprint-verified against the original Huey request before
+request creation. Shelfarr also exposes release-level selection APIs, but those
+APIs do not independently enforce the requested author or format and are not
+used by this flow. Do not auto-grab ambiguous or mismatched acquisition
+releases.
 
 Catalog visibility remains a separate read-only check. Ebook validation needs
 the actual Kavita URL, a least-privilege Kavita auth key, and ebook library ID

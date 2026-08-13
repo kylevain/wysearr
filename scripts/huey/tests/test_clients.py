@@ -1,7 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -20,6 +20,7 @@ from clients import (
     ShelfarrClient,
     SonarrClient,
 )
+from results import normalize_result
 
 
 class FakeResponse:
@@ -292,17 +293,41 @@ class ShelfarrClientTests(unittest.TestCase):
         return value
 
     def request_payload(self, **overrides):
+        request_overrides = dict(overrides.pop("request", {}))
+        book_overrides = dict(overrides.pop("book", {}))
         value = {
             "id": 73,
             "status": "pending",
             "attention_needed": False,
             "issue_description": None,
-            "book": {
-                "id": 9,
-                "title": "Dune",
-                "author": "Frank Herbert",
-                "book_type": "ebook",
-            },
+        }
+        value.update(overrides)
+        value["request"] = {
+            "id": value["id"],
+            "status": value["status"],
+            "attention_needed": value["attention_needed"],
+            "created_via": "api",
+            "external_source": "huey:42",
+            "request_scope": "single",
+            **request_overrides,
+        }
+        value["book"] = {
+            "id": 9,
+            "title": "Dune",
+            "author": "Frank Herbert",
+            "book_type": "ebook",
+            "content_kind": "book",
+            "work_id": "openlibrary:OL893415W",
+            **book_overrides,
+        }
+        return value
+
+    def create_response(self, request=None, **overrides):
+        value = {
+            "requests": [request or self.request_payload()],
+            "queued": False,
+            "warnings": [],
+            "errors": [],
         }
         value.update(overrides)
         return value
@@ -313,7 +338,7 @@ class ShelfarrClientTests(unittest.TestCase):
                 FakeResponse(json_value={"results": [self.metadata_result()]}),
                 FakeResponse(json_value={"requests": []}),
                 FakeResponse(json_value={"requests": []}),
-                FakeResponse(json_value={"requests": [self.request_payload()]}),
+                FakeResponse(status=201, json_value=self.create_response()),
             ]
         )
         client = ShelfarrClient("http://shelfarr", "shf_secret", session=session)
@@ -368,6 +393,7 @@ class ShelfarrClientTests(unittest.TestCase):
                             self.metadata_result(
                                 work_id="openlibrary:OTHER",
                                 author="Another Author",
+                                sources=[{"work_id": "openlibrary:OTHER"}],
                             ),
                         ]
                     }
@@ -378,8 +404,9 @@ class ShelfarrClientTests(unittest.TestCase):
             "http://shelfarr", "shf_secret", session=session
         ).submit("audiobooks", "Dune")
 
-        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["status"], "awaiting_selection")
         self.assertEqual(response["service"], "shelfarr")
+        self.assertEqual(len(response["selection_proposal"]), 2)
         self.assertEqual(len(session.calls), 1)
 
     def test_requested_format_must_be_available_in_metadata_result(self):
@@ -400,7 +427,548 @@ class ShelfarrClientTests(unittest.TestCase):
         ).submit("audiobooks", "Dune", "Frank Herbert", 42)
 
         self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["selection_proposal"], ())
         self.assertEqual(len(session.calls), 1)
+
+    def test_ambiguous_proposal_is_bounded_sanitized_and_normalized(self):
+        candidates = []
+        for index in range(4):
+            work_id = f"openlibrary:OL-OPTION-{index}"
+            candidates.append(
+                self.metadata_result(
+                    work_id=work_id,
+                    author=f"Author {index}",
+                    sources=[
+                        {
+                            "work_id": work_id,
+                            "source_url": f"https://metadata.invalid/{index}?token=hidden",
+                        }
+                    ],
+                    canonical_key=f"isbn:private-{index}",
+                )
+            )
+        session = FakeSession([FakeResponse(json_value={"results": candidates})])
+
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit("ebooks", "Dune")
+        normalized = normalize_result(response)
+
+        self.assertEqual(response["status"], "awaiting_selection")
+        self.assertEqual(len(response["selection_proposal"]), 3)
+        self.assertEqual(normalized["selection_proposal"], response["selection_proposal"])
+        expected_keys = {
+            "fingerprint",
+            "label",
+            "work_id",
+            "source_work_ids",
+            "title",
+            "author",
+            "year",
+            "content_kind",
+            "media_type",
+            "book_type",
+        }
+        for proposal in response["selection_proposal"]:
+            self.assertEqual(set(proposal), expected_keys)
+            self.assertRegex(proposal["fingerprint"], r"\A[0-9a-f]{64}\Z")
+            self.assertEqual(proposal["content_kind"], "book")
+            self.assertEqual(proposal["media_type"], "ebooks")
+            self.assertEqual(proposal["book_type"], "ebook")
+        rendered = repr(response["selection_proposal"])
+        self.assertNotIn("https://", rendered)
+        self.assertNotIn("token=", rendered)
+        self.assertNotIn("canonical_key", rendered)
+
+    def test_selected_proposal_is_freshly_revalidated_before_one_create(self):
+        other = self.metadata_result(
+            work_id="openlibrary:OTHER",
+            author="Another Author",
+            sources=[{"work_id": "openlibrary:OTHER"}],
+        )
+        initial_session = FakeSession(
+            [
+                FakeResponse(
+                    json_value={"results": [self.metadata_result(), other]}
+                )
+            ]
+        )
+        initial = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=initial_session
+        ).submit("ebooks", "Dune")
+        selected = next(
+            proposal
+            for proposal in initial["selection_proposal"]
+            if proposal["work_id"] == "openlibrary:OL893415W"
+        )
+
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result(), other]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(status=201, json_value=self.create_response()),
+            ]
+        )
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit_selected(
+            "ebooks",
+            "Dune",
+            None,
+            42,
+            selected_candidate=selected,
+            discord_user_id="1001",
+            discord_channel_id="2002",
+        )
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET", "GET", "POST"])
+        self.assertEqual(sum(call[0] == "POST" for call in session.calls), 1)
+        self.assertFalse(
+            any(
+                call[1].endswith("/grab") or call[1].endswith("/retry")
+                for call in session.calls
+            )
+        )
+        payload = session.calls[-1][2]["json"]
+        self.assertEqual(payload["work_id"], selected["work_id"])
+        self.assertEqual(payload["source_work_ids"], list(selected["source_work_ids"]))
+        self.assertEqual(payload["external_source"], "huey:42")
+
+    def test_selected_create_hook_runs_once_immediately_before_post(self):
+        selected = ShelfarrClient._candidate_snapshot(
+            self.metadata_result(), "ebooks"
+        )
+        self.assertIsNotNone(selected)
+        events = []
+
+        class OrderingSession(FakeSession):
+            def request(self, method, url, **kwargs):
+                if method == "POST":
+                    events.append("post")
+                return super().request(method, url, **kwargs)
+
+        session = OrderingSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(status=201, json_value=self.create_response()),
+            ]
+        )
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit_selected(
+            "ebooks",
+            "Dune",
+            "Frank Herbert",
+            42,
+            selected_candidate=selected,
+            before_create=lambda: events.append("callback"),
+        )
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(events, ["callback", "post"])
+        self.assertEqual(sum(call[0] == "POST" for call in session.calls), 1)
+
+    def test_selected_create_hook_failure_prevents_post(self):
+        selected = ShelfarrClient._candidate_snapshot(
+            self.metadata_result(), "ebooks"
+        )
+        self.assertIsNotNone(selected)
+        callback_calls = []
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": []}),
+            ]
+        )
+
+        def fail_before_create():
+            callback_calls.append("called")
+            raise RuntimeError("could not persist dispatch intent")
+
+        with self.assertRaisesRegex(RuntimeError, "persist dispatch intent"):
+            ShelfarrClient(
+                "http://shelfarr", "shf_secret", session=session
+            ).submit_selected(
+                "ebooks",
+                "Dune",
+                "Frank Herbert",
+                42,
+                selected_candidate=selected,
+                before_create=fail_before_create,
+            )
+
+        self.assertEqual(callback_calls, ["called"])
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET", "GET"])
+        self.assertEqual(sum(call[0] == "POST" for call in session.calls), 0)
+
+    def test_selected_create_hook_is_not_called_for_stale_or_reused_work(self):
+        selected = ShelfarrClient._candidate_snapshot(
+            self.metadata_result(), "ebooks"
+        )
+        self.assertIsNotNone(selected)
+
+        stale_hook = Mock()
+        stale_session = FakeSession(
+            [FakeResponse(json_value={"results": [self.metadata_result(year=1966)]})]
+        )
+        stale = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=stale_session
+        ).submit_selected(
+            "ebooks",
+            "Dune",
+            "Frank Herbert",
+            42,
+            selected_candidate=selected,
+            before_create=stale_hook,
+        )
+        self.assertEqual(stale["status"], "needs_selection")
+        stale_hook.assert_not_called()
+
+        reused_hook = Mock()
+        reused_session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": [self.request_payload()]}),
+            ]
+        )
+        reused = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=reused_session
+        ).submit_selected(
+            "ebooks",
+            "Dune",
+            "Frank Herbert",
+            42,
+            selected_candidate=selected,
+            before_create=reused_hook,
+        )
+        self.assertEqual(reused["status"], "queued")
+        reused_hook.assert_not_called()
+        self.assertEqual(sum(call[0] == "POST" for call in reused_session.calls), 0)
+
+    def test_create_requires_exact_pinned_response_without_a_second_post(self):
+        exact = self.create_response()
+        missing_queued = dict(exact)
+        missing_queued.pop("queued")
+        missing_warnings = dict(exact)
+        missing_warnings.pop("warnings")
+        missing_errors = dict(exact)
+        missing_errors.pop("errors")
+
+        malformed = (
+            ("HTTP 200", FakeResponse(status=200, json_value=exact)),
+            ("HTTP 202", FakeResponse(status=202, json_value=exact)),
+            ("missing queued", FakeResponse(status=201, json_value=missing_queued)),
+            (
+                "non-boolean queued",
+                FakeResponse(status=201, json_value=self.create_response(queued=0)),
+            ),
+            (
+                "queued response",
+                FakeResponse(status=201, json_value=self.create_response(queued=True)),
+            ),
+            (
+                "missing warnings",
+                FakeResponse(status=201, json_value=missing_warnings),
+            ),
+            (
+                "non-list warnings",
+                FakeResponse(status=201, json_value=self.create_response(warnings={})),
+            ),
+            (
+                "warning present",
+                FakeResponse(
+                    status=201, json_value=self.create_response(warnings=["partial"])
+                ),
+            ),
+            ("missing errors", FakeResponse(status=201, json_value=missing_errors)),
+            (
+                "non-list errors",
+                FakeResponse(status=201, json_value=self.create_response(errors={})),
+            ),
+            (
+                "error present",
+                FakeResponse(
+                    status=201, json_value=self.create_response(errors=["failed"])
+                ),
+            ),
+            (
+                "multiple requests",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(
+                        requests=[self.request_payload(), self.request_payload(id=74)]
+                    ),
+                ),
+            ),
+            (
+                "empty requests",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(requests=[]),
+                ),
+            ),
+            (
+                "non-list requests",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(requests={}),
+                ),
+            ),
+            (
+                "wrong correlation",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(
+                        self.request_payload(
+                            request={"external_source": "huey:another-request"}
+                        )
+                    ),
+                ),
+            ),
+            (
+                "missing nested request",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(
+                        {
+                            key: value
+                            for key, value in self.request_payload().items()
+                            if key != "request"
+                        }
+                    ),
+                ),
+            ),
+            (
+                "mismatched nested id",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(
+                        self.request_payload(request={"id": 999})
+                    ),
+                ),
+            ),
+            (
+                "mismatched nested status",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(
+                        self.request_payload(request={"status": "searching"})
+                    ),
+                ),
+            ),
+            (
+                "mismatched nested attention",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(
+                        self.request_payload(request={"attention_needed": True})
+                    ),
+                ),
+            ),
+            (
+                "wrong origin",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(
+                        self.request_payload(request={"created_via": "web"})
+                    ),
+                ),
+            ),
+            (
+                "collection response",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(
+                        self.request_payload(request={"request_scope": "collection"})
+                    ),
+                ),
+            ),
+            (
+                "wrong content kind",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(
+                        self.request_payload(book={"content_kind": "comic"})
+                    ),
+                ),
+            ),
+            (
+                "unsafe work identity",
+                FakeResponse(
+                    status=201,
+                    json_value=self.create_response(
+                        self.request_payload(book={"work_id": "openlibrary:token"})
+                    ),
+                ),
+            ),
+        )
+
+        for label, post_response in malformed:
+            with self.subTest(label=label):
+                session = FakeSession(
+                    [
+                        FakeResponse(json_value={"results": [self.metadata_result()]}),
+                        FakeResponse(json_value={"requests": []}),
+                        FakeResponse(json_value={"requests": []}),
+                        post_response,
+                        FakeResponse(json_value={"requests": []}),
+                    ]
+                )
+                with self.assertRaises(SubmissionUncertain):
+                    ShelfarrClient(
+                        "http://shelfarr", "shf_secret", session=session
+                    ).submit("ebooks", "Dune", "Frank Herbert", 42)
+                self.assertEqual(
+                    [call[0] for call in session.calls],
+                    ["GET", "GET", "GET", "POST", "GET"],
+                )
+                self.assertEqual(sum(call[0] == "POST" for call in session.calls), 1)
+
+    def test_selected_proposal_change_or_tampering_never_creates(self):
+        other = self.metadata_result(
+            work_id="openlibrary:OTHER",
+            author="Another Author",
+            sources=[{"work_id": "openlibrary:OTHER"}],
+        )
+        initial = ShelfarrClient(
+            "http://shelfarr",
+            "shf_secret",
+            session=FakeSession(
+                [FakeResponse(json_value={"results": [self.metadata_result(), other]})]
+            ),
+        ).submit("audiobooks", "Dune")
+        selected = next(
+            proposal
+            for proposal in initial["selection_proposal"]
+            if proposal["work_id"] == "openlibrary:OL893415W"
+        )
+
+        changed_session = FakeSession(
+            [
+                FakeResponse(
+                    json_value={
+                        "results": [self.metadata_result(year=1966), other]
+                    }
+                )
+            ]
+        )
+        changed = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=changed_session
+        ).submit_selected(
+            "audiobooks",
+            "Dune",
+            None,
+            42,
+            selected_candidate=selected,
+        )
+        self.assertEqual(changed["status"], "needs_selection")
+        self.assertEqual([call[0] for call in changed_session.calls], ["GET"])
+
+        tampered = dict(selected)
+        tampered["title"] = "A Different Book"
+        no_call_session = FakeSession()
+        rejected = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=no_call_session
+        ).submit_selected(
+            "audiobooks",
+            "Dune",
+            None,
+            42,
+            selected_candidate=tampered,
+        )
+        self.assertEqual(rejected["status"], "needs_selection")
+        self.assertEqual(no_call_session.calls, [])
+
+        invalid_fingerprint = dict(selected)
+        invalid_fingerprint["fingerprint"] = "é" * 64
+        invalid_fingerprint_session = FakeSession()
+        rejected_fingerprint = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=invalid_fingerprint_session
+        ).submit_selected(
+            "audiobooks",
+            "Dune",
+            None,
+            42,
+            selected_candidate=invalid_fingerprint,
+        )
+        self.assertEqual(rejected_fingerprint["status"], "needs_selection")
+        self.assertEqual(invalid_fingerprint_session.calls, [])
+
+        wrong_format_session = FakeSession()
+        wrong_format = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=wrong_format_session
+        ).submit_selected(
+            "ebooks",
+            "Dune",
+            None,
+            42,
+            selected_candidate=selected,
+        )
+        self.assertEqual(wrong_format["status"], "needs_selection")
+        self.assertEqual(wrong_format_session.calls, [])
+
+        with self.assertRaisesRegex(ValueError, "positive Huey request ID"):
+            ShelfarrClient(
+                "http://shelfarr", "shf_secret", session=FakeSession()
+            ).submit_selected(
+                "audiobooks",
+                "Dune",
+                None,
+                0,
+                selected_candidate=selected,
+            )
+
+    def test_recovered_request_must_match_confirmed_candidate_alias_and_format(self):
+        selected = ShelfarrClient._candidate_snapshot(
+            self.metadata_result(), "ebooks"
+        )
+        self.assertIsNotNone(selected)
+        persisted = {**selected, "source_work_ids": list(selected["source_work_ids"])}
+
+        self.assertTrue(
+            ShelfarrClient.recovered_request_matches_candidate(
+                self.request_payload(), persisted, "ebooks"
+            )
+        )
+        self.assertTrue(
+            ShelfarrClient.recovered_request_matches_candidate(
+                self.request_payload(book={"work_id": "hardcover:book:123"}),
+                persisted,
+                "ebooks",
+            )
+        )
+
+        mismatches = (
+            self.request_payload(book={"work_id": "openlibrary:OTHER"}),
+            self.request_payload(book={"book_type": "audiobook"}),
+            self.request_payload(book={"content_kind": "graphic"}),
+            self.request_payload(request={"status": "searching"}),
+        )
+        for remote in mismatches:
+            with self.subTest(remote=remote):
+                self.assertFalse(
+                    ShelfarrClient.recovered_request_matches_candidate(
+                        remote, persisted, "ebooks"
+                    )
+                )
+
+        tampered = {**persisted, "fingerprint": "f" * 64}
+        self.assertFalse(
+            ShelfarrClient.recovered_request_matches_candidate(
+                self.request_payload(), tampered, "ebooks"
+            )
+        )
+        self.assertFalse(
+            ShelfarrClient.recovered_request_matches_candidate(
+                self.request_payload(), persisted, "audiobooks"
+            )
+        )
 
     def test_existing_correlation_recovers_without_duplicate_post(self):
         correlated = self.request_payload(
@@ -463,7 +1031,7 @@ class ShelfarrClientTests(unittest.TestCase):
     def test_completed_evaluation_work_is_reused_by_new_huey_request(self):
         completed = self.request_payload(
             status="completed",
-            request={"id": 7, "external_source": "huey:900200012"},
+            request={"external_source": "huey:900200012"},
         )
         completed["book"] = {
             **completed["book"],

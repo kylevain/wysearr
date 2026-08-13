@@ -50,6 +50,7 @@ _SHELFARR_IMPORT_FAILURE = re.compile(
     r"disk space|no space|destination|finali[sz])",
     re.IGNORECASE,
 )
+_SELECTION_ORDINAL = re.compile(r"^[1-9][0-9]*$")
 
 
 def write_ready_marker(path: str | Path) -> None:
@@ -67,6 +68,7 @@ def remove_ready_marker(path: str | Path) -> None:
 def format_reply(media_type: str, response: dict[str, Any]) -> str:
     symbols = {
         "queued": "✅",
+        "awaiting_selection": "⚠️",
         "needs_selection": "⚠️",
         "failed": "❌",
         "complete": "✅",
@@ -82,6 +84,114 @@ def format_reply(media_type: str, response: dict[str, Any]) -> str:
         f"{symbol} Request #{response['request_id']}\n"
         f"Type: {media_type}\n"
         f"{response['message']}"
+    )
+
+
+def format_candidate_prompt(
+    media_type: str,
+    response: dict[str, Any],
+    *,
+    ttl_seconds: int,
+) -> str:
+    """Render a bounded prompt from already-sanitized persisted candidates."""
+
+    candidates = response.get("selection_proposal")
+    if not isinstance(candidates, (list, tuple)) or not candidates:
+        raise ValueError("Candidate prompt requires at least one option")
+    lines = []
+    for ordinal, candidate in enumerate(candidates[:3], start=1):
+        if not isinstance(candidate, dict):
+            raise ValueError("Candidate prompt contains an invalid option")
+        label = sanitize_display_text(candidate.get("label"), limit=300)
+        if not label:
+            raise ValueError("Candidate prompt contains an invalid label")
+        lines.append(f"{ordinal}. {label}")
+    minutes = max(1, (int(ttl_seconds) + 59) // 60)
+    return (
+        f"⚠️ Request #{response['request_id']} needs one metadata choice\n"
+        f"Type: {media_type}\n"
+        + "\n".join(lines)
+        + f"\nReply directly to this message with one number within {minutes} minute"
+        + ("" if minutes == 1 else "s")
+        + "."
+    )
+
+
+def _reply_reference_message_id(message: Any) -> str | None:
+    reference = getattr(message, "reference", None)
+    message_id = getattr(reference, "message_id", None)
+    if isinstance(message_id, bool) or not str(message_id or "").isdigit():
+        return None
+    if int(message_id) <= 0:
+        return None
+    return str(message_id)
+
+
+def _selection_ordinal(content: object) -> int:
+    text = str(content or "")
+    # Avoid Python's large-integer conversion limit while still treating an
+    # all-digit but absurd reply as an out-of-range selection.
+    if not _SELECTION_ORDINAL.fullmatch(text) or len(text) > 6:
+        return 0
+    return int(text)
+
+
+async def _reply_targets_huey_candidate_prompt(
+    client: Any, message: Any, prompt_message_id: str
+) -> bool | None:
+    """Identify a referenced Huey candidate prompt without trusting its reply.
+
+    ``None`` means Discord could not resolve the reference. Callers use that
+    distinction to fail closed for book-channel replies during the short
+    interval between Discord accepting a prompt and SQLite binding its ID.
+    """
+
+    reference = getattr(message, "reference", None)
+    referenced = getattr(reference, "resolved", None)
+    if referenced is None:
+        referenced = getattr(reference, "cached_message", None)
+    if referenced is None:
+        fetch_message = getattr(getattr(message, "channel", None), "fetch_message", None)
+        if not callable(fetch_message):
+            return None
+        try:
+            referenced = await fetch_message(int(prompt_message_id))
+        except Exception:
+            return None
+
+    author = getattr(referenced, "author", None)
+    client_user = getattr(client, "user", None)
+    author_id = getattr(author, "id", None)
+    client_user_id = getattr(client_user, "id", None)
+    if author_id is None or client_user_id is None:
+        return None
+    if str(author_id) != str(client_user_id):
+        return False
+    content = getattr(referenced, "content", None)
+    if not isinstance(content, str):
+        return None
+    return bool(
+        content.startswith("⚠️ Request #")
+        and " needs one metadata choice\n" in content
+        and "\nReply directly to this message with one number within " in content
+    )
+
+
+def selection_correction(outcome: str, request_id: object = None) -> str:
+    suffix = f" for request #{request_id}" if request_id is not None else ""
+    if outcome == "expired":
+        return (
+            f"⚠️ That metadata prompt{suffix} expired. "
+            "Submit the title again to start a new search."
+        )
+    if outcome == "inactive":
+        return (
+            "⚠️ That Huey metadata prompt is not active. "
+            "Submit the title as a new standalone message to start another search."
+        )
+    return (
+        f"⚠️ That is not a valid choice{suffix}. "
+        "The original requester must reply in this channel with one listed whole number."
     )
 
 
@@ -254,26 +364,28 @@ def reconcile_arr_requests(store: RequestStore, services: Any) -> int:
 def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
     """Poll correlated Shelfarr requests and persist each lifecycle edge once."""
 
-    def stage_recovered_acceptance(request: dict[str, Any]) -> None:
+    def recovered_acceptance_plans(
+        request: dict[str, Any], recovered: dict[str, Any]
+    ) -> tuple[Any, ...]:
         response = {
             "request_id": int(request["id"]),
             "status": "queued",
             "message": "Recovered a Shelfarr request after correlation completed.",
             "duplicate": False,
             "service": "shelfarr",
-            "external_id": request.get("external_id"),
-            "external_title": request.get("external_title"),
-            "external_status": request.get("external_status"),
-        }
-        for plan in response_notifications(
-            str(request.get("media_type") or "ebooks"), response, request
-        ):
-            store.enqueue_notification(
-                int(request["id"]), plan.event_key, plan.route, plan.message
+            "external_id": str(recovered["id"]),
+            "external_title": sanitize_display_text(
+                recovered.get("book", {}).get("title"), limit=300
             )
+            or request.get("title"),
+            "external_status": str(recovered["status"]).casefold(),
+        }
+        return response_notifications(
+            str(request.get("media_type") or "ebooks"), response, request
+        )
 
-    def recovered_format_matches(
-        request: dict[str, Any], recovered: dict[str, Any]
+    def recovered_identity_matches(
+        request: dict[str, Any], recovered: dict[str, Any], shelfarr_client: Any
     ) -> bool:
         expected = {"ebooks": "ebook", "audiobooks": "audiobook"}.get(
             str(request.get("media_type") or "").casefold()
@@ -284,7 +396,37 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
             if isinstance(book, dict)
             else ""
         )
-        return expected is not None and actual == expected
+        if expected is None or actual != expected:
+            return False
+
+        try:
+            confirmation = store.get_candidate_confirmation(int(request["id"]))
+            if confirmation is None:
+                return True
+            if confirmation.get("status") != "claimed":
+                return False
+            selected_ordinal = confirmation.get("selected_ordinal")
+            selected_options = [
+                option
+                for option in confirmation.get("options", ())
+                if isinstance(option, dict)
+                and option.get("ordinal") == selected_ordinal
+            ]
+            if len(selected_options) != 1:
+                return False
+            selected_candidate = selected_options[0].get("candidate")
+            matcher = getattr(
+                shelfarr_client, "recovered_request_matches_candidate", None
+            )
+            if not callable(matcher):
+                return False
+            return matcher(
+                recovered,
+                selected_candidate,
+                str(request.get("media_type") or ""),
+            ) is True
+        except Exception:
+            return False
 
     def quarantine_format_mismatch(
         request: dict[str, Any], *, startup: bool
@@ -304,7 +446,8 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
     changed_count = 0
     for uncertain in store.uncertain_shelfarr_requests():
         try:
-            recovered = services.shelfarr().recover_request(int(uncertain["id"]))
+            shelfarr_client = services.shelfarr()
+            recovered = shelfarr_client.recover_request(int(uncertain["id"]))
         except Exception as error:
             LOGGER.warning(
                 "Shelfarr uncertain submission recovery deferred for request %s (%s)",
@@ -328,10 +471,11 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
                 uncertain["id"],
             )
             continue
-        if not recovered_format_matches(uncertain, recovered):
+        if not recovered_identity_matches(uncertain, recovered, shelfarr_client):
             quarantine_format_mismatch(uncertain, startup=False)
             continue
-        recovered_request = store.transition(
+        plans = recovered_acceptance_plans(uncertain, recovered)
+        store.transition(
             int(uncertain["id"]),
             "queued",
             "Recovered Shelfarr correlation after an uncertain submission",
@@ -343,13 +487,16 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
                 recovered.get("book", {}).get("title"), limit=300
             )
             or uncertain.get("title"),
+            notifications=tuple(
+                (plan.event_key, plan.route, plan.message) for plan in plans
+            ),
         )
-        stage_recovered_acceptance(recovered_request)
         changed_count += 1
 
     for interrupted in store.interrupted_shelfarr_requests():
         try:
-            recovered = services.shelfarr().recover_request(int(interrupted["id"]))
+            shelfarr_client = services.shelfarr()
+            recovered = shelfarr_client.recover_request(int(interrupted["id"]))
         except Exception as error:
             LOGGER.warning(
                 "Shelfarr crash-window recovery deferred for request %s (%s)",
@@ -373,10 +520,11 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
                 interrupted["id"],
             )
             continue
-        if not recovered_format_matches(interrupted, recovered):
+        if not recovered_identity_matches(interrupted, recovered, shelfarr_client):
             quarantine_format_mismatch(interrupted, startup=True)
             continue
-        recovered_request = store.transition(
+        plans = recovered_acceptance_plans(interrupted, recovered)
+        store.transition(
             int(interrupted["id"]),
             "queued",
             "Recovered Shelfarr correlation after interrupted Huey dispatch",
@@ -388,8 +536,10 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
                 recovered.get("book", {}).get("title"), limit=300
             )
             or interrupted.get("title"),
+            notifications=tuple(
+                (plan.event_key, plan.route, plan.message) for plan in plans
+            ),
         )
-        stage_recovered_acceptance(recovered_request)
         changed_count += 1
 
     for request in store.queued_shelfarr_requests():
@@ -583,6 +733,14 @@ async def notification_loop(
 
     while not client.is_closed():
         try:
+            await asyncio.to_thread(store.expire_candidate_confirmations)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.error(
+                "Candidate confirmation expiry failed (%s)", type(error).__name__
+            )
+        try:
             await asyncio.to_thread(reconcile_arr_requests, store, services)
         except asyncio.CancelledError:
             raise
@@ -671,37 +829,8 @@ def build_client(
                 name="huey-shelfarr-reconciliation",
             )
 
-    @client.event
-    async def on_message(message):
-        if getattr(message.author, "bot", False) or getattr(message, "webhook_id", None) is not None:
-            return
-        media_type = channel_config.request_channels.get(str(message.channel.id))
-        if media_type is None:
-            return
-
-        delivery = {
-            "discord_user_id": str(message.author.id),
-            "discord_username": str(message.author),
-            "channel_id": str(message.channel.id),
-            "message_id": str(message.id),
-            "media_type": media_type,
-            "content": message.content,
-        }
-        try:
-            response = await asyncio.to_thread(processor.process, delivery)
-        except Exception as error:
-            LOGGER.error("Discord delivery could not be persisted (%s)", type(error).__name__)
-            try:
-                await message.reply(
-                    "❌ Huey could not save this request. Please try again; "
-                    "an administrator should check the Huey logs."
-                )
-            except Exception as reply_error:
-                LOGGER.warning(
-                    "Could not send persistence failure reply (%s)",
-                    type(reply_error).__name__,
-                )
-            return
+    async def deliver_response(message: Any, media_type: str, response: dict[str, Any]) -> None:
+        """Reply once, then stage only the response's lifecycle events."""
 
         reply = format_reply(media_type, response)
         try:
@@ -747,6 +876,177 @@ def build_client(
                 "Could not reconcile Discord lifecycle notifications",
             )
 
+    @client.event
+    async def on_message(message):
+        if getattr(message.author, "bot", False) or getattr(message, "webhook_id", None) is not None:
+            return
+        media_type = channel_config.request_channels.get(str(message.channel.id))
+        if media_type is None:
+            return
+
+        delivery = {
+            "discord_user_id": str(message.author.id),
+            "discord_username": str(message.author),
+            "channel_id": str(message.channel.id),
+            "message_id": str(message.id),
+            "media_type": media_type,
+            "content": message.content,
+        }
+
+        prompt_message_id = _reply_reference_message_id(message)
+        if prompt_message_id is not None:
+            selection_delivery = {
+                **delivery,
+                "prompt_message_id": prompt_message_id,
+                "ordinal": _selection_ordinal(message.content),
+            }
+            try:
+                selection_response = await asyncio.to_thread(
+                    processor.process_candidate_reply, selection_delivery
+                )
+            except Exception as error:
+                LOGGER.error(
+                    "Discord candidate reply could not be persisted (%s)",
+                    type(error).__name__,
+                )
+                try:
+                    await message.reply(
+                        "❌ Huey could not save this selection. Do not retry it yet; "
+                        "an administrator should check Huey and Shelfarr."
+                    )
+                except Exception as reply_error:
+                    LOGGER.warning(
+                        "Could not send candidate persistence failure reply (%s)",
+                        type(reply_error).__name__,
+                    )
+                return
+
+            selection_outcome = str(
+                selection_response.get("selection_outcome") or "not_found"
+            )
+            if selection_outcome == "duplicate":
+                return
+            if selection_outcome in {"invalid", "expired"}:
+                try:
+                    await message.reply(
+                        selection_correction(
+                            selection_outcome, selection_response.get("request_id")
+                        )
+                    )
+                except Exception as error:
+                    LOGGER.warning(
+                        "Could not send candidate correction (%s)", type(error).__name__
+                    )
+                return
+            if selection_outcome == "claimed":
+                selected_media_type = str(
+                    selection_response.get("media_type") or media_type
+                )
+                await deliver_response(message, selected_media_type, selection_response)
+                return
+            if selection_outcome == "not_found":
+                targets_huey_prompt = await _reply_targets_huey_candidate_prompt(
+                    client, message, prompt_message_id
+                )
+                if targets_huey_prompt is True or (
+                    targets_huey_prompt is None
+                    and media_type in {"ebooks", "audiobooks"}
+                ):
+                    try:
+                        await message.reply(selection_correction("inactive"))
+                    except Exception as error:
+                        LOGGER.warning(
+                            "Could not send inactive candidate correction (%s)",
+                            type(error).__name__,
+                        )
+                    return
+            # A reply to any message other than a live persisted Huey prompt is
+            # ordinary request-channel input and follows the unchanged parser.
+
+        # A bare integer is a selection token, not a safe standalone book
+        # request. This also closes the failover edge where Discord redelivers a
+        # recorded choice without its message reference: the durable reply-ID
+        # lookup above normally coalesces it, and this guard prevents a race from
+        # ever dispatching a separate request whose title is merely "1".
+        if (
+            prompt_message_id is None
+            and media_type in {"ebooks", "audiobooks"}
+            and _selection_ordinal(message.content) in {1, 2, 3}
+        ):
+            try:
+                await message.reply(selection_correction("inactive"))
+            except Exception as error:
+                LOGGER.warning(
+                    "Could not send standalone selection correction (%s)",
+                    type(error).__name__,
+                )
+            return
+
+        try:
+            response = await asyncio.to_thread(processor.process, delivery)
+        except Exception as error:
+            LOGGER.error("Discord delivery could not be persisted (%s)", type(error).__name__)
+            try:
+                await message.reply(
+                    "❌ Huey could not save this request. Please try again; "
+                    "an administrator should check the Huey logs."
+                )
+            except Exception as reply_error:
+                LOGGER.warning(
+                    "Could not send persistence failure reply (%s)",
+                    type(reply_error).__name__,
+                )
+            return
+
+        if (
+            response.get("status") == "awaiting_selection"
+            and response.get("selection_proposal")
+            and not response.get("duplicate")
+        ):
+            try:
+                prompt = await message.reply(
+                    format_candidate_prompt(
+                        media_type,
+                        response,
+                        ttl_seconds=processor.selection_ttl_seconds,
+                    )
+                )
+                prompt_message_id = getattr(prompt, "id", None)
+                if (
+                    isinstance(prompt_message_id, bool)
+                    or not str(prompt_message_id or "").isdigit()
+                    or int(prompt_message_id) <= 0
+                ):
+                    raise RuntimeError("Discord did not confirm the candidate prompt ID")
+                bound = await asyncio.to_thread(
+                    processor.store.bind_candidate_prompt,
+                    int(response["request_id"]),
+                    str(prompt_message_id),
+                )
+                if not bound:
+                    raise RuntimeError("Candidate prompt could not be bound")
+            except Exception as error:
+                LOGGER.warning(
+                    "Could not deliver candidate prompt for request %s (%s)",
+                    response["request_id"],
+                    type(error).__name__,
+                )
+                try:
+                    await asyncio.to_thread(
+                        processor.store.fail_candidate_prompt,
+                        int(response["request_id"]),
+                        "Could not deliver the Discord candidate prompt",
+                    )
+                except Exception as persistence_error:
+                    LOGGER.error(
+                        "Could not release failed candidate prompt for request %s (%s)",
+                        response["request_id"],
+                        type(persistence_error).__name__,
+                    )
+            return
+
+        await deliver_response(message, media_type, response)
+
     return client
 
 
@@ -768,13 +1068,27 @@ def main() -> None:
     channel_config = load_channel_config(config_path)
     store = RequestStore(database_path)
     store.initialize()
-    processor = RequestProcessor(store, services=ServiceRegistry())
     try:
         reconcile_seconds = float(os.environ.get("HUEY_RECONCILE_SECONDS", "30"))
     except ValueError as error:
         raise SystemExit("HUEY_RECONCILE_SECONDS must be numeric") from error
     if reconcile_seconds < 1:
         raise SystemExit("HUEY_RECONCILE_SECONDS must be at least 1")
+    try:
+        selection_ttl_seconds = int(
+            os.environ.get("HUEY_SELECTION_TTL_SECONDS", "900")
+        )
+    except ValueError as error:
+        raise SystemExit("HUEY_SELECTION_TTL_SECONDS must be an integer") from error
+    if not 1 <= selection_ttl_seconds <= 86_400:
+        raise SystemExit(
+            "HUEY_SELECTION_TTL_SECONDS must be between 1 and 86400"
+        )
+    processor = RequestProcessor(
+        store,
+        services=ServiceRegistry(),
+        selection_ttl_seconds=selection_ttl_seconds,
+    )
     client = build_client(channel_config, processor, ready_path, reconcile_seconds)
     try:
         client.run(token)

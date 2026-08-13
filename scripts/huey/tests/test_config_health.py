@@ -60,6 +60,39 @@ def channel_mapping() -> dict[str, dict[str, int]]:
     }
 
 
+def candidate_proposal():
+    return tuple(
+        {
+            "fingerprint": character * 64,
+            "label": label,
+            "work_id": work_id,
+            "source_work_ids": (work_id,),
+            "title": "Dune",
+            "author": author,
+            "year": year,
+            "content_kind": "book",
+            "media_type": "ebooks",
+            "book_type": "ebook",
+        }
+        for character, label, work_id, author, year in (
+            (
+                "a",
+                "Dune by Frank Herbert (1965), Ebook, Open Library",
+                "openlibrary:OL893415W",
+                "Frank Herbert",
+                1965,
+            ),
+            (
+                "b",
+                "Dune by Brian Herbert (2005), Ebook, Open Library",
+                "openlibrary:OL2W",
+                "Brian Herbert",
+                2005,
+            ),
+        )
+    )
+
+
 def read_production_channel_map() -> dict[str, dict[str, int]]:
     """Read the deliberately simple two-level channel inventory without PyYAML."""
 
@@ -292,13 +325,67 @@ class ServiceRegistryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "SHELFARR_ENABLED"):
                     ServiceRegistry({"SHELFARR_ENABLED": value})
 
+    def test_selected_book_uses_shelfarr_without_direct_fallback(self):
+        services = ServiceRegistry(
+            {"SHELFARR_ENABLED": "true", "SHELFARR_API_TOKEN": "shf_secret"}
+        )
+        shelfarr = Mock()
+        shelfarr.submit_selected.return_value = result(
+            "queued", "Queued in Shelfarr", service="shelfarr", external_id="73"
+        )
+        services._clients["shelfarr"] = shelfarr
+        request = {
+            "id": 42,
+            "media_type": "ebooks",
+            "title": "Dune",
+            "author": "Frank Herbert",
+            "discord_user_id": "1001",
+            "channel_id": "2002",
+        }
+        candidate = {"fingerprint": "a" * 64}
+        before_create = Mock()
+
+        response = services.book_selected(
+            request, candidate, before_create=before_create
+        )
+
+        self.assertEqual(response["service"], "shelfarr")
+        shelfarr.submit_selected.assert_called_once_with(
+            "ebooks",
+            "Dune",
+            "Frank Herbert",
+            42,
+            selected_candidate=candidate,
+            discord_user_id="1001",
+            discord_channel_id="2002",
+            before_create=before_create,
+        )
+
+    def test_selected_book_fails_when_shelfarr_ownership_is_disabled(self):
+        services = ServiceRegistry({"SHELFARR_ENABLED": "false"})
+        services._clients["direct"] = Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "disabled"):
+            services.book_selected(
+                {
+                    "id": 42,
+                    "media_type": "ebooks",
+                    "title": "Dune",
+                    "author": None,
+                },
+                {"fingerprint": "a" * 64},
+            )
+        services._clients["direct"].submit.assert_not_called()
+
 
 class FakeMessage:
-    def __init__(self):
+    def __init__(self, *, reply_message_id=900):
         self.replies = []
+        self.reply_message_id = reply_message_id
 
     async def reply(self, message):
         self.replies.append(message)
+        return types.SimpleNamespace(id=self.reply_message_id)
 
 
 class FakeChannel:
@@ -379,17 +466,31 @@ class FakeIntents:
 
 
 class FakeIncomingMessage(FakeMessage):
-    def __init__(self, *, message_id, channel, content):
-        super().__init__()
+    def __init__(
+        self,
+        *,
+        message_id,
+        channel,
+        content,
+        author_id=99,
+        reference_id=None,
+        reply_message_id=900,
+    ):
+        super().__init__(reply_message_id=reply_message_id)
         self.id = message_id
         self.channel = channel
         self.content = content
         self.webhook_id = None
+        self.reference = (
+            types.SimpleNamespace(message_id=reference_id)
+            if reference_id is not None
+            else None
+        )
         self.author = type(
             "Author",
             (),
             {
-                "id": 99,
+                "id": author_id,
                 "bot": False,
                 "__str__": lambda _self: "reader",
             },
@@ -441,6 +542,25 @@ class FakeShelfarrCompletionClient:
         if isinstance(self.outcome, Exception):
             raise self.outcome
         return self.outcome
+
+    @staticmethod
+    def recovered_request_matches_candidate(remote, selected_candidate, media_type):
+        expected_type = {"ebooks": "ebook", "audiobooks": "audiobook"}.get(
+            media_type
+        )
+        book = remote.get("book") if isinstance(remote, dict) else None
+        aliases = (
+            selected_candidate.get("source_work_ids")
+            if isinstance(selected_candidate, dict)
+            else None
+        )
+        return bool(
+            isinstance(book, dict)
+            and isinstance(aliases, (list, tuple))
+            and book.get("book_type") == expected_type
+            and book.get("content_kind") == "book"
+            and book.get("work_id") in aliases
+        )
 
 
 class FakeServices:
@@ -504,6 +624,29 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
             event_type="shelfarr_submission_uncertain",
             service="shelfarr",
             external_status="submission_uncertain",
+        )
+
+    def claim_candidate_for_dispatch(self):
+        self.store.transition(
+            self.request["id"],
+            "processing",
+            "Searching Shelfarr",
+            service="shelfarr",
+        )
+        self.store.create_candidate_confirmation(
+            self.request["id"], candidate_proposal()
+        )
+        self.store.bind_candidate_prompt(self.request["id"], "9001")
+        claimed = self.store.claim_candidate_selection(
+            prompt_message_id="9001",
+            reply_message_id="9002",
+            discord_user_id="1",
+            channel_id="2",
+            ordinal=1,
+        )
+        self.assertEqual(claimed["outcome"], "claimed")
+        self.assertTrue(
+            self.store.mark_candidate_dispatch_started(self.request["id"])
         )
 
     async def test_bookbot_completion_routes_status_and_addition_once_without_reply(self):
@@ -758,8 +901,206 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         )
         recovered_deliveries = self.store.pending_notification_deliveries()
         self.assertCountEqual(
-            [row["event_key"] for row in recovered_deliveries],
-            ["request_accepted", "download_queued"],
+            [(row["event_key"], row["route"]) for row in recovered_deliveries],
+            [
+                ("request_accepted", "request-status"),
+                ("download_queued", "download-queue"),
+            ],
+        )
+
+    async def test_claimed_interrupted_selection_requires_exact_recovered_work(self):
+        self.claim_candidate_for_dispatch()
+        self.store.initialize()
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "searching",
+                "attention_needed": False,
+                "book": {
+                    "title": "Wrong Dune",
+                    "book_type": "ebook",
+                    "content_kind": "book",
+                    "work_id": "openlibrary:OTHER",
+                },
+            }
+        )
+        services = FakeServices({"shelfarr": shelfarr})
+
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 0)
+        self.assertEqual(self.store.get_request(self.request["id"])["status"], "processing")
+        self.assertIsNone(self.store.get_request(self.request["id"])["external_id"])
+        alerts = self.store.pending_notification_deliveries()
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["event_key"], "recovery_uncertain")
+        self.assertIn("confirmed identity", alerts[0]["message"])
+
+        shelfarr.outcome = {
+            **shelfarr.outcome,
+            "book": {
+                **shelfarr.outcome["book"],
+                "title": "Dune",
+                "work_id": "openlibrary:OL893415W",
+            },
+        }
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 1)
+        recovered = self.store.get_request(self.request["id"])
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["external_id"], "73")
+        self.assertCountEqual(
+            [
+                (row["event_key"], row["route"])
+                for row in self.store.pending_notification_deliveries()
+            ],
+            [
+                ("recovery_uncertain", "system-health"),
+                ("request_accepted", "request-status"),
+                ("download_queued", "download-queue"),
+            ],
+        )
+
+    async def test_claimed_uncertain_selection_requires_exact_recovered_work(self):
+        self.claim_candidate_for_dispatch()
+        self.store.transition(
+            self.request["id"],
+            "queued",
+            "Shelfarr submission is awaiting correlation recovery",
+            event_type="shelfarr_submission_uncertain",
+            service="shelfarr",
+            external_status="submission_uncertain",
+        )
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "pending",
+                "attention_needed": False,
+                "book": {
+                    "title": "Wrong Dune",
+                    "book_type": "ebook",
+                    "content_kind": "book",
+                    "work_id": "openlibrary:OTHER",
+                },
+            }
+        )
+        services = FakeServices({"shelfarr": shelfarr})
+
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 0)
+        pending = self.store.get_request(self.request["id"])
+        self.assertEqual(pending["status"], "queued")
+        self.assertIsNone(pending["external_id"])
+        self.assertEqual(
+            self.store.pending_notification_deliveries()[0]["event_key"],
+            "submission_uncertain",
+        )
+
+        shelfarr.outcome = {
+            **shelfarr.outcome,
+            "book": {
+                **shelfarr.outcome["book"],
+                "title": "Dune",
+                "work_id": "openlibrary:OL893415W",
+            },
+        }
+        self.assertEqual(reconcile_shelfarr_requests(self.store, services), 1)
+        recovered = self.store.get_request(self.request["id"])
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["external_id"], "73")
+
+    async def test_corrupt_claimed_confirmation_quarantines_without_stopping_loop(self):
+        self.claim_candidate_for_dispatch()
+        second, _ = self.store.create_request(
+            discord_user_id="2",
+            discord_username="another reader",
+            channel_id="2",
+            message_id="101",
+            media_type="ebooks",
+            raw_request="Foundation",
+            title="Foundation",
+            author="Isaac Asimov",
+        )
+        self.store.transition(
+            second["id"],
+            "processing",
+            "Dispatching to Shelfarr",
+            service="shelfarr",
+        )
+        self.store.initialize()
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "searching",
+                "attention_needed": False,
+                "book": {
+                    "title": "Dune",
+                    "book_type": "ebook",
+                    "content_kind": "book",
+                    "work_id": "openlibrary:OL893415W",
+                },
+            }
+        )
+
+        real_get = self.store.get_candidate_confirmation
+
+        def corrupt_first(request_id):
+            if request_id == self.request["id"]:
+                raise ValueError("corrupt candidate snapshot")
+            return real_get(request_id)
+
+        with patch.object(
+            self.store, "get_candidate_confirmation", side_effect=corrupt_first
+        ):
+            self.assertEqual(
+                reconcile_shelfarr_requests(
+                    self.store, FakeServices({"shelfarr": shelfarr})
+                ),
+                1,
+            )
+
+        self.assertEqual(
+            self.store.get_request(self.request["id"])["status"], "processing"
+        )
+        self.assertIsNone(self.store.get_request(self.request["id"])["external_id"])
+        self.assertEqual(self.store.get_request(second["id"])["status"], "queued")
+        self.assertEqual(self.store.get_request(second["id"])["external_id"], "73")
+
+    async def test_missing_claimed_option_stays_quarantined(self):
+        self.claim_candidate_for_dispatch()
+        self.store.initialize()
+        shelfarr = FakeShelfarrCompletionClient(
+            {
+                "id": 73,
+                "status": "searching",
+                "attention_needed": False,
+                "book": {
+                    "title": "Dune",
+                    "book_type": "ebook",
+                    "content_kind": "book",
+                    "work_id": "openlibrary:OL893415W",
+                },
+            }
+        )
+        missing_option = {
+            **self.store.get_candidate_confirmation(self.request["id"]),
+            "options": [],
+        }
+
+        with patch.object(
+            self.store,
+            "get_candidate_confirmation",
+            return_value=missing_option,
+        ):
+            self.assertEqual(
+                reconcile_shelfarr_requests(
+                    self.store, FakeServices({"shelfarr": shelfarr})
+                ),
+                0,
+            )
+
+        pending = self.store.get_request(self.request["id"])
+        self.assertEqual(pending["status"], "processing")
+        self.assertIsNone(pending["external_id"])
+        self.assertEqual(
+            self.store.pending_notification_deliveries()[0]["event_key"],
+            "recovery_uncertain",
         )
 
     async def test_interrupted_shelfarr_dispatch_repeated_absence_stays_owned_then_recovers(self):
@@ -1429,6 +1770,502 @@ class DiscordAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
                 (len(status_channel.sent), len(queue_channel.sent)),
                 lifecycle_counts,
             )
+
+    async def test_candidate_reply_confirms_once_then_uses_normal_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RequestStore(Path(directory) / "huey.db")
+            store.initialize()
+
+            class SelectionServices:
+                shelfarr_enabled = True
+
+                def __init__(self):
+                    self.book_selected = Mock(
+                        return_value=result(
+                            "queued",
+                            "Shelfarr accepted Dune.",
+                            service="shelfarr",
+                            external_id="73",
+                            external_title="Dune",
+                            external_status="pending",
+                        )
+                    )
+
+            services = SelectionServices()
+            dispatcher = Mock(
+                return_value=result(
+                    "awaiting_selection",
+                    "Choose one candidate.",
+                    service="shelfarr",
+                    selection_proposal=candidate_proposal(),
+                )
+            )
+            processor = RequestProcessor(store, services=services, dispatcher=dispatcher)
+            config = validate_channel_config(channel_mapping())
+            discord_module = types.SimpleNamespace(
+                Intents=FakeIntents,
+                Client=FakeDiscordClient,
+            )
+            with patch.dict(sys.modules, {"discord": discord_module}):
+                client = build_client(config, processor, Path(directory) / "ready")
+
+            intake_channel = FakeChannel()
+            intake_channel.id = 2
+            queue_channel = FakeChannel()
+            status_channel = FakeChannel()
+            client.channels = {
+                2: intake_channel,
+                20: queue_channel,
+                21: status_channel,
+            }
+            request_message = FakeIncomingMessage(
+                message_id=700,
+                channel=intake_channel,
+                content="Dune by Frank Herbert",
+                reply_message_id=900,
+            )
+            selection_message = FakeIncomingMessage(
+                message_id=701,
+                channel=intake_channel,
+                content="2",
+                reference_id=900,
+                reply_message_id=901,
+            )
+
+            async def direct_call(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with patch("huey.asyncio.to_thread", new=direct_call):
+                await client.on_message(request_message)
+                self.assertEqual(status_channel.sent, [])
+                self.assertEqual(queue_channel.sent, [])
+                self.assertIn("Reply directly", request_message.replies[0])
+                self.assertEqual(store.get_request(1)["status"], "awaiting_selection")
+
+                await client.on_message(selection_message)
+                lifecycle_counts = (len(status_channel.sent), len(queue_channel.sent))
+                await client.on_message(selection_message)
+
+            self.assertEqual(dispatcher.call_count, 1)
+            services.book_selected.assert_called_once()
+            self.assertEqual(len(selection_message.replies), 1)
+            self.assertIn(
+                "Confirmed. Continuing request.", selection_message.replies[0]
+            )
+            self.assertEqual(lifecycle_counts, (1, 1))
+            self.assertEqual(
+                (len(status_channel.sent), len(queue_channel.sent)), lifecycle_counts
+            )
+
+    async def test_invalid_or_wrong_user_candidate_reply_is_corrective_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RequestStore(Path(directory) / "huey.db")
+            store.initialize()
+
+            class SelectionServices:
+                shelfarr_enabled = True
+                book_selected = Mock()
+
+            services = SelectionServices()
+            processor = RequestProcessor(
+                store,
+                services=services,
+                dispatcher=Mock(
+                    return_value=result(
+                        "awaiting_selection",
+                        "Choose one candidate.",
+                        service="shelfarr",
+                        selection_proposal=candidate_proposal(),
+                    )
+                ),
+            )
+            config = validate_channel_config(channel_mapping())
+            discord_module = types.SimpleNamespace(
+                Intents=FakeIntents,
+                Client=FakeDiscordClient,
+            )
+            with patch.dict(sys.modules, {"discord": discord_module}):
+                client = build_client(config, processor, Path(directory) / "ready")
+
+            intake_channel = FakeChannel()
+            intake_channel.id = 2
+            client.channels = {2: intake_channel}
+            request_message = FakeIncomingMessage(
+                message_id=710,
+                channel=intake_channel,
+                content="Dune by Frank Herbert",
+                reply_message_id=910,
+            )
+            malformed = FakeIncomingMessage(
+                message_id=711,
+                channel=intake_channel,
+                content=" 1 ",
+                reference_id=910,
+            )
+            wrong_user = FakeIncomingMessage(
+                message_id=712,
+                channel=intake_channel,
+                content="1",
+                author_id=100,
+                reference_id=910,
+            )
+
+            async def direct_call(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with patch("huey.asyncio.to_thread", new=direct_call):
+                await client.on_message(request_message)
+                await client.on_message(malformed)
+                await client.on_message(wrong_user)
+
+            self.assertEqual(len(malformed.replies), 1)
+            self.assertIn("not a valid choice", malformed.replies[0])
+            self.assertEqual(len(wrong_user.replies), 1)
+            self.assertIn("original requester", wrong_user.replies[0])
+            services.book_selected.assert_not_called()
+            self.assertEqual(store.get_request(1)["status"], "awaiting_selection")
+
+    async def test_candidate_prompt_reply_failure_releases_exact_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RequestStore(Path(directory) / "huey.db")
+            store.initialize()
+
+            class SelectionServices:
+                shelfarr_enabled = True
+
+            dispatcher = Mock(
+                return_value=result(
+                    "awaiting_selection",
+                    "Choose one candidate.",
+                    service="shelfarr",
+                    selection_proposal=candidate_proposal(),
+                )
+            )
+            processor = RequestProcessor(
+                store, services=SelectionServices(), dispatcher=dispatcher
+            )
+            config = validate_channel_config(channel_mapping())
+            discord_module = types.SimpleNamespace(
+                Intents=FakeIntents,
+                Client=FakeDiscordClient,
+            )
+            with patch.dict(sys.modules, {"discord": discord_module}):
+                client = build_client(config, processor, Path(directory) / "ready")
+
+            intake_channel = FakeChannel()
+            intake_channel.id = 2
+            client.channels = {2: intake_channel}
+            failed_prompt = FailReplyIncomingMessage(
+                message_id=720,
+                channel=intake_channel,
+                content="Dune by Frank Herbert",
+            )
+            retry = FakeIncomingMessage(
+                message_id=721,
+                channel=intake_channel,
+                content="Dune by Frank Herbert",
+                reply_message_id=920,
+            )
+
+            async def direct_call(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with patch("huey.asyncio.to_thread", new=direct_call):
+                await client.on_message(failed_prompt)
+                self.assertEqual(store.get_request(1)["status"], "needs_selection")
+                await client.on_message(retry)
+
+            self.assertEqual(store.get_request(2)["status"], "awaiting_selection")
+            self.assertEqual(dispatcher.call_count, 2)
+
+    async def test_orphan_or_unresolved_candidate_reply_never_becomes_book_intake(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RequestStore(Path(directory) / "huey.db")
+            store.initialize()
+
+            class SelectionServices:
+                shelfarr_enabled = True
+                book_selected = Mock()
+
+            services = SelectionServices()
+            dispatcher = Mock(
+                return_value=result(
+                    "awaiting_selection",
+                    "Choose one candidate.",
+                    service="shelfarr",
+                    selection_proposal=candidate_proposal(),
+                )
+            )
+            processor = RequestProcessor(
+                store, services=services, dispatcher=dispatcher
+            )
+            config = validate_channel_config(channel_mapping())
+            discord_module = types.SimpleNamespace(
+                Intents=FakeIntents,
+                Client=FakeDiscordClient,
+            )
+            with patch.dict(sys.modules, {"discord": discord_module}):
+                client = build_client(config, processor, Path(directory) / "ready")
+            client.user = types.SimpleNamespace(id=42, bot=True)
+
+            intake_channel = FakeChannel()
+            intake_channel.id = 2
+            client.channels = {2: intake_channel}
+            request_message = FakeIncomingMessage(
+                message_id=730,
+                channel=intake_channel,
+                content="Dune by Frank Herbert",
+                reply_message_id=930,
+            )
+
+            async def direct_call(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with (
+                patch("huey.asyncio.to_thread", new=direct_call),
+                patch.object(store, "bind_candidate_prompt", return_value=False),
+            ):
+                await client.on_message(request_message)
+
+            self.assertEqual(store.get_request(1)["status"], "needs_selection")
+            intake_channel.message = types.SimpleNamespace(
+                author=client.user,
+                content=(
+                    "⚠️ Request #1 needs one metadata choice\n"
+                    "Type: ebooks\n1. Dune\n"
+                    "Reply directly to this message with one number within 15 minutes."
+                ),
+            )
+            orphan_reply = FakeIncomingMessage(
+                message_id=731,
+                channel=intake_channel,
+                content="1",
+                reference_id=930,
+            )
+            unresolved_reply = FakeIncomingMessage(
+                message_id=732,
+                channel=intake_channel,
+                content="first",
+                reference_id=931,
+            )
+
+            with patch("huey.asyncio.to_thread", new=direct_call):
+                await client.on_message(orphan_reply)
+                intake_channel.message = None
+                await client.on_message(unresolved_reply)
+
+            self.assertIn("not active", orphan_reply.replies[0])
+            self.assertIn("not active", unresolved_reply.replies[0])
+            self.assertEqual(dispatcher.call_count, 1)
+            services.book_selected.assert_not_called()
+            with store.connect() as connection:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM requests").fetchone()[0],
+                    1,
+                )
+
+    async def test_reply_to_unrelated_message_preserves_movie_intake(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RequestStore(Path(directory) / "huey.db")
+            store.initialize()
+            dispatcher = Mock(
+                return_value=result(
+                    "queued",
+                    "Radarr accepted Alien.",
+                    service="radarr",
+                    external_id="73",
+                    external_title="Alien",
+                )
+            )
+            processor = RequestProcessor(
+                store, services=object(), dispatcher=dispatcher
+            )
+            config = validate_channel_config(channel_mapping())
+            discord_module = types.SimpleNamespace(
+                Intents=FakeIntents,
+                Client=FakeDiscordClient,
+            )
+            with patch.dict(sys.modules, {"discord": discord_module}):
+                client = build_client(config, processor, Path(directory) / "ready")
+            client.user = types.SimpleNamespace(id=42, bot=True)
+
+            movie_channel = FakeChannel(
+                message=types.SimpleNamespace(
+                    author=types.SimpleNamespace(id=100, bot=False)
+                )
+            )
+            movie_channel.id = 1
+            client.channels = {1: movie_channel}
+            message = FakeIncomingMessage(
+                message_id=740,
+                channel=movie_channel,
+                content="movie: Alien",
+                reference_id=739,
+            )
+
+            async def direct_call(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with patch("huey.asyncio.to_thread", new=direct_call):
+                await client.on_message(message)
+
+            dispatcher.assert_called_once()
+            self.assertEqual(store.get_request(1)["media_type"], "movies-tv")
+            self.assertEqual(store.get_request(1)["status"], "queued")
+
+    async def test_reply_to_non_candidate_huey_message_preserves_movie_intake(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RequestStore(Path(directory) / "huey.db")
+            store.initialize()
+            dispatcher = Mock(
+                return_value=result(
+                    "queued",
+                    "Radarr accepted Alien.",
+                    service="radarr",
+                    external_id="73",
+                    external_title="Alien",
+                )
+            )
+            processor = RequestProcessor(store, services=object(), dispatcher=dispatcher)
+            config = validate_channel_config(channel_mapping())
+            discord_module = types.SimpleNamespace(
+                Intents=FakeIntents,
+                Client=FakeDiscordClient,
+            )
+            with patch.dict(sys.modules, {"discord": discord_module}):
+                client = build_client(config, processor, Path(directory) / "ready")
+            client.user = types.SimpleNamespace(id=42, bot=True)
+
+            movie_channel = FakeChannel(
+                message=types.SimpleNamespace(
+                    author=client.user,
+                    content="✅ Request #9\nType: movies-tv\nRadarr accepted Arrival.",
+                )
+            )
+            movie_channel.id = 1
+            client.channels = {1: movie_channel}
+            message = FakeIncomingMessage(
+                message_id=750,
+                channel=movie_channel,
+                content="movie: Alien",
+                reference_id=749,
+            )
+
+            async def direct_call(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with patch("huey.asyncio.to_thread", new=direct_call):
+                await client.on_message(message)
+
+            dispatcher.assert_called_once()
+            self.assertEqual(store.get_request(1)["media_type"], "movies-tv")
+            self.assertEqual(store.get_request(1)["status"], "queued")
+
+    async def test_standalone_numeric_book_message_is_rejected_before_persistence(self):
+        for media_type in ("ebooks", "audiobooks"):
+            for selection_token in ("1", "2", "3"):
+                with (
+                    self.subTest(
+                        media_type=media_type, selection_token=selection_token
+                    ),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    store = RequestStore(Path(directory) / "huey.db")
+                    store.initialize()
+                    dispatcher = Mock(return_value=result("queued", "Unexpected dispatch"))
+                    processor = RequestProcessor(
+                        store, services=object(), dispatcher=dispatcher
+                    )
+                    config = validate_channel_config(channel_mapping())
+                    discord_module = types.SimpleNamespace(
+                        Intents=FakeIntents,
+                        Client=FakeDiscordClient,
+                    )
+                    with patch.dict(sys.modules, {"discord": discord_module}):
+                        client = build_client(
+                            config, processor, Path(directory) / "ready"
+                        )
+
+                    intake_channel = FakeChannel()
+                    intake_channel.id = REQUESTS[media_type]
+                    client.channels = {intake_channel.id: intake_channel}
+                    message = FakeIncomingMessage(
+                        message_id=760,
+                        channel=intake_channel,
+                        content=selection_token,
+                    )
+
+                    async def direct_call(function, *args, **kwargs):
+                        return function(*args, **kwargs)
+
+                    with patch("huey.asyncio.to_thread", new=direct_call):
+                        await client.on_message(message)
+
+                    dispatcher.assert_not_called()
+                    self.assertEqual(len(message.replies), 1)
+                    with store.connect() as connection:
+                        self.assertEqual(
+                            connection.execute(
+                                "SELECT COUNT(*) FROM requests"
+                            ).fetchone()[0],
+                            0,
+                        )
+
+    async def test_numeric_ebook_title_uses_ordinary_intake(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RequestStore(Path(directory) / "huey.db")
+            store.initialize()
+            dispatcher = Mock(
+                return_value=result(
+                    "queued",
+                    "Shelfarr accepted 1984.",
+                    service="shelfarr",
+                    external_id="73",
+                    external_title="1984",
+                    external_status="pending",
+                )
+            )
+            processor = RequestProcessor(
+                store, services=object(), dispatcher=dispatcher
+            )
+            config = validate_channel_config(channel_mapping())
+            discord_module = types.SimpleNamespace(
+                Intents=FakeIntents,
+                Client=FakeDiscordClient,
+            )
+            with patch.dict(sys.modules, {"discord": discord_module}):
+                client = build_client(config, processor, Path(directory) / "ready")
+
+            intake_channel = FakeChannel()
+            intake_channel.id = REQUESTS["ebooks"]
+            status_channel = FakeChannel()
+            queue_channel = FakeChannel()
+            client.channels = {
+                intake_channel.id: intake_channel,
+                ACTIVITY["request-status"]: status_channel,
+                ACTIVITY["download-queue"]: queue_channel,
+            }
+            message = FakeIncomingMessage(
+                message_id=761,
+                channel=intake_channel,
+                content="1984",
+            )
+
+            async def direct_call(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with patch("huey.asyncio.to_thread", new=direct_call):
+                await client.on_message(message)
+
+            dispatcher.assert_called_once()
+            self.assertEqual(len(message.replies), 1)
+            saved = store.get_request(1)
+            self.assertEqual(saved["media_type"], "ebooks")
+            self.assertEqual(saved["raw_request"], "1984")
+            self.assertEqual(saved["title"], "1984")
+            self.assertEqual(saved["status"], "queued")
+            self.assertEqual(len(status_channel.sent), 1)
+            self.assertEqual(len(queue_channel.sent), 1)
 
     async def test_immediate_handler_terminal_result_does_not_create_import_event(self):
         for status in ("completed", "failed"):

@@ -2,7 +2,9 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from threading import Barrier
 from pathlib import Path
 
@@ -68,6 +70,55 @@ class DatabaseTests(unittest.TestCase):
             "author": "Frank Herbert",
         }
 
+    @staticmethod
+    def selection_candidates(media_type="ebooks"):
+        book_type = "ebook" if media_type == "ebooks" else "audiobook"
+        return [
+            {
+                "fingerprint": character * 64,
+                "label": label,
+                "work_id": work_id,
+                "source_work_ids": [work_id],
+                "title": "Dune",
+                "author": author,
+                "year": year,
+                "content_kind": "book",
+                "media_type": media_type,
+                "book_type": book_type,
+            }
+            for character, label, work_id, author, year in (
+                (
+                    "a",
+                    "Dune — Frank Herbert (1965)",
+                    "openlibrary:OL893415W",
+                    "Frank Herbert",
+                    1965,
+                ),
+                (
+                    "b",
+                    "Dune — Brian Herbert (2005)",
+                    "hardcover:book:123",
+                    "Brian Herbert",
+                    2005,
+                ),
+            )
+        ]
+
+    def create_confirmation(self, *, now=None, target_key=DUNE_TARGET):
+        request, _ = self.store.create_request(
+            **self.request_values(), target_key=target_key
+        )
+        self.store.transition(
+            request["id"],
+            "processing",
+            "Searching Shelfarr",
+            service="shelfarr",
+        )
+        confirmation = self.store.create_candidate_confirmation(
+            request["id"], self.selection_candidates(), now=now
+        )
+        return request, confirmation
+
     def test_initialize_creates_parent_and_is_idempotent(self):
         self.store.initialize()
         self.store.initialize()
@@ -100,6 +151,440 @@ class DatabaseTests(unittest.TestCase):
         self.assertIsNotNone(aliases)
         self.assertIsNotNone(outbox)
         self.assertIsNotNone(target_index)
+
+    def test_candidate_schema_migrates_idempotently_without_backfilling_legacy_selection(self):
+        self.store.initialize()
+        legacy, _ = self.store.create_request(**self.request_values("legacy"))
+        self.store.transition(legacy["id"], "needs_selection", "Legacy ambiguity")
+
+        self.store.initialize()
+        self.store.initialize()
+
+        self.assertIsNone(self.store.get_candidate_confirmation(legacy["id"]))
+        with self.store.connect() as connection:
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            self.assertTrue(
+                {
+                    "candidate_confirmations",
+                    "candidate_options",
+                    "candidate_confirmation_replies",
+                }
+                <= tables
+            )
+            indexes = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA index_list(candidate_confirmations)"
+                )
+            }
+            self.assertIn("candidate_confirmations_expiry_idx", indexes)
+            confirmation_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(candidate_confirmations)"
+                )
+            }
+            self.assertIn("dispatch_started_at", confirmation_columns)
+            request_index = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='requests_active_target_uq'"
+            ).fetchone()[0]
+            self.assertIn("awaiting_selection", request_index)
+
+    def test_candidate_confirmation_persists_safe_snapshot_and_correlation(self):
+        self.store.initialize()
+        now = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+        request, confirmation = self.create_confirmation(now=now)
+
+        self.assertEqual(confirmation["status"], "pending")
+        self.assertEqual(confirmation["shelfarr_correlation"], f"huey:{request['id']}")
+        self.assertEqual(confirmation["expires_at"], "2026-08-13 12:15:00")
+        self.assertEqual([option["ordinal"] for option in confirmation["options"]], [1, 2])
+        self.assertEqual(
+            confirmation["options"][0]["candidate"]["source_work_ids"],
+            ["openlibrary:OL893415W"],
+        )
+        self.assertEqual(self.store.get_request(request["id"])["status"], "awaiting_selection")
+        self.assertEqual(
+            self.store.events_for(request["id"])[-1]["event_type"],
+            "selection_requested",
+        )
+        duplicate, created = self.store.create_request(
+            **self.request_values("same-target"), target_key=DUNE_TARGET
+        )
+        self.assertFalse(created)
+        self.assertEqual(duplicate["id"], request["id"])
+
+    def test_candidate_snapshot_allows_secret_garden_but_rejects_sensitive_identity(self):
+        self.store.initialize()
+        request, _ = self.store.create_request(
+            **self.request_values(), target_key=DUNE_TARGET
+        )
+        self.store.transition(request["id"], "processing", "Searching", service="shelfarr")
+        candidates = self.selection_candidates()
+        candidates[0] = {
+            **candidates[0],
+            "label": "The Secret Garden · Ebook · Open Library",
+            "title": "The Secret Garden",
+            "author": "Frances Hodgson Burnett",
+        }
+        confirmation = self.store.create_candidate_confirmation(request["id"], candidates)
+        self.assertEqual(confirmation["options"][0]["title"], "The Secret Garden")
+
+        second, _ = self.store.create_request(
+            **self.request_values("second"), target_key=DUNE_EDITION_TARGET
+        )
+        self.store.transition(second["id"], "processing", "Searching", service="shelfarr")
+        bad = self.selection_candidates()
+        bad[0] = {
+            **bad[0],
+            "work_id": "openlibrary:secret-token",
+            "source_work_ids": ["openlibrary:secret-token"],
+        }
+        with self.assertRaisesRegex(ValueError, "invalid identity"):
+            self.store.create_candidate_confirmation(second["id"], bad)
+
+    def test_prompt_binding_is_idempotent_unique_and_validated(self):
+        self.store.initialize()
+        request, _ = self.create_confirmation()
+        self.assertFalse(self.store.bind_candidate_prompt(request["id"], "not-a-snowflake"))
+        self.assertTrue(self.store.bind_candidate_prompt(request["id"], "9001"))
+        self.assertTrue(self.store.bind_candidate_prompt(request["id"], 9001))
+        self.assertFalse(self.store.bind_candidate_prompt(request["id"], "9002"))
+
+        second, _ = self.store.create_request(
+            **self.request_values("second"), target_key=DUNE_EDITION_TARGET
+        )
+        self.store.transition(second["id"], "processing", "Searching", service="shelfarr")
+        self.store.create_candidate_confirmation(second["id"], self.selection_candidates())
+        self.assertFalse(self.store.bind_candidate_prompt(second["id"], "9001"))
+
+    def test_valid_selection_claims_once_and_same_reply_is_duplicate_without_option(self):
+        self.store.initialize()
+        request, _ = self.create_confirmation()
+        self.assertTrue(self.store.bind_candidate_prompt(request["id"], "9001"))
+        now = datetime.now(timezone.utc)
+        claimed = self.store.claim_candidate_selection(
+            prompt_message_id="9001",
+            reply_message_id="9101",
+            discord_user_id="1",
+            channel_id="2",
+            ordinal=1,
+            now=now,
+        )
+        duplicate = self.store.claim_candidate_selection(
+            prompt_message_id="9001",
+            reply_message_id="9101",
+            discord_user_id="1",
+            channel_id="2",
+            ordinal=1,
+            now=now,
+        )
+        late_duplicate = self.store.claim_candidate_selection(
+            prompt_message_id="9001",
+            reply_message_id="9102",
+            discord_user_id="1",
+            channel_id="2",
+            ordinal=2,
+            now=now,
+        )
+
+        self.assertEqual(claimed["outcome"], "claimed")
+        self.assertEqual(claimed["request"]["id"], request["id"])
+        self.assertEqual(claimed["request"]["status"], "processing")
+        self.assertEqual(claimed["request"]["service"], "shelfarr")
+        self.assertEqual(claimed["option"]["ordinal"], 1)
+        self.assertEqual(duplicate["outcome"], "duplicate")
+        self.assertEqual(duplicate["request"]["id"], request["id"])
+        self.assertIsNone(duplicate["option"])
+        self.assertEqual(late_duplicate["outcome"], "duplicate")
+        self.assertEqual(late_duplicate["request"]["id"], request["id"])
+        self.assertIsNone(late_duplicate["option"])
+        self.assertEqual(self.store.get_by_message_id("9102")["id"], request["id"])
+        self.assertEqual(
+            [event["event_type"] for event in self.store.events_for(request["id"])].count(
+                "selection_claimed"
+            ),
+            1,
+        )
+        with self.store.connect() as connection:
+            self.assertEqual(
+                dict(
+                    connection.execute(
+                        "SELECT outcome, COUNT(*) FROM candidate_confirmation_replies "
+                        "GROUP BY outcome ORDER BY outcome"
+                    ).fetchall()
+                ),
+                {"claimed": 1, "duplicate": 1},
+            )
+
+    def test_dispatch_boundary_is_idempotent_and_restart_keeps_recovery_owner(self):
+        self.store.initialize()
+        request, _ = self.create_confirmation()
+        self.store.bind_candidate_prompt(request["id"], "9001")
+        self.assertEqual(
+            self.store.claim_candidate_selection(
+                prompt_message_id="9001",
+                reply_message_id="9101",
+                discord_user_id="1",
+                channel_id="2",
+                ordinal=1,
+            )["outcome"],
+            "claimed",
+        )
+        crossed_at = datetime(2026, 8, 13, 12, 5, tzinfo=timezone.utc)
+        self.assertTrue(
+            self.store.mark_candidate_dispatch_started(
+                request["id"], now=crossed_at
+            )
+        )
+        self.assertTrue(
+            self.store.mark_candidate_dispatch_started(
+                request["id"], now=crossed_at + timedelta(seconds=1)
+            )
+        )
+
+        self.store.initialize()
+
+        saved = self.store.get_request(request["id"])
+        confirmation = self.store.get_candidate_confirmation(request["id"])
+        self.assertEqual(saved["status"], "processing")
+        self.assertEqual(saved["service"], "shelfarr")
+        self.assertEqual(confirmation["status"], "claimed")
+        self.assertEqual(confirmation["dispatch_started_at"], "2026-08-13 12:05:00")
+        event_types = [
+            event["event_type"] for event in self.store.events_for(request["id"])
+        ]
+        self.assertEqual(event_types.count("selection_dispatch_started"), 1)
+        self.assertEqual(event_types.count("startup_shelfarr_recovery"), 1)
+        self.assertEqual(
+            [row["id"] for row in self.store.interrupted_shelfarr_requests()],
+            [request["id"]],
+        )
+
+    def test_restart_releases_claimed_selection_proven_not_dispatched(self):
+        self.store.initialize()
+        request, _ = self.create_confirmation()
+        self.store.bind_candidate_prompt(request["id"], "9001")
+        self.assertEqual(
+            self.store.claim_candidate_selection(
+                prompt_message_id="9001",
+                reply_message_id="9101",
+                discord_user_id="1",
+                channel_id="2",
+                ordinal=1,
+            )["outcome"],
+            "claimed",
+        )
+
+        self.store.initialize()
+
+        saved = self.store.get_request(request["id"])
+        confirmation = self.store.get_candidate_confirmation(request["id"])
+        self.assertEqual(saved["status"], "needs_selection")
+        self.assertEqual(confirmation["status"], "failed")
+        self.assertIsNone(confirmation["dispatch_started_at"])
+        event_types = [
+            event["event_type"] for event in self.store.events_for(request["id"])
+        ]
+        self.assertIn("selection_dispatch_recovered", event_types)
+        self.assertNotIn("startup_shelfarr_recovery", event_types)
+        pending = self.store.pending_notification_deliveries()
+        self.assertEqual(
+            [(row["event_key"], row["route"]) for row in pending],
+            [("request_rejected", "request-status")],
+        )
+        retry, created = self.store.create_request(
+            **self.request_values("retry-after-crash"), target_key=DUNE_TARGET
+        )
+        self.assertTrue(created)
+        self.assertNotEqual(retry["id"], request["id"])
+
+    def test_invalid_selection_replies_do_not_claim_or_release_prompt(self):
+        self.store.initialize()
+        request, _ = self.create_confirmation()
+        self.store.bind_candidate_prompt(request["id"], "9001")
+        attempts = (
+            ("9101", "99", "2", 1),
+            ("9102", "1", "99", 1),
+            ("9103", "1", "2", 0),
+            ("9104", "1", "2", 3),
+        )
+        for reply_id, user_id, channel_id, ordinal in attempts:
+            result = self.store.claim_candidate_selection(
+                prompt_message_id="9001",
+                reply_message_id=reply_id,
+                discord_user_id=user_id,
+                channel_id=channel_id,
+                ordinal=ordinal,
+            )
+            self.assertEqual(result["outcome"], "invalid")
+            self.assertEqual(result["request"]["id"], request["id"])
+            self.assertIsNone(result["option"])
+        self.assertEqual(self.store.get_request(request["id"])["status"], "awaiting_selection")
+        self.assertEqual(self.store.get_candidate_confirmation(request["id"])["status"], "pending")
+        self.assertEqual(
+            self.store.claim_candidate_selection(
+                prompt_message_id="does-not-exist",
+                reply_message_id="9199",
+                discord_user_id="1",
+                channel_id="2",
+                ordinal=1,
+            )["outcome"],
+            "not_found",
+        )
+
+    def test_concurrent_distinct_valid_replies_have_exactly_one_claim(self):
+        self.store.initialize()
+        request, _ = self.create_confirmation()
+        self.store.bind_candidate_prompt(request["id"], "9001")
+        barrier = Barrier(2)
+
+        def claim(values):
+            reply_id, ordinal = values
+            barrier.wait()
+            return self.store.claim_candidate_selection(
+                prompt_message_id="9001",
+                reply_message_id=reply_id,
+                discord_user_id="1",
+                channel_id="2",
+                ordinal=ordinal,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(claim, (("9101", 1), ("9102", 2))))
+        self.assertEqual(
+            Counter(result["outcome"] for result in results),
+            Counter({"claimed": 1, "duplicate": 1}),
+        )
+        self.assertEqual(sum(result["option"] is not None for result in results), 1)
+        with self.store.connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM candidate_confirmation_replies "
+                    "WHERE outcome='claimed'"
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_expiry_is_boundary_inclusive_releases_target_and_stages_outbox_once(self):
+        self.store.initialize()
+        start = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+        request, _ = self.create_confirmation(now=start)
+        self.store.bind_candidate_prompt(request["id"], "9001")
+        self.assertEqual(
+            self.store.expire_candidate_confirmations(
+                now=start + timedelta(seconds=899)
+            ),
+            [],
+        )
+        expired = self.store.expire_candidate_confirmations(
+            now=start + timedelta(seconds=900)
+        )
+        self.assertEqual([row["id"] for row in expired], [request["id"]])
+        self.assertEqual(expired[0]["status"], "needs_selection")
+        self.assertEqual(
+            self.store.expire_candidate_confirmations(
+                now=start + timedelta(seconds=901)
+            ),
+            [],
+        )
+        pending = self.store.pending_notification_deliveries()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(
+            (pending[0]["event_key"], pending[0]["route"]),
+            ("request_rejected", "request-status"),
+        )
+        retry, created = self.store.create_request(
+            **self.request_values("retry"), target_key=DUNE_TARGET
+        )
+        self.assertTrue(created)
+        self.assertNotEqual(retry["id"], request["id"])
+
+    def test_reply_at_expiry_boundary_expires_and_never_returns_option(self):
+        self.store.initialize()
+        start = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+        request, _ = self.create_confirmation(now=start)
+        self.store.bind_candidate_prompt(request["id"], "9001")
+        result = self.store.claim_candidate_selection(
+            prompt_message_id="9001",
+            reply_message_id="9101",
+            discord_user_id="1",
+            channel_id="2",
+            ordinal=1,
+            now=start + timedelta(seconds=900),
+        )
+        self.assertEqual(result["outcome"], "expired")
+        self.assertEqual(result["request"]["status"], "needs_selection")
+        self.assertIsNone(result["option"])
+        self.assertEqual(len(self.store.pending_notification_deliveries()), 1)
+
+    def test_prompt_failure_is_idempotent_and_releases_target(self):
+        self.store.initialize()
+        request, _ = self.create_confirmation()
+        self.assertTrue(
+            self.store.fail_candidate_prompt(
+                request["id"], "Discord candidate prompt could not be saved"
+            )
+        )
+        self.assertFalse(
+            self.store.fail_candidate_prompt(
+                request["id"], "Discord candidate prompt could not be saved"
+            )
+        )
+        self.assertEqual(self.store.get_request(request["id"])["status"], "needs_selection")
+        self.assertEqual(self.store.get_candidate_confirmation(request["id"])["status"], "failed")
+        pending = self.store.pending_notification_deliveries()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(
+            (pending[0]["request_id"], pending[0]["event_key"], pending[0]["route"]),
+            (request["id"], "request_rejected", "request-status"),
+        )
+
+    def test_restart_fails_unbound_prompt_but_preserves_bound_pending_prompt(self):
+        for bound in (False, True):
+            with self.subTest(bound=bound):
+                self.temporary.cleanup()
+                self.temporary = tempfile.TemporaryDirectory()
+                self.path = Path(self.temporary.name) / "huey.db"
+                self.store = RequestStore(self.path)
+                self.store.initialize()
+                request, _ = self.create_confirmation()
+                if bound:
+                    self.store.bind_candidate_prompt(request["id"], "9001")
+
+                self.store.initialize()
+                self.store.initialize()
+
+                saved = self.store.get_request(request["id"])
+                confirmation = self.store.get_candidate_confirmation(request["id"])
+                pending = self.store.pending_notification_deliveries()
+                if bound:
+                    self.assertEqual(saved["status"], "awaiting_selection")
+                    self.assertEqual(confirmation["status"], "pending")
+                    self.assertEqual(confirmation["prompt_message_id"], "9001")
+                    self.assertEqual(pending, [])
+                else:
+                    self.assertEqual(saved["status"], "needs_selection")
+                    self.assertEqual(confirmation["status"], "failed")
+                    self.assertEqual(
+                        self.store.events_for(request["id"])[-1]["event_type"],
+                        "selection_prompt_recovered",
+                    )
+                    self.assertEqual(len(pending), 1)
+                    self.assertEqual(
+                        (
+                            pending[0]["request_id"],
+                            pending[0]["event_key"],
+                            pending[0]["route"],
+                        ),
+                        (request["id"], "request_rejected", "request-status"),
+                    )
 
     def test_old_schema_migration_merges_duplicates_and_preserves_events(self):
         self.path.parent.mkdir(parents=True)

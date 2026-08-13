@@ -186,6 +186,181 @@ def huey_ready_check(path: Path) -> Check:
     )
 
 
+def huey_selection_ttl_check(environment: dict[str, str]) -> Check:
+    """Validate the bounded Discord candidate-confirmation lifetime."""
+
+    raw = environment.get("HUEY_SELECTION_TTL_SECONDS", "900")
+    if not re.fullmatch(r"[0-9]+", raw):
+        return Check(
+            "huey:selection-ttl",
+            False,
+            "must be a literal integer between 1 and 86400 seconds",
+        )
+    ttl = int(raw)
+    valid = 1 <= ttl <= 86_400
+    return Check(
+        "huey:selection-ttl",
+        valid,
+        f"{ttl} seconds" if valid else "must be between 1 and 86400 seconds",
+    )
+
+
+def _sqlite_indexes(
+    connection: sqlite3.Connection, table: str
+) -> dict[str, tuple[bool, tuple[str, ...]]]:
+    if not re.fullmatch(r"[a-z_]+", table):  # pragma: no cover - constants only
+        raise ValueError("invalid SQLite table name")
+    definitions: dict[str, tuple[bool, tuple[str, ...]]] = {}
+    for row in connection.execute(f"PRAGMA index_list({table})"):
+        name = str(row[1])
+        columns = tuple(
+            str(column[2])
+            for column in connection.execute(f'PRAGMA index_info("{name}")')
+        )
+        definitions[name] = (bool(row[2]), columns)
+    return definitions
+
+
+def _has_unique_columns(
+    indexes: dict[str, tuple[bool, tuple[str, ...]]], columns: tuple[str, ...]
+) -> bool:
+    return any(unique and indexed == columns for unique, indexed in indexes.values())
+
+
+def huey_database_check(database: Path) -> Check:
+    """Require Huey's request, outbox, and candidate-confirmation schema."""
+
+    try:
+        with closing(_open_readonly_database(database)) as connection:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            required_tables = {
+                "requests",
+                "notification_deliveries",
+                "candidate_confirmations",
+                "candidate_options",
+                "candidate_confirmation_replies",
+            }
+            if not required_tables <= tables:
+                return Check(
+                    "huey:database", False, "candidate confirmation tables missing"
+                )
+
+            def columns(table: str) -> set[str]:
+                return {
+                    str(row[1])
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                }
+
+            request_columns = columns("requests")
+            delivery_columns = columns("notification_deliveries")
+            confirmation_columns = columns("candidate_confirmations")
+            option_columns = columns("candidate_options")
+            reply_columns = columns("candidate_confirmation_replies")
+            request_indexes = _sqlite_indexes(connection, "requests")
+            delivery_indexes = _sqlite_indexes(connection, "notification_deliveries")
+            confirmation_indexes = _sqlite_indexes(connection, "candidate_confirmations")
+            option_indexes = _sqlite_indexes(connection, "candidate_options")
+            reply_indexes = _sqlite_indexes(connection, "candidate_confirmation_replies")
+
+            active_index = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'index' AND name = 'requests_active_target_uq'"
+            ).fetchone()
+            active_sql = str(active_index[0] or "").casefold() if active_index else ""
+            expiry_index = confirmation_indexes.get(
+                "candidate_confirmations_expiry_idx"
+            )
+
+        schema_ok = bool(
+            {
+                "status",
+                "updated_at",
+                "service",
+                "external_id",
+                "external_status",
+                "error",
+                "target_key",
+                "message_id",
+            }
+            <= request_columns
+            and {
+                "request_id",
+                "event_key",
+                "route",
+                "message",
+                "delivered_at",
+            }
+            <= delivery_columns
+            and {
+                "request_id",
+                "shelfarr_correlation",
+                "expires_at",
+                "status",
+                "prompt_message_id",
+                "selected_ordinal",
+                "dispatch_started_at",
+            }
+            <= confirmation_columns
+            and {
+                "confirmation_id",
+                "ordinal",
+                "fingerprint",
+                "label",
+                "book_type",
+                "candidate_json",
+            }
+            <= option_columns
+            and {
+                "confirmation_id",
+                "reply_message_id",
+                "discord_user_id",
+                "channel_id",
+                "ordinal",
+                "outcome",
+            }
+            <= reply_columns
+            and _has_unique_columns(request_indexes, ("message_id",))
+            and _has_unique_columns(request_indexes, ("target_key",))
+            and _has_unique_columns(
+                delivery_indexes, ("request_id", "event_key", "route")
+            )
+            and _has_unique_columns(confirmation_indexes, ("request_id",))
+            and _has_unique_columns(
+                confirmation_indexes, ("shelfarr_correlation",)
+            )
+            and _has_unique_columns(confirmation_indexes, ("prompt_message_id",))
+            and _has_unique_columns(
+                option_indexes, ("confirmation_id", "ordinal")
+            )
+            and _has_unique_columns(
+                option_indexes, ("confirmation_id", "fingerprint")
+            )
+            and _has_unique_columns(reply_indexes, ("reply_message_id",))
+            and expiry_index == (
+                False,
+                ("status", "expires_at", "id"),
+            )
+            and "awaiting_selection" in active_sql
+        )
+        return Check(
+            "huey:database",
+            integrity == "ok" and schema_ok,
+            (
+                "integrity, request/outbox, and candidate confirmation schema valid"
+                if integrity == "ok" and schema_ok
+                else "request/outbox or candidate confirmation schema invalid"
+            ),
+        )
+    except Exception as error:
+        return Check("huey:database", False, type(error).__name__)
+
+
 def _open_readonly_database(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
@@ -1561,6 +1736,7 @@ def validate() -> list[Check]:
         channel_inventory_check(STACK_ROOT / "docs" / "huey-channels.yml")
     )
     checks.append(huey_ready_check(STACK_ROOT / "state" / "huey" / "ready"))
+    checks.append(huey_selection_ttl_check(env))
 
     media_root = Path(env.get("MEDIA_ROOT", "/mnt/media"))
     torrent_root = Path(env.get("TORRENT_ROOT", str(STACK_ROOT / "state" / "torrents")))
@@ -1887,49 +2063,9 @@ def validate() -> list[Check]:
     except Exception as error:
         checks.append(Check("bazarr:api", False, type(error).__name__))
 
-    try:
-        database = STACK_ROOT / "state" / "huey" / "huey.db"
-        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
-            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(requests)")}
-            indexes = list(connection.execute("PRAGMA index_list(requests)"))
-            delivery_columns = {
-                row[1]
-                for row in connection.execute(
-                    "PRAGMA table_info(notification_deliveries)"
-                )
-            }
-            delivery_indexes = list(
-                connection.execute("PRAGMA index_list(notification_deliveries)")
-            )
-        required_columns = {
-            "status", "updated_at", "service", "external_id",
-            "external_status", "error",
-        }
-        unique_message = any(row[2] for row in indexes)
-        required_delivery_columns = {
-            "request_id",
-            "event_key",
-            "route",
-            "message",
-            "delivered_at",
-        }
-        unique_delivery = any(row[2] for row in delivery_indexes)
-        schema_ok = bool(
-            required_columns <= columns
-            and unique_message
-            and required_delivery_columns <= delivery_columns
-            and unique_delivery
-        )
-        checks.append(
-            Check(
-                "huey:database",
-                integrity == "ok" and schema_ok,
-                "integrity, request schema, and notification outbox valid",
-            )
-        )
-    except Exception as error:
-        checks.append(Check("huey:database", False, type(error).__name__))
+    checks.append(
+        huey_database_check(STACK_ROOT / "state" / "huey" / "huey.db")
+    )
 
     try:
         database = STACK_ROOT / "config" / "bookbot" / "bookbot.db"

@@ -67,8 +67,24 @@ author match an active or completed request exactly. Punctuation, accents, year,
 edition, platform, and format remain significant; failed and `needs_selection`
 requests remain retryable.
 Historical active/completed requests receive the same key during migration but
-are never replayed or silently merged. Titles are never silently guessed:
-ambiguous searches end in `needs_selection`.
+are never replayed or silently merged. Titles are never silently guessed. When
+Shelfarr owns an ebook/audiobook request and metadata has two or three close,
+safe matches, Huey reserves the exact target in `awaiting_selection` and replies
+with at most three numbered candidates. Only the original requester may reply
+directly to that persisted Huey prompt, in the same request channel, with one
+strict whole-number choice. The default confirmation lifetime is 15 minutes
+(`HUEY_SELECTION_TTL_SECONDS=900`); expiry releases the target and stages one
+request-status rejection. Legacy parse failures, no-result/low-confidence
+matches, and every non-Shelfarr `needs_selection` result remain terminal and are
+not resumable.
+
+Candidate confirmation selects metadata, not an acquisition release. Huey
+persists a bounded Shelfarr search snapshot, freshly searches and verifies the
+same fingerprint after confirmation, then creates the Shelfarr request with the
+original Huey request ID and `huey:<id>` correlation. It does not call
+Shelfarr's `/grab` endpoint. No accepted/download lifecycle event is emitted
+until that request creation succeeds. Movies/TV and every direct-media handler
+remain on their existing paths.
 
 An existing ARR entity is read before mutation. Imported media returns an
 already-imported result; a monitored item starts no duplicate search; an
