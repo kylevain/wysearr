@@ -278,6 +278,19 @@ The six configured intake channels are `#movies-tv`, `#ebooks`, `#audiobooks`,
 `#manga-comics`, `#roms`, and `#sheet-music`. Huey replies to the originating
 message only for the request acknowledgement. It routes later events by purpose:
 
+Human-authored messages in those channels remain normal intake. Dewey may use
+the same `DISCORD_BOT_TOKEN` through Discord's create-message REST endpoint,
+but Huey accepts a bot-authored message only when Discord reports Huey's own
+live bot user ID, no webhook ID, and an exact string message nonce matching
+`dewey:v1:[A-Za-z0-9_-]{16}`. Every other bot and every webhook remains ignored.
+The nonce is transport metadata, never part of request content. Dewey must set
+`enforce_nonce=true` and reuse the same stable 16-character URL-safe suffix for
+every retry of one logical submission. Discord's returned message ID remains
+Huey's durable delivery key. Ordinary Huey sends and replies use numeric nonces,
+so they cannot recurse into request intake. The shared bot token must never be
+committed or logged; the nonce must never be placed in request content or shown
+to users.
+
 | Event class | Discord destination |
 | --- | --- |
 | Accepted, rejected, completed, or failed request | `#request-status` |

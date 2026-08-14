@@ -58,6 +58,7 @@ _SHELFARR_IMPORT_FAILURE = re.compile(
     re.IGNORECASE,
 )
 _SELECTION_ORDINAL = re.compile(r"^[1-9][0-9]*$")
+_DEWEY_TRUSTED_NONCE = re.compile(r"\Adewey:v1:[A-Za-z0-9_-]{16}\Z")
 
 
 def write_ready_marker(path: str | Path) -> None:
@@ -70,6 +71,35 @@ def write_ready_marker(path: str | Path) -> None:
 
 def remove_ready_marker(path: str | Path) -> None:
     Path(path).unlink(missing_ok=True)
+
+
+def accepts_discord_intake(client: Any, message: Any) -> bool:
+    """Accept people plus an explicitly marked message from Huey's own bot.
+
+    Dewey posts through Discord's normal create-message endpoint using Huey's
+    existing bot identity. Requiring the exact non-content nonce keeps normal
+    Huey replies, every other bot, and all webhooks outside the intake path.
+    """
+
+    if getattr(message, "webhook_id", None) is not None:
+        return False
+    author = getattr(message, "author", None)
+    if author is None:
+        return False
+    if not getattr(author, "bot", False):
+        return True
+
+    client_user = getattr(client, "user", None)
+    author_id = getattr(author, "id", None)
+    client_user_id = getattr(client_user, "id", None)
+    nonce = getattr(message, "nonce", None)
+    return bool(
+        author_id is not None
+        and client_user_id is not None
+        and author_id == client_user_id
+        and isinstance(nonce, str)
+        and _DEWEY_TRUSTED_NONCE.fullmatch(nonce)
+    )
 
 
 def format_reply(media_type: str, response: dict[str, Any]) -> str:
@@ -1776,7 +1806,7 @@ def build_client(
 
     @client.event
     async def on_message(message):
-        if getattr(message.author, "bot", False) or getattr(message, "webhook_id", None) is not None:
+        if not accepts_discord_intake(client, message):
             return
         media_type = channel_config.request_channels.get(str(message.channel.id))
         if media_type is None:

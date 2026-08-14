@@ -21,6 +21,7 @@ from orchestrator import RequestProcessor
 from results import result
 from services import ServiceRegistry
 from huey import (
+    accepts_discord_intake,
     build_client,
     notification_loop,
     shelfarr_reconciliation_loop,
@@ -478,6 +479,9 @@ class FakeIncomingMessage(FakeMessage):
         channel,
         content,
         author_id=99,
+        author_bot=False,
+        nonce=None,
+        webhook_id=None,
         reference_id=None,
         reply_message_id=900,
     ):
@@ -485,7 +489,8 @@ class FakeIncomingMessage(FakeMessage):
         self.id = message_id
         self.channel = channel
         self.content = content
-        self.webhook_id = None
+        self.nonce = nonce
+        self.webhook_id = webhook_id
         self.reference = (
             types.SimpleNamespace(message_id=reference_id)
             if reference_id is not None
@@ -496,7 +501,7 @@ class FakeIncomingMessage(FakeMessage):
             (),
             {
                 "id": author_id,
-                "bot": False,
+                "bot": author_bot,
                 "__str__": lambda _self: "reader",
             },
         )()
@@ -2552,6 +2557,139 @@ class DiscordAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(error_channel.sent, [])
             event_types = [event["event_type"] for event in store.events_for(1)]
             self.assertEqual(event_types.count("notification_failed"), 1)
+
+
+class DiscordTrustedSelfIntakeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.channel = FakeChannel()
+        self.channel.id = REQUESTS["ebooks"]
+        self.client = types.SimpleNamespace(
+            user=types.SimpleNamespace(id=42, bot=True)
+        )
+
+    def message(self, **overrides):
+        values = {
+            "message_id": 500,
+            "channel": self.channel,
+            "content": "Dune by Frank Herbert",
+        }
+        values.update(overrides)
+        return FakeIncomingMessage(**values)
+
+    def test_human_and_exact_dewey_self_nonce_are_accepted(self):
+        human = self.message(author_id=99)
+        dewey = self.message(
+            author_id=42,
+            author_bot=True,
+            nonce="dewey:v1:AbCdEf0123_-xyZ9",
+        )
+
+        self.assertTrue(accepts_discord_intake(self.client, human))
+        self.assertTrue(accepts_discord_intake(self.client, dewey))
+
+    def test_other_automation_and_huey_replies_are_rejected(self):
+        valid_nonce = "dewey:v1:AbCdEf0123_-xyZ9"
+        rejected = (
+            self.message(author_id=99, webhook_id=600),
+            self.message(author_id=77, author_bot=True, nonce=valid_nonce),
+            self.message(author_id="42", author_bot=True, nonce=valid_nonce),
+            self.message(author_id=42, author_bot=True, nonce=None),
+            self.message(author_id=42, author_bot=True, nonce=123456789),
+            self.message(
+                author_id=42,
+                author_bot=True,
+                nonce="dewey:v1:AbCdEf0123_-xyZ",
+            ),
+            self.message(
+                author_id=42,
+                author_bot=True,
+                nonce="dewey:v1:AbCdEf0123_-xyZ90",
+            ),
+            self.message(
+                author_id=42,
+                author_bot=True,
+                nonce="dewey:v1:AbCdEf0123+_xyZ9",
+            ),
+            self.message(
+                author_id=42,
+                author_bot=True,
+                nonce=valid_nonce,
+                webhook_id=600,
+            ),
+        )
+
+        for message in rejected:
+            with self.subTest(nonce=message.nonce, webhook_id=message.webhook_id):
+                self.assertFalse(accepts_discord_intake(self.client, message))
+
+    async def test_exact_dewey_self_nonce_reaches_normal_durable_processor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RequestStore(Path(directory) / "huey.db")
+            store.initialize()
+            dispatcher = Mock(
+                return_value=result(
+                    "queued",
+                    "Queued Dune in qBittorrent",
+                    service="qbittorrent",
+                    external_id="d" * 40,
+                    external_title="Dune EPUB",
+                )
+            )
+            processor = RequestProcessor(
+                store,
+                services={"direct": object()},
+                dispatcher=dispatcher,
+            )
+            config = validate_channel_config(channel_mapping())
+            discord_module = types.SimpleNamespace(
+                Intents=FakeIntents,
+                Client=FakeDiscordClient,
+            )
+            with patch.dict(sys.modules, {"discord": discord_module}):
+                client = build_client(config, processor, Path(directory) / "ready")
+            client.user = types.SimpleNamespace(id=42, bot=True)
+            client.channels = {
+                REQUESTS["ebooks"]: self.channel,
+                **{channel_id: FakeChannel() for channel_id in ACTIVITY.values()},
+                **{channel_id: FakeChannel() for channel_id in SYSTEM.values()},
+            }
+            message = self.message(
+                author_id=42,
+                author_bot=True,
+                nonce="dewey:v1:AbCdEf0123_-xyZ9",
+            )
+
+            async def direct_call(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with patch("huey.asyncio.to_thread", new=direct_call):
+                await client.on_message(message)
+
+            dispatcher.assert_called_once()
+            self.assertEqual(len(message.replies), 1)
+            self.assertEqual(store.get_request(1)["discord_user_id"], "42")
+
+    async def test_rejected_automated_message_never_reaches_processor(self):
+        processor = Mock()
+        config = validate_channel_config(channel_mapping())
+        discord_module = types.SimpleNamespace(
+            Intents=FakeIntents,
+            Client=FakeDiscordClient,
+        )
+        with patch.dict(sys.modules, {"discord": discord_module}):
+            client = build_client(config, processor, Path("/unused/ready"))
+        client.user = types.SimpleNamespace(id=42, bot=True)
+        message = self.message(
+            author_id=77,
+            author_bot=True,
+            nonce="dewey:v1:AbCdEf0123_-xyZ9",
+        )
+
+        await client.on_message(message)
+
+        processor.process.assert_not_called()
+        processor.process_candidate_reply.assert_not_called()
+        self.assertEqual(message.replies, [])
 
 
 class DiscordChannelValidationTests(unittest.IsolatedAsyncioTestCase):
