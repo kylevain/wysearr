@@ -80,6 +80,11 @@ a SQLite-safe runtime checkpoint, pulls pinned images, builds Huey and BookBot,
 repairs known compatible migrations, bootstraps service integrations, waits for
 health, and runs the production validator.
 
+qBittorrent is fail-closed behind PIA through Gluetun; its LAN address and every
+internal `http://qbittorrent:8080` integration remain unchanged. The architecture,
+kill-switch proof, port-forward behavior, and recovery procedure are in
+[docs/qbittorrent-vpn.md](docs/qbittorrent-vpn.md).
+
 Common commands:
 
 ```bash
@@ -87,6 +92,7 @@ cd /home/wyseadmin/homelab
 docker compose ps
 docker compose logs --tail=100 huey bookbot
 python3 scripts/validate.py
+python3 scripts/validate_qbittorrent_vpn.py
 python3 scripts/backup.py
 ```
 

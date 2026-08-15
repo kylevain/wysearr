@@ -1,0 +1,4 @@
+[[roles]]
+name = "local-vpn-control"
+routes = ["GET /v1/vpn/status", "PUT /v1/vpn/status"]
+auth = "none"

@@ -112,6 +112,22 @@ if [ ! -w state/huey ] || { [ -e state/huey/huey.db ] && [ ! -w state/huey/huey.
     fail "state/huey is not writable by UID $(id -u); repair ownership before deploying"
 fi
 
+vpn_provider="$(strict_env_value VPN_SERVICE_PROVIDER)"
+openvpn_user="$(strict_env_value OPENVPN_USER)"
+openvpn_password="$(strict_env_value OPENVPN_PASSWORD)"
+openvpn_protocol="$(strict_env_value OPENVPN_PROTOCOL)"
+[ "$vpn_provider" = "private internet access" ] || \
+    fail "VPN_SERVICE_PROVIDER must be exactly 'private internet access'"
+[ -n "$openvpn_user" ] && [ "$openvpn_user" != "__WYSEARR_INVALID__" ] || \
+    fail "OPENVPN_USER must have one nonempty exact assignment"
+[ -n "$openvpn_password" ] && [ "$openvpn_password" != "__WYSEARR_INVALID__" ] || \
+    fail "OPENVPN_PASSWORD must have one nonempty exact assignment"
+case "$openvpn_protocol" in
+    ""|udp) ;;
+    *) fail "OPENVPN_PROTOCOL must be udp when explicitly configured" ;;
+esac
+unset openvpn_user openvpn_password
+
 docker compose config --quiet
 deployment_id="$(date -u +%Y%m%d-%H%M%S)-$$"
 
@@ -190,7 +206,42 @@ docker compose pull --ignore-buildable
 docker compose build --pull bookbot huey
 
 runtime_replaced=1
-docker compose up -d --remove-orphans "${core_services[@]}"
+# Gluetun owns the published WebUI port and the `qbittorrent` network alias.
+# Stop a legacy/direct-network qBittorrent before the first migration so both
+# containers can never contend for the same LAN port. Later deploys preserve a
+# running qBittorrent unless Gluetun itself was recreated or the namespace link
+# is stale.
+previous_gluetun_container="$(docker compose ps -q gluetun 2>/dev/null || true)"
+qbittorrent_container="$(docker compose ps -aq qbittorrent 2>/dev/null || true)"
+qbittorrent_network_mode=""
+if [ -n "$qbittorrent_container" ]; then
+    qbittorrent_network_mode="$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$qbittorrent_container")"
+fi
+if service_is_running qbittorrent && \
+    { [ -z "$previous_gluetun_container" ] || \
+      [ "$qbittorrent_network_mode" != "container:$previous_gluetun_container" ]; }; then
+    docker compose stop qbittorrent
+fi
+
+docker compose up -d --no-deps gluetun
+wait_for_health 240 gluetun
+gluetun_container="$(docker compose ps -q gluetun)"
+[ -n "$gluetun_container" ] || fail "Gluetun has no running container"
+
+qbittorrent_container="$(docker compose ps -aq qbittorrent 2>/dev/null || true)"
+qbittorrent_network_mode=""
+if [ -n "$qbittorrent_container" ]; then
+    qbittorrent_network_mode="$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$qbittorrent_container")"
+fi
+if ! service_is_running qbittorrent || \
+    [ "$qbittorrent_network_mode" != "container:$gluetun_container" ]; then
+    docker compose up -d --no-deps --force-recreate qbittorrent
+fi
+wait_for_health 240 qbittorrent
+
+docker compose up -d --no-deps qbittorrent-port-forward
+wait_for_health 240 qbittorrent-port-forward
+docker compose up -d --remove-orphans --no-deps "${core_services[@]}"
 wait_for_health 300 "${core_services[@]}"
 
 python3 scripts/repair_whisparr_quality.py --apply
@@ -245,6 +296,7 @@ fi
 docker compose up -d --build --remove-orphans bookbot huey
 wait_for_health 300 bookbot huey
 
+python3 scripts/validate_qbittorrent_vpn.py
 python3 scripts/validate.py
 
 # Take the post-deploy rollback generation while every Shelfarr state writer
@@ -259,6 +311,7 @@ if [ "${#evaluation_services[@]}" -gt 0 ]; then
 fi
 docker compose start huey
 wait_for_health 180 huey
+python3 scripts/validate_qbittorrent_vpn.py
 python3 scripts/validate.py
 
 deployment_complete=1
