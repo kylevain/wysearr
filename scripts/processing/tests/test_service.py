@@ -3,15 +3,17 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 from bookbot_lib.config import CATEGORY_SPECS, BookBotConfig
+from bookbot_lib.errors import MetadataCorrelationError
 from bookbot_lib.huey import HueyUpdater
 from bookbot_lib.ledger import ImportLedger
 from bookbot_lib.service import BookBotService
-from bookbot_lib.storage import LibraryImporter
+from bookbot_lib.storage import AudiobookMetadata, LibraryImporter
 
 
 HASH_A = "a" * 40
@@ -80,6 +82,17 @@ class FakeHuey:
     def __init__(self) -> None:
         self.completed: list[tuple[str, Path, str]] = []
         self.failures: list[tuple[str, str, str]] = []
+        self.metadata: AudiobookMetadata | None = None
+        self.metadata_error: Exception | None = None
+        self.metadata_lookups: list[tuple[str, str]] = []
+
+    def abba_audiobook_metadata(
+        self, torrent_hash: str, tags: str = ""
+    ) -> AudiobookMetadata | None:
+        self.metadata_lookups.append((torrent_hash, tags))
+        if self.metadata_error is not None:
+            raise self.metadata_error
+        return self.metadata
 
     def complete(self, torrent_hash: str, destination: Path, tags: str = "") -> bool:
         self.completed.append((torrent_hash, destination, tags))
@@ -186,7 +199,105 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(2, len(self.huey.completed))
         self.assertTrue(self.config.health_path.is_file())
 
-    def test_retained_import_reconciles_later_duplicate_huey_request(self) -> None:
+    def test_trusted_abba_audiobook_metadata_is_staged_with_import(self) -> None:
+        source = self.downloads / "audiobooks" / (
+            "Brynne Weaver - Tourist Season (The Seasons of Carnage Trilogy #1)"
+        )
+        source.mkdir()
+        (source / "Brynne Weaver - Tourist Season.m4b").write_bytes(b"audio")
+        torrent = completed_torrent(
+            HASH_A, "audiobooks", source, self.downloads, tags="huey-33"
+        )
+        self.huey.metadata = AudiobookMetadata(
+            "Tourist Season", "Brynne Weaver"
+        )
+        qbit = FakeQbittorrent([torrent], self.downloads)
+        service = self.service(qbit)
+
+        counts = service.run_cycle(now=100)
+
+        destination = self.media / "audiobooks" / "Tourist Season"
+        root = ET.fromstring((destination / "metadata.opf").read_bytes())
+        namespace = {"dc": "http://purl.org/dc/elements/1.1/"}
+        self.assertEqual(1, counts.imported)
+        self.assertEqual(
+            "Tourist Season",
+            root.findtext(".//dc:title", namespaces=namespace),
+        )
+        self.assertEqual(
+            "Brynne Weaver",
+            root.findtext(".//dc:creator", namespaces=namespace),
+        )
+        self.assertFalse((self.media / "audiobooks" / source.name).exists())
+        row = service.ledger.get(HASH_A)
+        assert row is not None
+        self.assertEqual(str(destination), row["destination_path"])
+        self.assertEqual([(HASH_A, "huey-33")], self.huey.metadata_lookups)
+
+    def test_audiobook_without_trusted_huey_metadata_is_unchanged(self) -> None:
+        source = self.downloads / "audiobooks" / "Uncorrelated Book.m4b"
+        source.write_bytes(b"audio")
+        torrent = completed_torrent(
+            HASH_A, "audiobooks", source, self.downloads, tags=""
+        )
+        qbit = FakeQbittorrent([torrent], self.downloads)
+        service = self.service(qbit)
+
+        counts = service.run_cycle(now=100)
+        reconciled = service.run_cycle(now=101)
+
+        destination = self.media / "audiobooks" / "Uncorrelated Book"
+        self.assertEqual(1, counts.imported)
+        self.assertEqual(1, reconciled.reconciled)
+        self.assertFalse((destination / "metadata.opf").exists())
+
+    def test_ambiguous_huey_metadata_fails_closed_before_copy(self) -> None:
+        source = self.downloads / "audiobooks" / "Ambiguous Book.m4b"
+        source.write_bytes(b"audio")
+        torrent = completed_torrent(
+            HASH_A,
+            "audiobooks",
+            source,
+            self.downloads,
+            tags="huey-1,huey-2",
+        )
+        self.huey.metadata_error = MetadataCorrelationError(
+            "multiple matching requests"
+        )
+
+        counts = self.service(
+            FakeQbittorrent([torrent], self.downloads)
+        ).run_cycle(now=100)
+
+        self.assertEqual(1, counts.rejected)
+        self.assertTrue(source.is_file())
+        self.assertFalse((self.media / "audiobooks").exists())
+
+    def test_reconcile_does_not_mutate_retained_audiobook_metadata(self) -> None:
+        source = self.downloads / "audiobooks" / "Legacy Book.m4b"
+        source.write_bytes(b"audio")
+        torrent = completed_torrent(
+            HASH_A, "audiobooks", source, self.downloads, tags="huey-33"
+        )
+        qbit = FakeQbittorrent([torrent], self.downloads)
+        service = self.service(qbit)
+        first = service.run_cycle(now=100)
+        destination = self.media / "audiobooks" / "Legacy Book"
+        self.assertEqual(1, first.imported)
+        self.assertFalse((destination / "metadata.opf").exists())
+
+        self.huey.metadata = AudiobookMetadata(
+            "Tourist & Season", "Brynne Weaver"
+        )
+        metadata_lookups = list(self.huey.metadata_lookups)
+        second = service.run_cycle(now=101)
+
+        self.assertEqual(1, second.reconciled)
+        self.assertEqual(metadata_lookups, self.huey.metadata_lookups)
+        self.assertFalse((destination / "metadata.opf").exists())
+        self.assertFalse((self.media / "audiobooks" / "Tourist & Season").exists())
+
+    def test_retained_import_does_not_complete_untagged_same_hash_request(self) -> None:
         source = self.downloads / "ebooks" / "Book.epub"
         source.write_bytes(b"book")
         torrent = completed_torrent(
@@ -194,7 +305,7 @@ class ServiceTests(unittest.TestCase):
             "ebooks",
             source,
             self.downloads,
-            tags="huey-1,huey-4",
+            tags="huey-1",
         )
         qbit = FakeQbittorrent([torrent], self.downloads)
         huey_database = self.config_dir / "huey.db"
@@ -261,10 +372,10 @@ class ServiceTests(unittest.TestCase):
                 "SELECT id, status FROM requests ORDER BY id"
             ).fetchall()
         self.assertEqual(1, first.imported)
-        self.assertEqual(1, second.reconciled)
+        self.assertEqual(0, second.reconciled)
         self.assertEqual(imported_at, service.ledger.get(HASH_A)["imported_at"])
         self.assertEqual(
-            [(1, "complete"), (2, "complete"), (3, "failed"), (4, "queued")],
+            [(1, "complete"), (2, "queued"), (3, "failed"), (4, "queued")],
             statuses,
         )
 

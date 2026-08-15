@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 from collections.abc import Mapping, Sequence
@@ -25,8 +26,15 @@ REQUEST_STATUSES = frozenset(
 )
 CANDIDATE_CONFIRMATION_TTL_SECONDS = 15 * 60
 _SELECTION_FINGERPRINT = re.compile(r"\A[0-9a-f]{64}\Z")
+_ABBA_CANDIDATE_ID = re.compile(r"\Aabba:[0-9a-f]{64}\Z")
+_ABBA_INFO_HASH = re.compile(r"\A[0-9a-f]{40}\Z")
+_LAZYLIBRARIAN_BOOK_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
+_EBOOK_BACKENDS = frozenset({"lazylibrarian", "shelfarr"})
+_DOWNLOAD_ID = re.compile(r"\A(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 _SELECTION_WORK_ID = re.compile(
-    r"\A(?:hardcover|google_books|openlibrary):[A-Za-z0-9][A-Za-z0-9._:-]{0,230}\Z"
+    r"\A(?:(?:hardcover|google_books|openlibrary):"
+    r"[A-Za-z0-9][A-Za-z0-9._:-]{0,230}|"
+    r"(?:abba|lazylibrarian):[0-9a-f]{64})\Z"
 )
 _SENSITIVE_SELECTION_TEXT = re.compile(
     r"(?:https?://|ftp://|www\.|magnet:|"
@@ -60,6 +68,10 @@ _REQUEST_COLUMNS = {
     "notified_at": "TEXT",
     "target_key": "TEXT",
     "external_status": "TEXT",
+    "dispatch_started_at": "TEXT",
+    "abba_candidate_id": "TEXT",
+    "lazylibrarian_book_id": "TEXT",
+    "canonical_request_id": "INTEGER",
 }
 _CANDIDATE_CONFIRMATION_COLUMNS = {
     "dispatch_started_at": "TEXT",
@@ -77,6 +89,28 @@ SHELFARR_STATUSES = frozenset(
         "failed",
     }
 )
+ABBA_STATUSES = frozenset(
+    {"queued", "downloading", "downloaded", "processing", "failed"}
+)
+LAZYLIBRARIAN_STATUSES = frozenset(
+    {"queued", "downloading", "processing", "failed"}
+)
+
+
+class LazyLibrarianHashCollision(sqlite3.IntegrityError):
+    """Two active LazyLibrarian requests resolved to one qBit identity."""
+
+
+class EbookIdentityCollision(sqlite3.IntegrityError):
+    """Another logical Huey request already owns the resolved ebook work."""
+
+    def __init__(self, owner_request_id: int):
+        super().__init__("Resolved ebook identity is already reserved")
+        self.owner_request_id = int(owner_request_id)
+
+
+class EbookCascadeStateError(RuntimeError):
+    """A cascade transition would violate its serial mutation invariant."""
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -170,6 +204,56 @@ def _normalize_candidate_snapshot(
     return snapshot
 
 
+def _ebook_identity_key(snapshot: Mapping[str, Any]) -> str:
+    """Return a provider-independent exact-work reservation key."""
+
+    try:
+        from .matching import normalize_identity_text
+    except ImportError:  # pragma: no cover - direct container entrypoint
+        from matching import normalize_identity_text
+
+    payload = {
+        "version": 1,
+        "media_type": "ebooks",
+        "title": normalize_identity_text(snapshot.get("title")),
+        "author": normalize_identity_text(snapshot.get("author")),
+        "year": snapshot.get("year"),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _ebook_policy(value: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)):
+        raise ValueError("Ebook backend policy must be an ordered sequence")
+    policy = tuple(str(backend) for backend in value)
+    if (
+        not policy
+        or len(set(policy)) != len(policy)
+        or any(backend not in _EBOOK_BACKENDS for backend in policy)
+    ):
+        raise ValueError("Ebook backend policy is invalid")
+    return policy
+
+
+def _ebook_backend_identity(backend: str, value: object) -> str:
+    identity = str(value or "")
+    if backend == "lazylibrarian":
+        if not _LAZYLIBRARIAN_BOOK_ID.fullmatch(identity):
+            raise ValueError("LazyLibrarian reservation requires an exact BookID")
+    elif backend == "shelfarr":
+        if not _SELECTION_WORK_ID.fullmatch(identity) or identity.startswith(
+            ("abba:", "lazylibrarian:")
+        ):
+            raise ValueError("Shelfarr reservation requires an exact work ID")
+    else:
+        raise ValueError("Unsupported ebook backend")
+    return identity
+
+
 class RequestStore:
     """Small transaction-oriented repository around the Huey SQLite database."""
 
@@ -198,8 +282,17 @@ class RequestStore:
             self._fail_unbound_candidate_confirmations(connection)
             self._fail_claimed_pre_dispatch_confirmations(connection)
             self._mark_interrupted_shelfarr_requests(connection)
+            self._mark_interrupted_abba_requests(connection)
+            self._mark_interrupted_lazylibrarian_requests(connection)
             self._fail_interrupted_requests(connection)
             self._backfill_target_keys(connection)
+            connection.executescript(
+                """
+                DROP INDEX IF EXISTS requests_active_abba_hash_uq;
+                DROP INDEX IF EXISTS requests_active_abba_candidate_uq;
+                """
+            )
+            self._migrate_abba_collisions(connection)
             connection.executescript(
                 """
                 DROP INDEX IF EXISTS requests_active_target_uq;
@@ -210,6 +303,36 @@ class RequestStore:
                           'new', 'processing', 'awaiting_selection',
                           'queued', 'complete', 'completed'
                       );
+                CREATE UNIQUE INDEX IF NOT EXISTS requests_active_ll_book_uq
+                    ON requests(lazylibrarian_book_id)
+                    WHERE service = 'lazylibrarian'
+                      AND lazylibrarian_book_id IS NOT NULL
+                      AND status IN (
+                          'processing', 'queued', 'complete', 'completed'
+                      );
+                CREATE UNIQUE INDEX IF NOT EXISTS requests_active_ll_hash_uq
+                    ON requests(lower(external_id))
+                    WHERE service = 'lazylibrarian'
+                      AND external_id IS NOT NULL
+                      AND status IN ('processing', 'queued');
+                CREATE UNIQUE INDEX requests_active_abba_hash_uq
+                    ON requests(lower(external_id))
+                    WHERE service = 'abba'
+                      AND external_id IS NOT NULL
+                      AND canonical_request_id IS NULL
+                      AND status IN (
+                          'processing', 'queued', 'complete', 'completed'
+                      );
+                CREATE UNIQUE INDEX requests_active_abba_candidate_uq
+                    ON requests(abba_candidate_id)
+                    WHERE service = 'abba'
+                      AND abba_candidate_id IS NOT NULL
+                      AND canonical_request_id IS NULL
+                      AND status IN (
+                          'processing', 'queued', 'complete', 'completed'
+                      );
+                CREATE INDEX IF NOT EXISTS requests_canonical_request_idx
+                    ON requests(canonical_request_id);
                 CREATE INDEX IF NOT EXISTS requests_status_idx
                     ON requests(status, updated_at);
                 CREATE INDEX IF NOT EXISTS requests_media_created_idx
@@ -218,6 +341,50 @@ class RequestStore:
                     ON events(request_id, created_at);
                 """
             )
+
+    @staticmethod
+    def _close_released_ebook_cascade(
+        connection: sqlite3.Connection, request_id: int
+    ) -> None:
+        """Keep a released candidate target and its cascade ledger consistent."""
+
+        cascade = connection.execute(
+            """
+            SELECT current_ordinal, mutation_backend FROM ebook_cascades
+            WHERE request_id = ?
+            """,
+            (int(request_id),),
+        ).fetchone()
+        if cascade is None:
+            return
+        if cascade["mutation_backend"] is not None:
+            raise EbookCascadeStateError(
+                "A mutated ebook cascade cannot be released as a prompt failure"
+            )
+        connection.execute(
+            """
+            UPDATE ebook_backend_attempts
+            SET status = 'failed', finished_at = CURRENT_TIMESTAMP,
+                outcome_message = COALESCE(
+                    outcome_message, 'Candidate confirmation ended before mutation'
+                )
+            WHERE request_id = ? AND ordinal = ?
+              AND status IN ('searching', 'awaiting_selection')
+            """,
+            (int(request_id), int(cascade["current_ordinal"])),
+        )
+        connection.execute(
+            """
+            UPDATE ebook_cascades
+            SET state = 'failed', updated_at = CURRENT_TIMESTAMP
+            WHERE request_id = ?
+            """,
+            (int(request_id),),
+        )
+        connection.execute(
+            "DELETE FROM ebook_backend_reservations WHERE request_id = ?",
+            (int(request_id),),
+        )
 
     @staticmethod
     def _fail_unbound_candidate_confirmations(
@@ -259,6 +426,9 @@ class RequestStore:
                 """,
                 (message, row["request_id"]),
             )
+            RequestStore._close_released_ebook_cascade(
+                connection, int(row["request_id"])
+            )
             connection.execute(
                 "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
                 (row["request_id"], "selection_prompt_recovered", message),
@@ -274,7 +444,6 @@ class RequestStore:
                     f"⚠️ Request #{row['request_id']} needs clarification: {message}",
                 ),
             )
-
     @staticmethod
     def _fail_claimed_pre_dispatch_confirmations(
         connection: sqlite3.Connection,
@@ -282,15 +451,15 @@ class RequestStore:
         """Release a selection proven not to have crossed the POST boundary.
 
         ``dispatch_started_at`` is set transactionally by the callback which
-        runs immediately before Shelfarr's non-idempotent request POST.  A
+        runs immediately before the service's non-idempotent request POST.  A
         claimed row without that marker after restart therefore cannot have
-        reached Shelfarr and may be released without risking a duplicate.
+        reached the service and may be released without risking a duplicate.
         Rows with the marker remain owned for correlation recovery.
         """
 
         message = (
-            "Huey restarted before the confirmed selection reached Shelfarr; "
-            "submit the title again."
+            "Huey restarted before the confirmed selection reached the acquisition "
+            "service; submit the title again."
         )
         rows = connection.execute(
             """
@@ -300,8 +469,12 @@ class RequestStore:
             WHERE candidate_confirmations.status = 'claimed'
               AND candidate_confirmations.dispatch_started_at IS NULL
               AND requests.status = 'processing'
-              AND requests.service = 'shelfarr'
+              AND requests.service IN ('shelfarr', 'abba', 'lazylibrarian')
               AND requests.external_id IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM ebook_cascades
+                  WHERE ebook_cascades.request_id = requests.id
+              )
             ORDER BY candidate_confirmations.id
             """
         ).fetchall()
@@ -322,7 +495,8 @@ class RequestStore:
                 SET status = 'needs_selection', updated_at = CURRENT_TIMESTAMP,
                     error = ?
                 WHERE id = ? AND status = 'processing'
-                  AND service = 'shelfarr' AND external_id IS NULL
+                  AND service IN ('shelfarr', 'abba', 'lazylibrarian')
+                  AND external_id IS NULL
                 """,
                 (message, row["request_id"]),
             )
@@ -349,6 +523,17 @@ class RequestStore:
             SELECT id FROM requests
             WHERE status = 'processing' AND service = 'shelfarr'
               AND external_id IS NULL
+              AND (
+                  NOT EXISTS (
+                      SELECT 1 FROM ebook_cascades
+                      WHERE ebook_cascades.request_id = requests.id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM ebook_cascades
+                      WHERE ebook_cascades.request_id = requests.id
+                        AND ebook_cascades.mutation_backend = 'shelfarr'
+                  )
+              )
             """
         ).fetchall()
         for row in rows:
@@ -370,6 +555,69 @@ class RequestStore:
                 )
 
     @staticmethod
+    def _mark_interrupted_abba_requests(connection: sqlite3.Connection) -> None:
+        """Keep only ABBA dispatches which crossed the durable grab boundary."""
+
+        rows = connection.execute(
+            """
+            SELECT id FROM requests
+            WHERE status = 'processing' AND service = 'abba'
+              AND external_id IS NULL AND dispatch_started_at IS NOT NULL
+              AND abba_candidate_id IS NOT NULL
+            """
+        ).fetchall()
+        for row in rows:
+            exists = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE request_id = ? AND event_type = 'startup_abba_recovery'
+                """,
+                (row["id"],),
+            ).fetchone()
+            if exists is None:
+                connection.execute(
+                    "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                    (
+                        row["id"],
+                        "startup_abba_recovery",
+                        "Huey restarted during an ABBA grab; recovering correlation",
+                    ),
+                )
+
+    @staticmethod
+    def _mark_interrupted_lazylibrarian_requests(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Keep LL mutations owned without ever repeating their book search."""
+
+        rows = connection.execute(
+            """
+            SELECT id FROM requests
+            WHERE status = 'processing' AND service = 'lazylibrarian'
+              AND external_id IS NULL AND dispatch_started_at IS NOT NULL
+              AND lazylibrarian_book_id IS NOT NULL
+            """
+        ).fetchall()
+        for row in rows:
+            exists = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE request_id = ?
+                  AND event_type = 'startup_lazylibrarian_recovery'
+                """,
+                (row["id"],),
+            ).fetchone()
+            if exists is None:
+                connection.execute(
+                    "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                    (
+                        row["id"],
+                        "startup_lazylibrarian_recovery",
+                        "Huey restarted during a LazyLibrarian dispatch; recovering exact history",
+                    ),
+                )
+
+    @staticmethod
     def _fail_interrupted_requests(connection: sqlite3.Connection) -> None:
         message = (
             "Huey restarted before this request reached a durable queued state; "
@@ -379,7 +627,28 @@ class RequestStore:
             """
             SELECT id FROM requests
             WHERE status IN ('new', 'processing')
+              AND NOT (
+                  status = 'processing' AND media_type = 'ebooks'
+                  AND EXISTS (
+                      SELECT 1 FROM ebook_cascades
+                      WHERE ebook_cascades.request_id = requests.id
+                        AND ebook_cascades.mutation_backend IS NULL
+                        AND ebook_cascades.state IN (
+                            'searching', 'awaiting_selection'
+                        )
+                  )
+              )
               AND NOT (status = 'processing' AND service = 'shelfarr')
+              AND NOT (
+                  status = 'processing' AND service = 'abba'
+                  AND dispatch_started_at IS NOT NULL
+                  AND abba_candidate_id IS NOT NULL
+              )
+              AND NOT (
+                  status = 'processing' AND service = 'lazylibrarian'
+                  AND dispatch_started_at IS NOT NULL
+                  AND lazylibrarian_book_id IS NOT NULL
+              )
             """
         ).fetchall()
         for row in rows:
@@ -410,6 +679,56 @@ class RequestStore:
                       SELECT 1 FROM events
                       WHERE events.request_id = requests.id
                         AND events.event_type = 'startup_shelfarr_recovery'
+                  )
+                ORDER BY updated_at, id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def interrupted_abba_requests(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return ABBA grabs which crossed the durable dispatch boundary."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE status = 'processing'
+                  AND service = 'abba'
+                  AND external_id IS NULL
+                  AND dispatch_started_at IS NOT NULL
+                  AND abba_candidate_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM events
+                      WHERE events.request_id = requests.id
+                        AND events.event_type = 'startup_abba_recovery'
+                  )
+                ORDER BY updated_at, id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def interrupted_lazylibrarian_requests(
+        self, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return LL requests which crossed their durable mutation boundary."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE status = 'processing'
+                  AND service = 'lazylibrarian'
+                  AND external_id IS NULL
+                  AND dispatch_started_at IS NOT NULL
+                  AND lazylibrarian_book_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM events
+                      WHERE events.request_id = requests.id
+                        AND events.event_type = 'startup_lazylibrarian_recovery'
                   )
                 ORDER BY updated_at, id
                 LIMIT ?
@@ -517,6 +836,248 @@ class RequestStore:
             )
 
     @staticmethod
+    def _coalesce_abba_row(
+        connection: sqlite3.Connection,
+        alias_request_id: int,
+        canonical_request_id: int,
+        *,
+        reason: str,
+    ) -> None:
+        """Turn one duplicate ABBA row into an inert canonical-request alias."""
+
+        alias_id = int(alias_request_id)
+        owner_id = int(canonical_request_id)
+        if alias_id == owner_id:
+            raise sqlite3.IntegrityError("An ABBA request cannot alias itself")
+        message = (
+            "ABBA acquisition identity is already owned by canonical request "
+            f"#{owner_id} ({reason})"
+        )
+        cursor = connection.execute(
+            """
+            UPDATE requests
+            SET status = 'failed', canonical_request_id = ?,
+                external_status = 'canonical_duplicate', error = NULL,
+                notified_at = COALESCE(notified_at, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND service = 'abba'
+              AND canonical_request_id IS NULL
+            """,
+            (owner_id, alias_id),
+        )
+        if cursor.rowcount != 1:
+            raise sqlite3.IntegrityError("ABBA duplicate could not be aliased")
+        connection.execute(
+            """
+            UPDATE requests
+            SET canonical_request_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE canonical_request_id = ?
+            """,
+            (owner_id, alias_id),
+        )
+        connection.execute(
+            """
+            UPDATE delivery_aliases
+            SET request_id = ?
+            WHERE request_id = ?
+            """,
+            (owner_id, alias_id),
+        )
+        connection.execute(
+            """
+            UPDATE candidate_confirmations
+            SET status = 'failed', updated_at = CURRENT_TIMESTAMP,
+                failure_message = ?
+            WHERE request_id = ? AND status IN ('pending', 'claimed')
+            """,
+            (message[:500], alias_id),
+        )
+        delivery_ids = {
+            str(row["message_id"])
+            for row in connection.execute(
+                "SELECT message_id FROM requests WHERE id = ?", (alias_id,)
+            ).fetchall()
+        }
+        delivery_ids.update(
+            str(row["reply_message_id"])
+            for row in connection.execute(
+                """
+                SELECT candidate_confirmation_replies.reply_message_id
+                FROM candidate_confirmation_replies
+                JOIN candidate_confirmations
+                  ON candidate_confirmations.id =
+                     candidate_confirmation_replies.confirmation_id
+                WHERE candidate_confirmations.request_id = ?
+                """,
+                (alias_id,),
+            ).fetchall()
+        )
+        for delivery_id in delivery_ids:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO delivery_aliases (message_id, request_id)
+                VALUES (?, ?)
+                """,
+                (delivery_id, owner_id),
+            )
+        connection.execute(
+            "DELETE FROM notification_deliveries "
+            "WHERE request_id = ? AND delivered_at IS NULL",
+            (alias_id,),
+        )
+        connection.execute(
+            "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+            (alias_id, "abba_canonical_alias", message),
+        )
+        connection.execute(
+            "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+            (
+                owner_id,
+                "abba_duplicate_coalesced",
+                f"Coalesced duplicate ABBA request #{alias_id} ({reason})",
+            ),
+        )
+
+    @classmethod
+    def _migrate_abba_collisions(cls, connection: sqlite3.Connection) -> None:
+        """Deterministically reconcile ABBA collisions created by older code."""
+
+        active = "'processing', 'queued', 'complete', 'completed'"
+        # Resolve candidate identity before hash identity.  Otherwise a row
+        # whose candidate changed from X to Y can be hidden as a harmless hash
+        # alias before the candidate conflict is inspected.  Equal non-null
+        # hashes are deliberately left unlinked here: the global hash pass
+        # below will point every duplicate directly at the ultimate root and
+        # cannot create an alias chain.
+        duplicate_candidates = connection.execute(
+            f"""
+            SELECT abba_candidate_id
+            FROM requests
+            WHERE service = 'abba' AND abba_candidate_id IS NOT NULL
+              AND canonical_request_id IS NULL
+              AND status IN ({active})
+            GROUP BY abba_candidate_id
+            HAVING COUNT(*) > 1
+            ORDER BY abba_candidate_id
+            """
+        ).fetchall()
+        for duplicate in duplicate_candidates:
+            rows = connection.execute(
+                f"""
+                SELECT id, external_id, status
+                FROM requests
+                WHERE service = 'abba' AND abba_candidate_id = ?
+                  AND canonical_request_id IS NULL
+                  AND status IN ({active})
+                ORDER BY
+                    CASE
+                        WHEN external_id IS NOT NULL
+                          OR status IN ('queued', 'complete', 'completed')
+                        THEN 0 ELSE 1
+                    END,
+                    id
+                """,
+                (duplicate["abba_candidate_id"],),
+            ).fetchall()
+            owner_id = int(rows[0]["id"])
+            owner_hash = (
+                None
+                if rows[0]["external_id"] is None
+                else str(rows[0]["external_id"]).casefold()
+            )
+            for conflict in rows[1:]:
+                conflict_id = int(conflict["id"])
+                conflict_hash = (
+                    None
+                    if conflict["external_id"] is None
+                    else str(conflict["external_id"]).casefold()
+                )
+                if conflict_hash == owner_hash:
+                    if owner_hash is None:
+                        cls._coalesce_abba_row(
+                            connection,
+                            conflict_id,
+                            owner_id,
+                            reason="existing candidate collision migration",
+                        )
+                    continue
+
+                # One opaque candidate resolving to a different hash is not a
+                # safe alias.  Preserve the deterministic owner and quarantine
+                # only the rows whose hash differs from it; equal-hash rows
+                # remain eligible for the direct global hash election below.
+                connection.execute(
+                    """
+                    UPDATE requests
+                    SET status = 'failed',
+                        external_status = 'candidate_identity_conflict',
+                        error = 'ABBA candidate resolved to conflicting torrent hashes',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND canonical_request_id IS NULL
+                    """,
+                    (conflict_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE candidate_confirmations
+                    SET status = 'failed', updated_at = CURRENT_TIMESTAMP,
+                        failure_message =
+                            'ABBA candidate identity conflict requires review'
+                    WHERE request_id = ? AND status IN ('pending', 'claimed')
+                    """,
+                    (conflict_id,),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM notification_deliveries
+                    WHERE request_id = ? AND delivered_at IS NULL
+                    """,
+                    (conflict_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO events (request_id, event_type, message)
+                    VALUES (?, 'abba_candidate_identity_conflict', ?)
+                    """,
+                    (
+                        conflict_id,
+                        f"Candidate conflicts with canonical request #{owner_id}",
+                    ),
+                )
+
+        duplicate_hashes = connection.execute(
+            f"""
+            SELECT lower(external_id) AS info_hash
+            FROM requests
+            WHERE service = 'abba' AND external_id IS NOT NULL
+              AND canonical_request_id IS NULL
+              AND status IN ({active})
+            GROUP BY lower(external_id)
+            HAVING COUNT(*) > 1
+            ORDER BY lower(external_id)
+            """
+        ).fetchall()
+        for duplicate in duplicate_hashes:
+            rows = connection.execute(
+                f"""
+                SELECT id FROM requests
+                WHERE service = 'abba' AND lower(external_id) = ?
+                  AND canonical_request_id IS NULL
+                  AND status IN ({active})
+                ORDER BY id
+                """,
+                (duplicate["info_hash"],),
+            ).fetchall()
+            owner_id = int(rows[0]["id"])
+            for alias in rows[1:]:
+                cls._coalesce_abba_row(
+                    connection,
+                    int(alias["id"]),
+                    owner_id,
+                    reason="existing hash collision migration",
+                )
+
+    @staticmethod
     def _merge_duplicate_messages(connection: sqlite3.Connection) -> None:
         duplicates = connection.execute(
             """
@@ -545,6 +1106,10 @@ class RequestStore:
                     external_id = COALESCE(?, external_id),
                     external_status = COALESCE(?, external_status),
                     external_title = COALESCE(?, external_title),
+                    dispatch_started_at = COALESCE(?, dispatch_started_at),
+                    abba_candidate_id = COALESCE(?, abba_candidate_id),
+                    lazylibrarian_book_id = COALESCE(?, lazylibrarian_book_id),
+                    canonical_request_id = COALESCE(?, canonical_request_id),
                     error = COALESCE(?, error),
                     notified_at = COALESCE(?, notified_at)
                 WHERE id = ?
@@ -558,6 +1123,10 @@ class RequestStore:
                     latest["external_id"],
                     latest["external_status"],
                     latest["external_title"],
+                    latest["dispatch_started_at"],
+                    latest["abba_candidate_id"],
+                    latest["lazylibrarian_book_id"],
+                    latest["canonical_request_id"],
                     latest["error"],
                     latest["notified_at"],
                     duplicate["keep_id"],
@@ -606,20 +1175,1181 @@ class RequestStore:
             row = connection.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
         return dict(row) if row else None
 
+    @staticmethod
+    def _ebook_cascade_row(
+        connection: sqlite3.Connection, request_id: int
+    ) -> dict[str, Any] | None:
+        row = connection.execute(
+            "SELECT * FROM ebook_cascades WHERE request_id = ?", (int(request_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        try:
+            policy = json.loads(str(value["policy_json"]))
+            value["policy"] = _ebook_policy(policy)
+            value["identity"] = (
+                json.loads(str(value["identity_json"]))
+                if value.get("identity_json") is not None
+                else None
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise sqlite3.DatabaseError("Ebook cascade state is invalid") from error
+        attempts = connection.execute(
+            """
+            SELECT * FROM ebook_backend_attempts
+            WHERE request_id = ? ORDER BY ordinal
+            """,
+            (int(request_id),),
+        ).fetchall()
+        reservations = connection.execute(
+            """
+            SELECT backend, backend_identity FROM ebook_backend_reservations
+            WHERE request_id = ? ORDER BY backend, backend_identity
+            """,
+            (int(request_id),),
+        ).fetchall()
+        identities_by_backend: dict[str, list[str]] = {}
+        for reservation in reservations:
+            identities_by_backend.setdefault(str(reservation["backend"]), []).append(
+                str(reservation["backend_identity"])
+            )
+        value["attempts"] = []
+        for attempt_row in attempts:
+            attempt = dict(attempt_row)
+            attempt["backend_identities"] = tuple(
+                identities_by_backend.get(str(attempt["backend"]), ())
+            )
+            value["attempts"].append(attempt)
+        return value
+
+    def get_ebook_cascade(self, request_id: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            return self._ebook_cascade_row(connection, int(request_id))
+
+    def create_ebook_cascade(
+        self, request_id: int, backends: Sequence[str]
+    ) -> dict[str, Any]:
+        """Snapshot one immutable serial policy before its first search."""
+
+        policy = _ebook_policy(backends)
+        encoded = json.dumps(policy, separators=(",", ":"))
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            request = connection.execute(
+                "SELECT media_type, status FROM requests WHERE id = ?",
+                (int(request_id),),
+            ).fetchone()
+            if request is None:
+                raise KeyError(f"Unknown request ID: {request_id}")
+            if request["media_type"] != "ebooks":
+                raise ValueError("Only ebook requests may own an ebook cascade")
+            existing = self._ebook_cascade_row(connection, int(request_id))
+            if existing is not None:
+                if existing["policy"] != policy:
+                    raise EbookCascadeStateError(
+                        "Persisted ebook backend policy cannot be changed"
+                    )
+                return existing
+            if request["status"] != "new":
+                raise EbookCascadeStateError(
+                    "Ebook cascade must be reserved before request dispatch"
+                )
+            connection.execute(
+                """
+                INSERT INTO ebook_cascades (
+                    request_id, policy_json, current_ordinal, state
+                ) VALUES (?, ?, 0, 'searching')
+                """,
+                (int(request_id), encoded),
+            )
+            for ordinal, backend in enumerate(policy):
+                connection.execute(
+                    """
+                    INSERT INTO ebook_backend_attempts (
+                        request_id, ordinal, backend, status
+                    ) VALUES (?, ?, ?, 'pending')
+                    """,
+                    (int(request_id), ordinal, backend),
+                )
+            connection.execute(
+                """
+                UPDATE requests
+                SET status = 'processing', service = ?,
+                    updated_at = CURRENT_TIMESTAMP, error = NULL
+                WHERE id = ? AND status = 'new'
+                """,
+                (policy[0], int(request_id)),
+            )
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (
+                    int(request_id),
+                    "ebook_cascade_started",
+                    "Started the configured serial ebook acquisition policy",
+                ),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO notification_deliveries (
+                    request_id, event_key, route, message
+                ) VALUES (?, 'request_accepted', 'request-status', ?)
+                """,
+                (
+                    int(request_id),
+                    f"✅ Request #{int(request_id)} accepted: Huey is searching "
+                    "for a usable ebook release.",
+                ),
+            )
+            value = self._ebook_cascade_row(connection, int(request_id))
+            if value is None:  # pragma: no cover - transaction invariant
+                raise sqlite3.DatabaseError("Ebook cascade was not persisted")
+            return value
+
+    def begin_ebook_attempt(
+        self, request_id: int, backend: str | None = None
+    ) -> dict[str, Any]:
+        """Begin or safely replay the current search-only attempt."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cascade = self._ebook_cascade_row(connection, int(request_id))
+            if cascade is None:
+                raise EbookCascadeStateError("Request has no ebook cascade")
+            ordinal = int(cascade["current_ordinal"])
+            policy = cascade["policy"]
+            if ordinal >= len(policy):
+                raise EbookCascadeStateError("Ebook cascade is exhausted")
+            expected = policy[ordinal]
+            if backend is not None and backend != expected:
+                raise EbookCascadeStateError("Ebook backend is not the current attempt")
+            if cascade["mutation_backend"] is not None:
+                raise EbookCascadeStateError(
+                    "Ebook mutation is already owned and cannot be redispatched"
+                )
+            if cascade["state"] not in {"searching", "awaiting_selection"}:
+                raise EbookCascadeStateError("Ebook cascade is not resumable")
+            attempt = cascade["attempts"][ordinal]
+            if attempt["status"] not in {
+                "pending",
+                "searching",
+                "awaiting_selection",
+            }:
+                raise EbookCascadeStateError("Ebook attempt is not search-safe")
+            first_start = attempt["status"] == "pending"
+            attempt_cursor = connection.execute(
+                """
+                UPDATE ebook_backend_attempts
+                SET status = 'searching',
+                    started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
+                WHERE request_id = ? AND ordinal = ?
+                """,
+                (int(request_id), ordinal),
+            )
+            cascade_cursor = connection.execute(
+                """
+                UPDATE ebook_cascades
+                SET state = 'searching', updated_at = CURRENT_TIMESTAMP
+                WHERE request_id = ?
+                """,
+                (int(request_id),),
+            )
+            request_cursor = connection.execute(
+                """
+                UPDATE requests
+                SET status = 'processing', service = ?, error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'processing'
+                """,
+                (expected, int(request_id)),
+            )
+            if request_cursor.rowcount != 1:
+                raise EbookCascadeStateError("Ebook request is no longer processing")
+            if first_start:
+                connection.execute(
+                    "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                    (
+                        int(request_id),
+                        "ebook_backend_search",
+                        f"Searching ebook backend attempt {ordinal + 1}",
+                    ),
+                )
+            value = self._ebook_cascade_row(connection, int(request_id))
+            if value is None:  # pragma: no cover
+                raise sqlite3.DatabaseError("Ebook cascade disappeared")
+            return value
+
+    def set_ebook_identity(
+        self,
+        request_id: int,
+        backend: str,
+        identity: Mapping[str, Any],
+        *,
+        backend_identity: object | None = None,
+        backend_aliases: Sequence[object] = (),
+    ) -> bool:
+        """Atomically reserve one resolved work and optional provider ID."""
+
+        if backend not in _EBOOK_BACKENDS:
+            raise ValueError("Unsupported ebook backend")
+        normalized = _normalize_candidate_snapshot(
+            identity, request_media_type="ebooks"
+        )
+        identity_key = _ebook_identity_key(normalized)
+        encoded = json.dumps(
+            normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if isinstance(backend_aliases, (str, bytes)) or len(backend_aliases) > 8:
+            raise ValueError("Ebook backend aliases must be a bounded sequence")
+        provider_identity = (
+            _ebook_backend_identity(backend, backend_identity)
+            if backend_identity is not None
+            else None
+        )
+        provider_identities = []
+        for raw_identity in (
+            *((provider_identity,) if provider_identity is not None else ()),
+            *backend_aliases,
+        ):
+            normalized_provider = _ebook_backend_identity(backend, raw_identity)
+            if normalized_provider not in provider_identities:
+                provider_identities.append(normalized_provider)
+        if provider_identity is not None and provider_identity not in provider_identities:
+            raise ValueError("Primary ebook backend identity is not reserved")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cascade = self._ebook_cascade_row(connection, int(request_id))
+            if cascade is None:
+                raise EbookCascadeStateError("Request has no ebook cascade")
+            ordinal = int(cascade["current_ordinal"])
+            if cascade["policy"][ordinal] != backend:
+                raise EbookCascadeStateError("Identity came from a non-current backend")
+            attempt = cascade["attempts"][ordinal]
+            if (
+                cascade["state"] not in {"searching", "awaiting_selection"}
+                or attempt["status"] not in {"searching", "awaiting_selection"}
+            ):
+                raise EbookCascadeStateError(
+                    "Ebook identity cannot be changed outside a search-safe attempt"
+                )
+            existing_key = cascade.get("identity_key")
+            if existing_key is not None and existing_key != identity_key:
+                raise EbookCascadeStateError(
+                    "Ebook backend resolved a different work identity"
+                )
+            if existing_key is None:
+                try:
+                    connection.execute(
+                        """
+                        UPDATE ebook_cascades
+                        SET identity_key = ?, identity_fingerprint = ?,
+                            identity_json = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE request_id = ? AND identity_key IS NULL
+                        """,
+                        (
+                            identity_key,
+                            normalized["fingerprint"],
+                            encoded,
+                            int(request_id),
+                        ),
+                    )
+                except sqlite3.IntegrityError as error:
+                    owner = connection.execute(
+                        """
+                        SELECT request_id FROM ebook_cascades
+                        WHERE identity_key = ? AND request_id != ?
+                          AND state IN (
+                              'searching', 'awaiting_selection', 'mutating',
+                              'uncertain', 'queued', 'completed'
+                          )
+                        ORDER BY request_id LIMIT 1
+                        """,
+                        (identity_key, int(request_id)),
+                    ).fetchone()
+                    if owner is not None:
+                        raise EbookIdentityCollision(owner["request_id"]) from error
+                    raise
+            if provider_identity is not None:
+                if attempt.get("backend_identity") not in {None, provider_identity}:
+                    raise EbookCascadeStateError(
+                        "Ebook attempt already reserved a different backend identity"
+                    )
+                for reserved_identity in provider_identities:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO ebook_backend_reservations (
+                            backend, backend_identity, request_id
+                        ) VALUES (?, ?, ?)
+                        """,
+                        (backend, reserved_identity, int(request_id)),
+                    )
+                    owner = connection.execute(
+                        """
+                        SELECT request_id FROM ebook_backend_reservations
+                        WHERE backend = ? AND backend_identity = ?
+                        """,
+                        (backend, reserved_identity),
+                    ).fetchone()
+                    if owner is None:  # pragma: no cover
+                        raise sqlite3.DatabaseError("Ebook reservation disappeared")
+                    if int(owner["request_id"]) != int(request_id):
+                        raise EbookIdentityCollision(owner["request_id"])
+                connection.execute(
+                    """
+                    UPDATE ebook_backend_attempts
+                    SET backend_identity = COALESCE(backend_identity, ?)
+                    WHERE request_id = ? AND ordinal = ?
+                      AND backend = ?
+                    """,
+                    (provider_identity, int(request_id), ordinal, backend),
+                )
+            return existing_key is None
+
+    def lock_ebook_mutation(
+        self,
+        request_id: int,
+        backend: str,
+        *,
+        backend_identity: object | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Cross the request-wide mutation boundary for exactly one backend."""
+
+        if backend not in _EBOOK_BACKENDS:
+            raise ValueError("Unsupported ebook backend")
+        provider_identity = (
+            _ebook_backend_identity(backend, backend_identity)
+            if backend_identity is not None
+            else None
+        )
+        observed_at = _selection_timestamp(now)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cascade = self._ebook_cascade_row(connection, int(request_id))
+            if cascade is None:
+                raise EbookCascadeStateError("Request has no ebook cascade")
+            ordinal = int(cascade["current_ordinal"])
+            if cascade["policy"][ordinal] != backend:
+                return False
+            attempt = cascade["attempts"][ordinal]
+            if cascade["mutation_backend"] is not None:
+                # A pre-existing lock is reconciliation-only. Returning true
+                # here would authorize a replayed callback to POST twice.
+                return False
+            if cascade["state"] != "searching" or attempt["status"] != "searching":
+                return False
+            if cascade.get("identity_key") is None:
+                raise EbookCascadeStateError(
+                    "Ebook work identity must be reserved before mutation"
+                )
+            if provider_identity is not None and attempt.get("backend_identity") not in {
+                None,
+                provider_identity,
+            }:
+                return False
+            reserved_identity = provider_identity or attempt.get("backend_identity")
+            if reserved_identity is None:
+                raise EbookCascadeStateError(
+                    "Backend identity must be reserved before mutation"
+                )
+            reservation = connection.execute(
+                """
+                SELECT request_id FROM ebook_backend_reservations
+                WHERE backend = ? AND backend_identity = ?
+                """,
+                (backend, reserved_identity),
+            ).fetchone()
+            if reservation is None or int(reservation["request_id"]) != int(request_id):
+                raise EbookCascadeStateError(
+                    "Backend mutation identity is not owned by this request"
+                )
+            cascade_cursor = connection.execute(
+                """
+                UPDATE ebook_cascades
+                SET state = 'mutating', mutation_backend = ?,
+                    mutation_started_at = ?, updated_at = ?
+                WHERE request_id = ? AND mutation_backend IS NULL
+                """,
+                (backend, observed_at, observed_at, int(request_id)),
+            )
+            if cascade_cursor.rowcount != 1:
+                raise EbookCascadeStateError(
+                    "Ebook cascade mutation marker could not be persisted"
+                )
+            attempt_cursor = connection.execute(
+                """
+                UPDATE ebook_backend_attempts
+                SET status = 'mutating', mutation_started_at = ?,
+                    backend_identity = COALESCE(backend_identity, ?)
+                WHERE request_id = ? AND ordinal = ? AND status = 'searching'
+                """,
+                (
+                    observed_at,
+                    provider_identity,
+                    int(request_id),
+                    ordinal,
+                ),
+            )
+            if attempt_cursor.rowcount != 1:
+                raise EbookCascadeStateError(
+                    "Ebook attempt mutation marker could not be persisted"
+                )
+            request_cursor = connection.execute(
+                """
+                UPDATE requests
+                SET dispatch_started_at = ?, updated_at = ?,
+                    lazylibrarian_book_id = CASE
+                        WHEN ? = 'lazylibrarian' THEN ?
+                        ELSE lazylibrarian_book_id
+                    END
+                WHERE id = ? AND status = 'processing' AND service = ?
+                """,
+                (
+                    observed_at,
+                    observed_at,
+                    backend,
+                    provider_identity,
+                    int(request_id),
+                    backend,
+                ),
+            )
+            if request_cursor.rowcount != 1:
+                raise EbookCascadeStateError(
+                    "Ebook request mutation marker could not be persisted"
+                )
+            connection.execute(
+                """
+                UPDATE candidate_confirmations
+                SET dispatch_started_at = COALESCE(dispatch_started_at, ?),
+                    updated_at = ?
+                WHERE request_id = ? AND status = 'claimed'
+                """,
+                (observed_at, observed_at, int(request_id)),
+            )
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (
+                    int(request_id),
+                    "ebook_mutation_started",
+                    f"Ebook backend attempt {ordinal + 1} crossed its mutation boundary",
+                ),
+            )
+            return True
+
+    def resumable_ebook_requests(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return only cascade attempts proven not to have crossed mutation."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT requests.* FROM requests
+                JOIN ebook_cascades ON ebook_cascades.request_id = requests.id
+                WHERE requests.media_type = 'ebooks'
+                  AND requests.status = 'processing'
+                  AND ebook_cascades.mutation_backend IS NULL
+                  AND (
+                      ebook_cascades.state = 'searching'
+                      OR (
+                          ebook_cascades.state = 'awaiting_selection'
+                          AND EXISTS (
+                              SELECT 1 FROM candidate_confirmations
+                              WHERE candidate_confirmations.request_id = requests.id
+                                AND candidate_confirmations.status = 'claimed'
+                                AND candidate_confirmations.dispatch_started_at IS NULL
+                          )
+                      )
+                  )
+                ORDER BY requests.updated_at, requests.id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _normalized_deliveries(
+        notifications: Sequence[tuple[str, str, str]],
+    ) -> list[tuple[str, str, str]]:
+        normalized: list[tuple[str, str, str]] = []
+        for delivery in notifications:
+            if (
+                not isinstance(delivery, (list, tuple))
+                or len(delivery) != 3
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in delivery
+                )
+            ):
+                raise ValueError("Notification delivery fields cannot be empty")
+            normalized.append(
+                (delivery[0].strip(), delivery[1].strip(), delivery[2].strip()[:2000])
+            )
+        return normalized
+
+    def advance_ebook_backend(
+        self,
+        request_id: int,
+        backend: str,
+        outcome: str,
+        handler_result: Mapping[str, Any],
+        *,
+        final_message: str,
+        notifications: Sequence[tuple[str, str, str]] = (),
+    ) -> str | None:
+        """CAS-advance after a safe miss/unavailable outcome, or exhaust once."""
+
+        if backend not in _EBOOK_BACKENDS or outcome not in {"miss", "unavailable"}:
+            raise ValueError("Invalid ebook backend advancement")
+        if outcome == "miss" and handler_result.get("backend_outcome") != "miss":
+            raise ValueError("Ebook miss advancement requires a typed miss result")
+        if not final_message or not final_message.strip():
+            raise ValueError("Ebook exhaustion requires a user-safe message")
+        deliveries = self._normalized_deliveries(notifications)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cascade = self._ebook_cascade_row(connection, int(request_id))
+            if cascade is None:
+                raise EbookCascadeStateError("Request has no ebook cascade")
+            ordinal = int(cascade["current_ordinal"])
+            if cascade["policy"][ordinal] != backend:
+                raise EbookCascadeStateError("Ebook backend is not current")
+            attempt = cascade["attempts"][ordinal]
+            mutation_backend = cascade.get("mutation_backend")
+            if mutation_backend is not None:
+                raise EbookCascadeStateError(
+                    "Post-mutation ebook outcome cannot advance safely"
+                )
+            if cascade["state"] != "searching" or attempt["status"] != "searching":
+                raise EbookCascadeStateError(
+                    "Only a search-only ebook attempt may advance"
+                )
+
+            finished_status = "miss" if outcome == "miss" else "unavailable"
+            attempt_cursor = connection.execute(
+                """
+                UPDATE ebook_backend_attempts
+                SET status = ?, finished_at = CURRENT_TIMESTAMP,
+                    mutation_resolved_at = CASE
+                        WHEN mutation_started_at IS NOT NULL THEN CURRENT_TIMESTAMP
+                        ELSE mutation_resolved_at
+                    END,
+                    outcome_message = ?
+                WHERE request_id = ? AND ordinal = ?
+                """,
+                (
+                    finished_status,
+                    str(handler_result.get("message") or "")[:1000],
+                    int(request_id),
+                    ordinal,
+                ),
+            )
+            if attempt_cursor.rowcount != 1:
+                raise EbookCascadeStateError("Ebook attempt could not be advanced")
+            next_ordinal = ordinal + 1
+            if next_ordinal < len(cascade["policy"]):
+                next_backend = cascade["policy"][next_ordinal]
+                cascade_cursor = connection.execute(
+                    """
+                    UPDATE ebook_cascades
+                    SET current_ordinal = ?, state = 'searching',
+                        mutation_backend = NULL, mutation_started_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND current_ordinal = ?
+                    """,
+                    (next_ordinal, int(request_id), ordinal),
+                )
+                request_cursor = connection.execute(
+                    """
+                    UPDATE requests
+                    SET status = 'processing', service = ?, external_id = NULL,
+                        external_status = NULL, external_title = NULL,
+                        dispatch_started_at = NULL, error = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = 'processing'
+                    """,
+                    (next_backend, int(request_id)),
+                )
+                if cascade_cursor.rowcount != 1 or request_cursor.rowcount != 1:
+                    raise EbookCascadeStateError(
+                        "Ebook backend advancement could not be persisted atomically"
+                    )
+                connection.execute(
+                    "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                    (
+                        int(request_id),
+                        f"ebook_backend_{finished_status}",
+                        f"Ebook backend attempt {ordinal + 1} ended before a handoff; advancing serially",
+                    ),
+                )
+                return next_backend
+
+            cascade_cursor = connection.execute(
+                """
+                UPDATE ebook_cascades
+                SET state = 'failed', mutation_backend = NULL,
+                    mutation_started_at = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE request_id = ? AND current_ordinal = ?
+                """,
+                (int(request_id), ordinal),
+            )
+            connection.execute(
+                "DELETE FROM ebook_backend_reservations WHERE request_id = ?",
+                (int(request_id),),
+            )
+            request_cursor = connection.execute(
+                """
+                UPDATE requests
+                SET status = 'failed', updated_at = CURRENT_TIMESTAMP,
+                    service = ?, external_id = NULL, external_status = NULL,
+                    external_title = NULL, dispatch_started_at = NULL,
+                    error = ?
+                WHERE id = ? AND status = 'processing'
+                """,
+                (backend, final_message.strip()[:1000], int(request_id)),
+            )
+            if cascade_cursor.rowcount != 1 or request_cursor.rowcount != 1:
+                raise EbookCascadeStateError(
+                    "Ebook cascade exhaustion could not be persisted atomically"
+                )
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (
+                    int(request_id),
+                    "ebook_cascade_exhausted",
+                    "Every configured ebook backend ended without a safe acquisition",
+                ),
+            )
+            for event_key, route, message in deliveries:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_deliveries (
+                        request_id, event_key, route, message
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (int(request_id), event_key, route, message),
+                )
+            return None
+
+    def persist_ebook_result(
+        self,
+        request_id: int,
+        backend: str,
+        handler_result: Mapping[str, Any],
+        *,
+        notifications: Sequence[tuple[str, str, str]] = (),
+    ) -> dict[str, Any]:
+        """Atomically finish one cascade attempt and its Huey request state."""
+
+        if backend not in _EBOOK_BACKENDS:
+            raise ValueError("Unsupported ebook backend")
+        status = str(handler_result.get("status") or "")
+        if status not in {"queued", "completed", "failed"}:
+            raise ValueError("Unsupported durable ebook result")
+        deliveries = self._normalized_deliveries(notifications)
+        external_id = (
+            str(handler_result["external_id"])
+            if handler_result.get("external_id") is not None
+            else None
+        )
+        if backend == "lazylibrarian" and external_id is not None:
+            external_id = external_id.casefold()
+            if not _DOWNLOAD_ID.fullmatch(external_id):
+                raise ValueError("Invalid LazyLibrarian download ID")
+        if (
+            backend == "shelfarr"
+            and external_id is not None
+            and (not external_id.isdigit() or int(external_id) <= 0)
+        ):
+            raise ValueError("Invalid Shelfarr request ID")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cascade = self._ebook_cascade_row(connection, int(request_id))
+            if cascade is None:
+                raise EbookCascadeStateError("Request has no ebook cascade")
+            ordinal = int(cascade["current_ordinal"])
+            if cascade["policy"][ordinal] != backend:
+                raise EbookCascadeStateError("Ebook backend is not current")
+            attempt = cascade["attempts"][ordinal]
+            uncertain = bool(
+                status == "queued"
+                and handler_result.get("external_status") == "submission_uncertain"
+            )
+            if uncertain:
+                if not (
+                    (
+                        cascade.get("mutation_backend") == backend
+                        and attempt["status"] == "mutating"
+                    )
+                    or (
+                        cascade.get("mutation_backend") is None
+                        and attempt["status"] == "searching"
+                    )
+                ):
+                    raise EbookCascadeStateError(
+                        "Ebook uncertainty is not attached to the current attempt"
+                    )
+                cascade_state = "uncertain"
+                attempt_status = "uncertain"
+            elif status in {"queued", "completed"}:
+                if external_id is None:
+                    raise EbookCascadeStateError(
+                        "A successful ebook handoff requires an external ID"
+                    )
+                if cascade.get("identity_key") is None:
+                    raise EbookCascadeStateError(
+                        "A successful ebook attempt has no resolved identity"
+                    )
+                existing_attach = bool(
+                    cascade.get("mutation_backend") is None
+                    and cascade["state"] == "searching"
+                    and attempt["status"] == "searching"
+                )
+                local_submission = bool(
+                    cascade.get("mutation_backend") == backend
+                    and cascade["state"] == "mutating"
+                    and attempt["status"] == "mutating"
+                )
+                if not (existing_attach or local_submission):
+                    raise EbookCascadeStateError(
+                        "Successful ebook result has no valid handoff boundary"
+                    )
+                cascade_state = "queued" if status == "queued" else "completed"
+                attempt_status = cascade_state
+            else:
+                if not (
+                    cascade.get("mutation_backend") == backend
+                    and cascade["state"] in {"mutating", "uncertain"}
+                    and attempt["status"] == cascade["state"]
+                ):
+                    raise EbookCascadeStateError(
+                        "A failed ebook result has no valid mutation boundary"
+                    )
+                cascade_state = "failed"
+                attempt_status = "failed"
+
+            final_backend = (
+                backend
+                if status in {"queued", "completed"} and not uncertain
+                else None
+            )
+            finalizer = (
+                None
+                if final_backend is None
+                else "bookbot"
+                if backend == "lazylibrarian"
+                else "shelfarr"
+            )
+            cascade_cursor = connection.execute(
+                """
+                UPDATE ebook_cascades
+                SET state = ?, final_backend = COALESCE(final_backend, ?),
+                    finalizer = COALESCE(finalizer, ?),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE request_id = ? AND current_ordinal = ?
+                """,
+                (
+                    cascade_state,
+                    final_backend,
+                    finalizer,
+                    int(request_id),
+                    ordinal,
+                ),
+            )
+            if status == "failed":
+                connection.execute(
+                    "DELETE FROM ebook_backend_reservations WHERE request_id = ?",
+                    (int(request_id),),
+                )
+            attempt_cursor = connection.execute(
+                """
+                UPDATE ebook_backend_attempts
+                SET status = ?, finished_at = CASE
+                        WHEN ? IN ('completed', 'failed') THEN CURRENT_TIMESTAMP
+                        ELSE finished_at
+                    END,
+                    mutation_resolved_at = CASE
+                        WHEN mutation_started_at IS NOT NULL
+                             AND ? IN ('queued', 'completed', 'failed')
+                        THEN CURRENT_TIMESTAMP
+                        ELSE mutation_resolved_at
+                    END,
+                    external_id = ?, external_status = ?, outcome_message = ?
+                WHERE request_id = ? AND ordinal = ?
+                """,
+                (
+                    attempt_status,
+                    attempt_status,
+                    attempt_status,
+                    external_id,
+                    handler_result.get("external_status"),
+                    str(handler_result.get("message") or "")[:1000],
+                    int(request_id),
+                    ordinal,
+                ),
+            )
+            if cascade_cursor.rowcount != 1 or attempt_cursor.rowcount != 1:
+                raise EbookCascadeStateError(
+                    "Ebook result ledger could not be persisted atomically"
+                )
+            error = str(handler_result.get("message") or "") if status == "failed" else None
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE requests
+                    SET status = ?, service = ?, external_id = ?,
+                        external_status = ?, external_title = ?, error = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status IN ('processing', 'queued')
+                      AND external_id IS NULL
+                    """,
+                    (
+                        status,
+                        backend,
+                        external_id,
+                        handler_result.get("external_status"),
+                        handler_result.get("external_title"),
+                        error,
+                        int(request_id),
+                    ),
+                )
+            except sqlite3.IntegrityError as collision:
+                if backend == "lazylibrarian" and external_id is not None:
+                    raise LazyLibrarianHashCollision(
+                        "Active LazyLibrarian download identity collision"
+                    ) from collision
+                raise
+            if cursor.rowcount != 1:
+                raise EbookCascadeStateError("Ebook request is no longer processing")
+            event_type = (
+                f"{backend}_submission_uncertain"
+                if uncertain
+                else "handler_completed"
+                if status == "completed"
+                else f"ebook_cascade_{status}"
+            )
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (
+                    int(request_id),
+                    event_type,
+                    str(handler_result.get("message") or "")[:2000],
+                ),
+            )
+            for event_key, route, message in deliveries:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_deliveries (
+                        request_id, event_key, route, message
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (int(request_id), event_key, route, message),
+                )
+            row = connection.execute(
+                "SELECT * FROM requests WHERE id = ?", (int(request_id),)
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise sqlite3.DatabaseError("Ebook request disappeared")
+            return dict(row)
+
+    def terminalize_ebook_cascade(
+        self,
+        request_id: int,
+        backend: str,
+        status: str,
+        message: str,
+        *,
+        notifications: Sequence[tuple[str, str, str]] = (),
+        event_type: str = "ebook_cascade_failed",
+        duplicate_owner_request_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Close a non-mutating ambiguity/collision without backend fallback."""
+
+        if backend not in _EBOOK_BACKENDS or status not in {
+            "needs_selection",
+            "failed",
+        }:
+            raise ValueError("Invalid ebook cascade terminalization")
+        if not message or not message.strip():
+            raise ValueError("Ebook terminalization requires a message")
+        deliveries = self._normalized_deliveries(notifications)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cascade = self._ebook_cascade_row(connection, int(request_id))
+            if cascade is None:
+                raise EbookCascadeStateError("Request has no ebook cascade")
+            ordinal = int(cascade["current_ordinal"])
+            if cascade["policy"][ordinal] != backend:
+                raise EbookCascadeStateError("Ebook backend is not current")
+            if cascade.get("mutation_backend") is not None:
+                raise EbookCascadeStateError(
+                    "A mutated ebook attempt cannot use pre-mutation terminalization"
+                )
+            attempt_cursor = connection.execute(
+                """
+                UPDATE ebook_backend_attempts
+                SET status = 'failed', finished_at = CURRENT_TIMESTAMP,
+                    outcome_message = ?
+                WHERE request_id = ? AND ordinal = ?
+                  AND status IN ('searching', 'awaiting_selection')
+                """,
+                (message.strip()[:1000], int(request_id), ordinal),
+            )
+            cascade_cursor = connection.execute(
+                """
+                UPDATE ebook_cascades
+                SET state = 'failed', updated_at = CURRENT_TIMESTAMP
+                WHERE request_id = ? AND current_ordinal = ?
+                  AND state IN ('searching', 'awaiting_selection')
+                """,
+                (int(request_id), ordinal),
+            )
+            connection.execute(
+                "DELETE FROM ebook_backend_reservations WHERE request_id = ?",
+                (int(request_id),),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE requests
+                SET status = ?, service = ?, error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status IN ('processing', 'awaiting_selection')
+                """,
+                (
+                    status,
+                    backend,
+                    message.strip()[:1000],
+                    int(request_id),
+                ),
+            )
+            if (
+                attempt_cursor.rowcount != 1
+                or cascade_cursor.rowcount != 1
+                or cursor.rowcount != 1
+            ):
+                raise EbookCascadeStateError(
+                    "Ebook terminalization could not be persisted atomically"
+                )
+            if duplicate_owner_request_id is not None:
+                owner = connection.execute(
+                    "SELECT id FROM requests WHERE id = ?",
+                    (int(duplicate_owner_request_id),),
+                ).fetchone()
+                delivery = connection.execute(
+                    "SELECT message_id FROM requests WHERE id = ?",
+                    (int(request_id),),
+                ).fetchone()
+                if owner is None or delivery is None:
+                    raise EbookCascadeStateError(
+                        "Ebook identity collision owner could not be linked"
+                    )
+                # The redundant row remains as an internal audit, while future
+                # Discord redelivery resolves to the canonical logical request.
+                connection.execute(
+                    "DELETE FROM notification_deliveries WHERE request_id = ?",
+                    (int(request_id),),
+                )
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO delivery_aliases (message_id, request_id)
+                    VALUES (?, ?)
+                    """,
+                    (str(delivery["message_id"]), int(duplicate_owner_request_id)),
+                )
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (int(request_id), event_type, message.strip()[:2000]),
+            )
+            for event_key, route, notification_message in deliveries:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_deliveries (
+                        request_id, event_key, route, message
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (int(request_id), event_key, route, notification_message),
+                )
+            row = connection.execute(
+                "SELECT * FROM requests WHERE id = ?", (int(request_id),)
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise sqlite3.DatabaseError("Ebook request disappeared")
+            return dict(row)
+
+    def record_ebook_recovered_handoff(
+        self,
+        request_id: int,
+        backend: str,
+        external_id: object,
+        external_title: str,
+        external_status: str,
+        message: str,
+        *,
+        backend_identity: object | None = None,
+        event_type: str = "ebook_handoff_recovered",
+        notifications: Sequence[tuple[str, str, str]] = (),
+    ) -> bool:
+        """Atomically bind a quarantined attempt to its exact recovered handoff."""
+
+        if backend not in _EBOOK_BACKENDS:
+            raise ValueError("Unsupported ebook backend")
+        if not message or not message.strip():
+            raise ValueError("Recovered ebook handoff requires a message")
+        normalized_external_id = str(external_id or "")
+        if not normalized_external_id:
+            raise ValueError("Recovered ebook handoff requires an external ID")
+        if backend == "lazylibrarian":
+            normalized_external_id = normalized_external_id.casefold()
+            if not _DOWNLOAD_ID.fullmatch(normalized_external_id):
+                raise ValueError("Invalid LazyLibrarian download ID")
+        elif not normalized_external_id.isdigit() or int(normalized_external_id) <= 0:
+            raise ValueError("Invalid Shelfarr request ID")
+        provider_identity = (
+            _ebook_backend_identity(backend, backend_identity)
+            if backend_identity is not None
+            else None
+        )
+        deliveries = self._normalized_deliveries(notifications)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cascade = self._ebook_cascade_row(connection, int(request_id))
+            if cascade is None:
+                raise EbookCascadeStateError("Request has no ebook cascade")
+            ordinal = int(cascade["current_ordinal"])
+            attempt = cascade["attempts"][ordinal]
+            owned_identities = set(attempt.get("backend_identities", ()))
+            owned_identity = provider_identity or attempt.get("backend_identity")
+            if (
+                cascade["policy"][ordinal] != backend
+                or attempt["backend"] != backend
+                or attempt["status"] not in {"mutating", "uncertain"}
+                or cascade["state"] not in {"mutating", "uncertain"}
+                or owned_identity is None
+                or (
+                    provider_identity is not None
+                    and provider_identity not in owned_identities
+                )
+                or attempt.get("backend_identity") not in owned_identities
+            ):
+                raise EbookCascadeStateError(
+                    "Recovered handoff does not match the current ebook attempt"
+                )
+            reservation = connection.execute(
+                """
+                SELECT request_id FROM ebook_backend_reservations
+                WHERE backend = ? AND backend_identity = ?
+                """,
+                (backend, owned_identity),
+            ).fetchone()
+            if reservation is None or int(reservation["request_id"]) != int(request_id):
+                raise EbookCascadeStateError(
+                    "Recovered ebook backend identity is not reserved"
+                )
+            if backend == "lazylibrarian":
+                duplicate = connection.execute(
+                    """
+                    SELECT id FROM requests
+                    WHERE id != ? AND service = 'lazylibrarian'
+                      AND lower(external_id) = ?
+                      AND status IN ('processing', 'queued')
+                    LIMIT 1
+                    """,
+                    (int(request_id), normalized_external_id),
+                ).fetchone()
+                if duplicate is not None:
+                    raise LazyLibrarianHashCollision(
+                        "Active LazyLibrarian download identity collision"
+                    )
+            request_cursor = connection.execute(
+                """
+                UPDATE requests
+                SET status = 'queued', service = ?, external_id = ?,
+                    external_status = ?, external_title = ?, error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND service = ? AND external_id IS NULL
+                  AND status IN ('processing', 'queued')
+                """,
+                (
+                    backend,
+                    normalized_external_id,
+                    external_status,
+                    external_title,
+                    int(request_id),
+                    backend,
+                ),
+            )
+            if request_cursor.rowcount != 1:
+                return False
+            attempt_cursor = connection.execute(
+                """
+                UPDATE ebook_backend_attempts
+                SET status = 'queued', external_id = ?, external_status = ?,
+                    outcome_message = ?,
+                    mutation_resolved_at = CASE
+                        WHEN mutation_started_at IS NOT NULL THEN CURRENT_TIMESTAMP
+                        ELSE mutation_resolved_at
+                    END
+                WHERE request_id = ? AND ordinal = ?
+                  AND status IN ('mutating', 'uncertain')
+                """,
+                (
+                    normalized_external_id,
+                    external_status,
+                    message.strip()[:1000],
+                    int(request_id),
+                    ordinal,
+                ),
+            )
+            cascade_cursor = connection.execute(
+                """
+                UPDATE ebook_cascades
+                SET state = 'queued', final_backend = ?, finalizer = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE request_id = ? AND state IN ('mutating', 'uncertain')
+                """,
+                (
+                    backend,
+                    "bookbot" if backend == "lazylibrarian" else "shelfarr",
+                    int(request_id),
+                ),
+            )
+            if attempt_cursor.rowcount != 1 or cascade_cursor.rowcount != 1:
+                raise EbookCascadeStateError(
+                    "Recovered ebook handoff ledger could not be persisted"
+                )
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (int(request_id), event_type, message.strip()[:2000]),
+            )
+            for event_key, route, notification_message in deliveries:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_deliveries (
+                        request_id, event_key, route, message
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        int(request_id),
+                        event_key,
+                        route,
+                        notification_message,
+                    ),
+                )
+            return True
+
     def get_by_message_id(self, message_id: str | int) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM requests WHERE message_id = ?", (str(message_id),)
+                """
+                SELECT requests.*
+                FROM delivery_aliases
+                JOIN requests ON requests.id = delivery_aliases.request_id
+                WHERE delivery_aliases.message_id = ?
+                """,
+                (str(message_id),),
             ).fetchone()
             if row is None:
                 row = connection.execute(
-                    """
-                    SELECT requests.*
-                    FROM delivery_aliases
-                    JOIN requests ON requests.id = delivery_aliases.request_id
-                    WHERE delivery_aliases.message_id = ?
-                    """,
-                    (str(message_id),),
+                    "SELECT * FROM requests WHERE message_id = ?", (str(message_id),)
                 ).fetchone()
             if row is None:
                 # Discord normally preserves a reply reference on gateway
@@ -654,6 +2384,7 @@ class RequestStore:
         title: str | None,
         author: str | None,
         target_key: str | None = None,
+        ebook_backends: Sequence[str] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Reserve one exact target and return its canonical request record.
 
@@ -662,6 +2393,9 @@ class RequestStore:
         failed and ``needs_selection`` requests deliberately remain retryable.
         """
 
+        policy = _ebook_policy(ebook_backends) if ebook_backends is not None else None
+        if policy is not None and media_type != "ebooks":
+            raise ValueError("Only ebook requests may snapshot ebook backends")
         values = (
             str(discord_user_id),
             str(discord_username),
@@ -679,12 +2413,12 @@ class RequestStore:
             # reaching an acquisition handler.
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
-                "SELECT id FROM requests WHERE message_id = ?", (str(message_id),)
+                "SELECT request_id AS id FROM delivery_aliases WHERE message_id = ?",
+                (str(message_id),),
             ).fetchone()
             if existing is None:
                 existing = connection.execute(
-                    "SELECT request_id AS id FROM delivery_aliases WHERE message_id = ?",
-                    (str(message_id),),
+                    "SELECT id FROM requests WHERE message_id = ?", (str(message_id),)
                 ).fetchone()
             if existing is None:
                 existing = connection.execute(
@@ -757,6 +2491,54 @@ class RequestStore:
                 "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
                 (request_id, "received", "Request received from Discord"),
             )
+            if policy is not None:
+                encoded = json.dumps(policy, separators=(",", ":"))
+                connection.execute(
+                    """
+                    INSERT INTO ebook_cascades (
+                        request_id, policy_json, current_ordinal, state
+                    ) VALUES (?, ?, 0, 'searching')
+                    """,
+                    (int(request_id), encoded),
+                )
+                for ordinal, backend in enumerate(policy):
+                    connection.execute(
+                        """
+                        INSERT INTO ebook_backend_attempts (
+                            request_id, ordinal, backend, status
+                        ) VALUES (?, ?, ?, 'pending')
+                        """,
+                        (int(request_id), ordinal, backend),
+                    )
+                connection.execute(
+                    """
+                    UPDATE requests
+                    SET status = 'processing', service = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = 'new'
+                    """,
+                    (policy[0], int(request_id)),
+                )
+                connection.execute(
+                    "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                    (
+                        int(request_id),
+                        "ebook_cascade_started",
+                        "Started the configured serial ebook acquisition policy",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_deliveries (
+                        request_id, event_key, route, message
+                    ) VALUES (?, 'request_accepted', 'request-status', ?)
+                    """,
+                    (
+                        int(request_id),
+                        f"✅ Request #{int(request_id)} accepted: Huey is searching "
+                        "for a usable ebook release.",
+                    ),
+                )
             row = connection.execute(
                 "SELECT * FROM requests WHERE id = ?", (request_id,)
             ).fetchone()
@@ -823,7 +2605,7 @@ class RequestStore:
         now: datetime | None = None,
         ttl_seconds: int = CANDIDATE_CONFIRMATION_TTL_SECONDS,
     ) -> dict[str, Any]:
-        """Persist a bounded Shelfarr choice and reserve its target atomically."""
+        """Persist a bounded acquisition choice and reserve its target atomically."""
 
         if isinstance(candidates, (str, bytes)) or not 2 <= len(candidates) <= 3:
             raise ValueError("Candidate confirmations require two or three options")
@@ -846,9 +2628,13 @@ class RequestStore:
                 if existing["status"] == "pending" and request["status"] == "awaiting_selection":
                     return existing
                 raise ValueError("Request already has a candidate confirmation")
-            if request["status"] != "processing" or request["service"] != "shelfarr":
+            if request["status"] != "processing" or request["service"] not in {
+                "shelfarr",
+                "abba",
+                "lazylibrarian",
+            }:
                 raise ValueError(
-                    "Candidate confirmations require a processing Shelfarr request"
+                    "Candidate confirmations require a supported processing request"
                 )
 
             normalized = [
@@ -903,20 +2689,57 @@ class RequestStore:
                         ),
                     ),
                 )
-            connection.execute(
+            request_cursor = connection.execute(
                 """
                 UPDATE requests
                 SET status = 'awaiting_selection', updated_at = ?, error = NULL
-                WHERE id = ? AND status = 'processing' AND service = 'shelfarr'
+                WHERE id = ? AND status = 'processing'
+                  AND service IN ('shelfarr', 'abba', 'lazylibrarian')
                 """,
                 (created_at, int(request_id)),
             )
+            if request_cursor.rowcount != 1:
+                raise EbookCascadeStateError(
+                    "Candidate request state could not be persisted"
+                )
+            cascade_cursor = connection.execute(
+                """
+                UPDATE ebook_cascades
+                SET state = 'awaiting_selection', updated_at = ?
+                WHERE request_id = ? AND state = 'searching'
+                  AND mutation_backend IS NULL
+                """,
+                (created_at, int(request_id)),
+            )
+            attempt_cursor = connection.execute(
+                """
+                UPDATE ebook_backend_attempts
+                SET status = 'awaiting_selection'
+                WHERE request_id = ?
+                  AND ordinal = (
+                      SELECT current_ordinal FROM ebook_cascades
+                      WHERE request_id = ?
+                  )
+                  AND status = 'searching'
+                """,
+                (int(request_id), int(request_id)),
+            )
+            has_cascade = connection.execute(
+                "SELECT 1 FROM ebook_cascades WHERE request_id = ?",
+                (int(request_id),),
+            ).fetchone() is not None
+            if has_cascade and (
+                cascade_cursor.rowcount != 1 or attempt_cursor.rowcount != 1
+            ):
+                raise EbookCascadeStateError(
+                    "Ebook candidate prompt diverged from cascade state"
+                )
             connection.execute(
                 "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
                 (
                     int(request_id),
                     "selection_requested",
-                    "Shelfarr metadata candidates require requester confirmation",
+                    "Acquisition candidates require requester confirmation",
                 ),
             )
             value = self._candidate_confirmation_row(connection, int(request_id))
@@ -1139,6 +2962,9 @@ class RequestStore:
                     """,
                     (observed_at, message, request["id"]),
                 )
+                self._close_released_ebook_cascade(
+                    connection, int(request["id"])
+                )
                 connection.execute(
                     "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
                     (request["id"], "selection_expired", message),
@@ -1247,7 +3073,8 @@ class RequestStore:
                 """
                 UPDATE requests
                 SET status = 'processing', updated_at = ?, error = NULL
-                WHERE id = ? AND status = 'awaiting_selection' AND service = 'shelfarr'
+                WHERE id = ? AND status = 'awaiting_selection'
+                  AND service IN ('shelfarr', 'abba', 'lazylibrarian')
                 """,
                 (observed_at, request["id"]),
             )
@@ -1269,8 +3096,8 @@ class RequestStore:
     ) -> bool:
         """Durably cross the selected-candidate POST boundary exactly once.
 
-        The Shelfarr client invokes this immediately before its sole request
-        creation POST. A restart can consequently distinguish a confirmed
+        The selected service invokes this immediately before its sole
+        non-idempotent POST. A restart can consequently distinguish a confirmed
         choice which was never submitted from one whose outcome needs
         correlation recovery.
         """
@@ -1287,7 +3114,7 @@ class RequestStore:
                 WHERE candidate_confirmations.request_id = ?
                   AND candidate_confirmations.status = 'claimed'
                   AND requests.status = 'processing'
-                  AND requests.service = 'shelfarr'
+                  AND requests.service IN ('shelfarr', 'abba', 'lazylibrarian')
                   AND requests.external_id IS NULL
                 """,
                 (int(request_id),),
@@ -1312,7 +3139,335 @@ class RequestStore:
                 (
                     int(request_id),
                     "selection_dispatch_started",
-                    "Confirmed Shelfarr candidate crossed the request dispatch boundary",
+                    "Confirmed candidate crossed the request dispatch boundary",
+                ),
+            )
+            return True
+
+    def reserve_abba_dispatch(
+        self,
+        request_id: int,
+        candidate_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Reserve one ABBA candidate and selected prompt before any mutation.
+
+        The returned row is the canonical owner.  A different request ID means
+        this request was atomically converted into an inert delivery alias, so
+        the caller must not contact ABBA for the duplicate correlation.
+        """
+
+        normalized_candidate_id = str(candidate_id or "")
+        if not _ABBA_CANDIDATE_ID.fullmatch(normalized_candidate_id):
+            raise ValueError("ABBA dispatch requires an exact candidate ID")
+        observed_at = _selection_timestamp(now)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE id = ? AND service = 'abba'
+                """,
+                (int(request_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["canonical_request_id"] is not None:
+                owner = connection.execute(
+                    "SELECT * FROM requests WHERE id = ?",
+                    (int(row["canonical_request_id"]),),
+                ).fetchone()
+                return dict(owner) if owner is not None else None
+            if row["status"] != "processing" or row["external_id"] is not None:
+                return None
+            if row["dispatch_started_at"] is not None:
+                return (
+                    dict(row)
+                    if row["abba_candidate_id"] == normalized_candidate_id
+                    else None
+                )
+
+            owner = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE id != ? AND service = 'abba'
+                  AND abba_candidate_id = ?
+                  AND canonical_request_id IS NULL
+                  AND status IN (
+                      'processing', 'queued', 'complete', 'completed'
+                  )
+                ORDER BY
+                    CASE
+                        WHEN status IN ('complete', 'completed') THEN 0
+                        WHEN status = 'queued' THEN 1
+                        ELSE 2
+                    END,
+                    id
+                LIMIT 1
+                """,
+                (int(request_id), normalized_candidate_id),
+            ).fetchone()
+            if owner is not None:
+                self._coalesce_abba_row(
+                    connection,
+                    int(request_id),
+                    int(owner["id"]),
+                    reason="candidate identity",
+                )
+                return dict(owner)
+
+            cursor = connection.execute(
+                """
+                UPDATE requests
+                SET dispatch_started_at = ?, updated_at = ?,
+                    abba_candidate_id = ?
+                WHERE id = ? AND status = 'processing'
+                  AND service = 'abba' AND external_id IS NULL
+                  AND dispatch_started_at IS NULL
+                  AND canonical_request_id IS NULL
+                """,
+                (
+                    observed_at,
+                    observed_at,
+                    normalized_candidate_id,
+                    int(request_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            confirmation = connection.execute(
+                """
+                SELECT id, dispatch_started_at
+                FROM candidate_confirmations
+                WHERE request_id = ? AND status = 'claimed'
+                """,
+                (int(request_id),),
+            ).fetchone()
+            if confirmation is not None and confirmation["dispatch_started_at"] is None:
+                connection.execute(
+                    """
+                    UPDATE candidate_confirmations
+                    SET dispatch_started_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'claimed'
+                      AND dispatch_started_at IS NULL
+                    """,
+                    (observed_at, observed_at, int(confirmation["id"])),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO events (request_id, event_type, message)
+                    VALUES (?, 'selection_dispatch_started', ?)
+                    """,
+                    (
+                        int(request_id),
+                        "Confirmed candidate crossed the request dispatch boundary",
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO events (request_id, event_type, message)
+                VALUES (?, 'abba_dispatch_started', ?)
+                """,
+                (
+                    int(request_id),
+                    "Abba request crossed the dispatch boundary",
+                ),
+            )
+            saved = connection.execute(
+                "SELECT * FROM requests WHERE id = ?", (int(request_id),)
+            ).fetchone()
+            return dict(saved) if saved is not None else None
+
+    def coalesce_abba_request(
+        self,
+        request_id: int,
+        canonical_request_id: int,
+        *,
+        candidate_id: str | None = None,
+        canonical_candidate_id: str | None = None,
+        info_hash: str | None = None,
+        reason: str = "torrent hash identity",
+    ) -> dict[str, Any]:
+        """Alias one ABBA request only after validating its canonical owner."""
+
+        normalized_candidate = str(candidate_id or "")
+        normalized_owner_candidate = str(canonical_candidate_id or "")
+        normalized_hash = str(info_hash or "").casefold()
+        if candidate_id is not None and not _ABBA_CANDIDATE_ID.fullmatch(
+            normalized_candidate
+        ):
+            raise ValueError("Invalid ABBA alias candidate")
+        if canonical_candidate_id is not None and not _ABBA_CANDIDATE_ID.fullmatch(
+            normalized_owner_candidate
+        ):
+            raise ValueError("Invalid canonical ABBA candidate")
+        if info_hash is not None and not _ABBA_INFO_HASH.fullmatch(normalized_hash):
+            raise ValueError("Invalid canonical ABBA download hash")
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            request = connection.execute(
+                "SELECT * FROM requests WHERE id = ?", (int(request_id),)
+            ).fetchone()
+            owner = connection.execute(
+                "SELECT * FROM requests WHERE id = ?",
+                (int(canonical_request_id),),
+            ).fetchone()
+            if request is None or owner is None:
+                raise sqlite3.IntegrityError("ABBA canonical request is missing")
+            if request["canonical_request_id"] is not None:
+                if int(request["canonical_request_id"]) != int(canonical_request_id):
+                    raise sqlite3.IntegrityError("ABBA request has another canonical owner")
+                return dict(owner)
+            if (
+                int(request_id) == int(canonical_request_id)
+                or request["service"] != "abba"
+                or owner["service"] != "abba"
+                or owner["canonical_request_id"] is not None
+                or owner["status"]
+                not in {"processing", "queued", "complete", "completed", "failed"}
+                or request["status"] not in {"processing", "queued"}
+            ):
+                raise sqlite3.IntegrityError("Invalid ABBA canonical ownership")
+            if owner["status"] == "failed" and (
+                candidate_id is None
+                or canonical_candidate_id is None
+                or info_hash is None
+            ):
+                raise sqlite3.IntegrityError(
+                    "Failed ABBA ownership requires exact canonical evidence"
+                )
+            if (
+                candidate_id is not None
+                and request["abba_candidate_id"] != normalized_candidate
+            ):
+                raise sqlite3.IntegrityError("ABBA alias candidate changed")
+            if (
+                canonical_candidate_id is not None
+                and owner["abba_candidate_id"] != normalized_owner_candidate
+            ):
+                raise sqlite3.IntegrityError("Canonical ABBA candidate changed")
+            if info_hash is not None:
+                for value in (request["external_id"], owner["external_id"]):
+                    if value is not None and str(value).casefold() != normalized_hash:
+                        raise sqlite3.IntegrityError(
+                            "ABBA canonical download hash changed"
+                        )
+            self._coalesce_abba_row(
+                connection,
+                int(request_id),
+                int(canonical_request_id),
+                reason=reason,
+            )
+            owner = connection.execute(
+                "SELECT * FROM requests WHERE id = ?",
+                (int(canonical_request_id),),
+            ).fetchone()
+            assert owner is not None
+            return dict(owner)
+
+    def mark_request_dispatch_started(
+        self,
+        request_id: int,
+        service: str,
+        *,
+        candidate_id: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Persist the generic remote-mutation boundary for restart recovery."""
+
+        if service not in {"shelfarr", "abba", "lazylibrarian"}:
+            raise ValueError("Unsupported correlated dispatch service")
+        normalized_candidate_id = str(candidate_id or "")
+        if service == "abba":
+            if not _ABBA_CANDIDATE_ID.fullmatch(normalized_candidate_id):
+                raise ValueError("ABBA dispatch requires an exact candidate ID")
+            owner = self.reserve_abba_dispatch(
+                int(request_id), normalized_candidate_id, now=now
+            )
+            return owner is not None and int(owner["id"]) == int(request_id)
+        elif service == "lazylibrarian":
+            if not _LAZYLIBRARIAN_BOOK_ID.fullmatch(normalized_candidate_id):
+                raise ValueError(
+                    "LazyLibrarian dispatch requires an exact book ID"
+                )
+        elif candidate_id is not None:
+            raise ValueError(
+                "Only ABBA and LazyLibrarian dispatches accept a candidate ID"
+            )
+        observed_at = _selection_timestamp(now)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT dispatch_started_at, abba_candidate_id,
+                       lazylibrarian_book_id
+                FROM requests
+                WHERE id = ? AND status = 'processing' AND service = ?
+                  AND external_id IS NULL
+                """,
+                (int(request_id), service),
+            ).fetchone()
+            if row is None:
+                return False
+            if service == "lazylibrarian":
+                duplicate = connection.execute(
+                    """
+                    SELECT id FROM requests
+                    WHERE id != ? AND service = 'lazylibrarian'
+                      AND lazylibrarian_book_id = ?
+                      AND status IN (
+                          'processing', 'queued', 'complete', 'completed'
+                      )
+                    LIMIT 1
+                    """,
+                    (int(request_id), normalized_candidate_id),
+                ).fetchone()
+                if duplicate is not None:
+                    return False
+            if row["dispatch_started_at"] is not None:
+                if service == "lazylibrarian":
+                    return (
+                        row["lazylibrarian_book_id"]
+                        == normalized_candidate_id
+                    )
+                return True
+            cursor = connection.execute(
+                """
+                UPDATE requests
+                SET dispatch_started_at = ?, updated_at = ?,
+                    abba_candidate_id = CASE
+                        WHEN service = 'abba' THEN ? ELSE abba_candidate_id
+                    END,
+                    lazylibrarian_book_id = CASE
+                        WHEN service = 'lazylibrarian' THEN ?
+                        ELSE lazylibrarian_book_id
+                    END
+                WHERE id = ? AND status = 'processing' AND service = ?
+                  AND external_id IS NULL AND dispatch_started_at IS NULL
+                """,
+                (
+                    observed_at,
+                    observed_at,
+                    normalized_candidate_id if service == "abba" else None,
+                    (
+                        normalized_candidate_id
+                        if service == "lazylibrarian"
+                        else None
+                    ),
+                    int(request_id),
+                    service,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (
+                    int(request_id),
+                    f"{service}_dispatch_started",
+                    f"{service.title()} request crossed the dispatch boundary",
                 ),
             )
             return True
@@ -1355,6 +3510,9 @@ class RequestStore:
                     WHERE id = ? AND status = 'awaiting_selection'
                     """,
                     (observed_at, message, row["request_id"]),
+                )
+                self._close_released_ebook_cascade(
+                    connection, int(row["request_id"])
                 )
                 connection.execute(
                     "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
@@ -1416,6 +3574,7 @@ class RequestStore:
                 """,
                 (failure, int(request_id)),
             )
+            self._close_released_ebook_cascade(connection, int(request_id))
             connection.execute(
                 "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
                 (int(request_id), "selection_prompt_failed", failure),
@@ -1460,6 +3619,15 @@ class RequestStore:
             raise ValueError(f"Invalid request status: {status}")
         if not message or not message.strip():
             raise ValueError("State transitions require an event message")
+        normalized_external_id = str(external_id) if external_id is not None else None
+        if service in {"lazylibrarian", "abba"} and normalized_external_id is not None:
+            normalized_external_id = normalized_external_id.casefold()
+        if service == "lazylibrarian" and normalized_external_id is not None:
+            if not _DOWNLOAD_ID.fullmatch(normalized_external_id):
+                raise ValueError("Invalid LazyLibrarian download ID")
+        if service == "abba" and normalized_external_id is not None:
+            if not _ABBA_INFO_HASH.fullmatch(normalized_external_id):
+                raise ValueError("Invalid ABBA download ID")
         normalized_notifications: list[tuple[str, str, str]] = []
         for delivery in notifications:
             if (
@@ -1472,18 +3640,76 @@ class RequestStore:
                 (delivery[0].strip(), delivery[1].strip(), delivery[2].strip()[:2000])
             )
         with self.connect() as connection:
+            if (
+                service in {"lazylibrarian", "abba"}
+                and normalized_external_id is not None
+                and status in {"processing", "queued"}
+            ):
+                connection.execute("BEGIN IMMEDIATE")
+            if (
+                service == "abba"
+                and normalized_external_id is not None
+                and status in {"processing", "queued"}
+            ):
+                duplicate = connection.execute(
+                    """
+                    SELECT * FROM requests
+                    WHERE id != ? AND service = 'abba'
+                      AND lower(external_id) = ?
+                      AND canonical_request_id IS NULL
+                      AND status IN (
+                          'processing', 'queued', 'complete', 'completed'
+                      )
+                    ORDER BY
+                        CASE
+                            WHEN status IN ('complete', 'completed') THEN 0
+                            WHEN status = 'queued' THEN 1
+                            ELSE 2
+                        END,
+                        id
+                    LIMIT 1
+                    """,
+                    (int(request_id), normalized_external_id),
+                ).fetchone()
+                if duplicate is not None:
+                    self._coalesce_abba_row(
+                        connection,
+                        int(request_id),
+                        int(duplicate["id"]),
+                        reason="Huey hash defense",
+                    )
+                    return dict(duplicate)
+            if (
+                service == "lazylibrarian"
+                and normalized_external_id is not None
+                and status in {"processing", "queued"}
+            ):
+                duplicate = connection.execute(
+                    """
+                    SELECT id FROM requests
+                    WHERE id != ? AND service = 'lazylibrarian'
+                      AND lower(external_id) = ?
+                      AND status IN ('processing', 'queued')
+                    LIMIT 1
+                    """,
+                    (int(request_id), normalized_external_id),
+                ).fetchone()
+                if duplicate is not None:
+                    raise LazyLibrarianHashCollision(
+                        "Active LazyLibrarian download identity collision"
+                    )
             cursor = connection.execute(
                 """
                 UPDATE requests
                 SET status = ?, updated_at = CURRENT_TIMESTAMP,
                     service = ?, external_id = ?, external_title = ?,
                     external_status = ?, error = ?
-                WHERE id = ?
+                WHERE id = ? AND canonical_request_id IS NULL
                 """,
                 (
                     status,
                     service,
-                    str(external_id) if external_id is not None else None,
+                    normalized_external_id,
                     external_title,
                     external_status,
                     error,
@@ -1543,6 +3769,7 @@ class RequestStore:
                 FROM requests
                 WHERE requests.status IN ('complete', 'completed', 'failed')
                   AND requests.notified_at IS NULL
+                  AND requests.canonical_request_id IS NULL
                 ORDER BY requests.updated_at, requests.id
                 LIMIT ?
                 """,
@@ -1728,6 +3955,415 @@ class RequestStore:
                 (max(1, min(int(limit), 1000)),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def queued_abba_requests(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return active ABBA/qBittorrent jobs awaiting BookBot completion."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE status = 'queued' AND service = 'abba'
+                  AND external_id IS NOT NULL
+                ORDER BY updated_at, id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def queued_lazylibrarian_requests(
+        self, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return correlated LL downloads awaiting BookBot's terminal import."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE status = 'queued' AND service = 'lazylibrarian'
+                  AND external_id IS NOT NULL
+                  AND lazylibrarian_book_id IS NOT NULL
+                ORDER BY updated_at, id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def uncertain_abba_requests(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return ABBA grabs whose response was lost after dispatch began."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE status = 'queued' AND service = 'abba'
+                  AND external_id IS NULL
+                  AND external_status = 'submission_uncertain'
+                  AND dispatch_started_at IS NOT NULL
+                  AND abba_candidate_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM events
+                      WHERE events.request_id = requests.id
+                        AND events.event_type = 'abba_submission_uncertain'
+                  )
+                ORDER BY updated_at, id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def uncertain_lazylibrarian_requests(
+        self, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return LL submissions awaiting an exact history correlation."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM requests
+                WHERE status = 'queued' AND service = 'lazylibrarian'
+                  AND external_id IS NULL
+                  AND external_status = 'submission_uncertain'
+                  AND dispatch_started_at IS NOT NULL
+                  AND lazylibrarian_book_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM events
+                      WHERE events.request_id = requests.id
+                        AND events.event_type =
+                            'lazylibrarian_submission_uncertain'
+                  )
+                ORDER BY updated_at, id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_lazylibrarian_download(
+        self,
+        request_id: int,
+        book_id: str,
+        download_id: str,
+        external_title: str,
+        message: str,
+        *,
+        external_status: str = "queued",
+        notifications: Sequence[tuple[str, str, str]] = (),
+    ) -> bool:
+        """Bind one exact LL BookID to one immutable qBittorrent hash."""
+
+        normalized_book_id = str(book_id or "")
+        normalized_download_id = str(download_id or "").casefold()
+        if not _LAZYLIBRARIAN_BOOK_ID.fullmatch(normalized_book_id):
+            raise ValueError("Invalid LazyLibrarian book ID")
+        if not _DOWNLOAD_ID.fullmatch(normalized_download_id):
+            raise ValueError("Invalid LazyLibrarian download ID")
+        if not message or not message.strip():
+            raise ValueError("LazyLibrarian recovery requires an event message")
+        if external_status not in {"queued", "processing"}:
+            raise ValueError("Invalid LazyLibrarian handoff status")
+        normalized_notifications: list[tuple[str, str, str]] = []
+        for delivery in notifications:
+            if (
+                not isinstance(delivery, (list, tuple))
+                or len(delivery) != 3
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in delivery
+                )
+            ):
+                raise ValueError("Notification delivery fields cannot be empty")
+            normalized_notifications.append(
+                (delivery[0].strip(), delivery[1].strip(), delivery[2].strip()[:2000])
+            )
+
+        if self.get_ebook_cascade(int(request_id)) is not None:
+            return self.record_ebook_recovered_handoff(
+                int(request_id),
+                "lazylibrarian",
+                normalized_download_id,
+                external_title,
+                external_status,
+                message,
+                backend_identity=normalized_book_id,
+                event_type="lazylibrarian_history_recovered",
+                notifications=normalized_notifications,
+            )
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT status, external_id, lazylibrarian_book_id
+                FROM requests
+                WHERE id = ? AND service = 'lazylibrarian'
+                """,
+                (int(request_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["lazylibrarian_book_id"] != normalized_book_id:
+                raise sqlite3.IntegrityError(
+                    "LazyLibrarian recovery book identity changed"
+                )
+            if row["external_id"] is not None:
+                if str(row["external_id"]).casefold() != normalized_download_id:
+                    raise sqlite3.IntegrityError(
+                        "LazyLibrarian recovery download identity changed"
+                    )
+                return False
+            if row["status"] not in {"processing", "queued"}:
+                return False
+            duplicate = connection.execute(
+                """
+                SELECT id FROM requests
+                WHERE id != ? AND service = 'lazylibrarian'
+                  AND lower(external_id) = ?
+                  AND status IN ('processing', 'queued')
+                LIMIT 1
+                """,
+                (int(request_id), normalized_download_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise LazyLibrarianHashCollision(
+                    "Active LazyLibrarian download identity collision"
+                )
+            cursor = connection.execute(
+                """
+                UPDATE requests
+                SET status = 'queued', external_id = ?,
+                    external_status = ?, external_title = ?,
+                    error = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND service = 'lazylibrarian'
+                  AND status IN ('processing', 'queued')
+                  AND external_id IS NULL
+                  AND lazylibrarian_book_id = ?
+                """,
+                (
+                    normalized_download_id,
+                    external_status,
+                    external_title,
+                    int(request_id),
+                    normalized_book_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (
+                    int(request_id),
+                    "lazylibrarian_history_recovered",
+                    message.strip()[:2000],
+                ),
+            )
+            for event_key, route, notification_message in normalized_notifications:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_deliveries (
+                        request_id, event_key, route, message
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        int(request_id),
+                        event_key,
+                        route,
+                        notification_message,
+                    ),
+                )
+            return True
+
+    def record_lazylibrarian_state(
+        self,
+        request_id: int,
+        expected_download_id: str,
+        external_status: str,
+        message: str,
+        *,
+        terminal: bool = False,
+        error: str | None = None,
+        notifications: Sequence[tuple[str, str, str]] = (),
+    ) -> bool:
+        """Persist one reliable qBit phase while BookBot owns success."""
+
+        normalized = external_status.strip().casefold()
+        normalized_download_id = str(expected_download_id or "").casefold()
+        if not _DOWNLOAD_ID.fullmatch(normalized_download_id):
+            raise ValueError("Invalid LazyLibrarian download ID")
+        if normalized not in LAZYLIBRARIAN_STATUSES:
+            raise ValueError(f"Invalid LazyLibrarian status: {external_status}")
+        if not message or not message.strip():
+            raise ValueError("LazyLibrarian state observations require a message")
+        if terminal != (normalized == "failed"):
+            raise ValueError(
+                "LazyLibrarian failures must be terminal before BookBot"
+            )
+        normalized_notifications: list[tuple[str, str, str]] = []
+        for delivery in notifications:
+            if (
+                not isinstance(delivery, (list, tuple))
+                or len(delivery) != 3
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in delivery
+                )
+            ):
+                raise ValueError("Notification delivery fields cannot be empty")
+            normalized_notifications.append(
+                (delivery[0].strip(), delivery[1].strip(), delivery[2].strip()[:2000])
+            )
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT external_status FROM requests
+                WHERE id = ? AND status = 'queued'
+                  AND service = 'lazylibrarian'
+                  AND external_id IS NOT NULL
+                  AND lower(external_id) = ?
+                """,
+                (int(request_id), normalized_download_id),
+            ).fetchone()
+            if row is None or (
+                str(row["external_status"] or "").casefold() == normalized
+                and not terminal
+            ):
+                return False
+            next_status = "failed" if terminal else "queued"
+            cursor = connection.execute(
+                """
+                UPDATE requests
+                SET status = ?, external_status = ?, error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'queued'
+                  AND service = 'lazylibrarian'
+                  AND external_id IS NOT NULL
+                  AND lower(external_id) = ?
+                """,
+                (
+                    next_status,
+                    normalized,
+                    error if terminal else None,
+                    int(request_id),
+                    normalized_download_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (
+                    int(request_id),
+                    f"lazylibrarian_{normalized}",
+                    message.strip()[:2000],
+                ),
+            )
+            for event_key, route, notification_message in normalized_notifications:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_deliveries (
+                        request_id, event_key, route, message
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        int(request_id),
+                        event_key,
+                        route,
+                        notification_message,
+                    ),
+                )
+            return True
+
+    def record_abba_state(
+        self,
+        request_id: int,
+        external_status: str,
+        message: str,
+        *,
+        terminal: bool = False,
+        error: str | None = None,
+        notifications: Sequence[tuple[str, str, str]] = (),
+    ) -> bool:
+        """Persist one quiet ABBA/qBittorrent lifecycle edge."""
+
+        normalized = external_status.strip().casefold()
+        if normalized not in ABBA_STATUSES:
+            raise ValueError(f"Invalid ABBA status: {external_status}")
+        if not message or not message.strip():
+            raise ValueError("ABBA state observations require a message")
+        if terminal and normalized != "failed":
+            raise ValueError("Only a failed ABBA job is terminal before BookBot")
+        normalized_notifications: list[tuple[str, str, str]] = []
+        for delivery in notifications:
+            if (
+                not isinstance(delivery, (list, tuple))
+                or len(delivery) != 3
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in delivery
+                )
+            ):
+                raise ValueError("Notification delivery fields cannot be empty")
+            normalized_notifications.append(
+                (delivery[0].strip(), delivery[1].strip(), delivery[2].strip()[:2000])
+            )
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT external_status FROM requests
+                WHERE id = ? AND status = 'queued' AND service = 'abba'
+                """,
+                (int(request_id),),
+            ).fetchone()
+            if row is None or (
+                str(row["external_status"] or "").casefold() == normalized
+                and not terminal
+            ):
+                return False
+            next_status = "failed" if terminal else "queued"
+            connection.execute(
+                """
+                UPDATE requests
+                SET status = ?, external_status = ?, error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'queued' AND service = 'abba'
+                """,
+                (
+                    next_status,
+                    normalized,
+                    error if terminal else None,
+                    int(request_id),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (
+                    int(request_id),
+                    f"abba_{normalized}",
+                    message.strip()[:2000],
+                ),
+            )
+            for event_key, route, notification_message in normalized_notifications:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_deliveries (
+                        request_id, event_key, route, message
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        int(request_id),
+                        event_key,
+                        route,
+                        notification_message,
+                    ),
+                )
+            return True
 
     def record_shelfarr_state(
         self,

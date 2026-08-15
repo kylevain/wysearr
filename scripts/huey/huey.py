@@ -11,15 +11,19 @@ import asyncio
 import logging
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 try:
-    from .clients import ServiceError
+    from .clients import CanonicalAcquisition, ServiceError, ServiceRejected
     from .config import ChannelConfig, load_channel_config
     from .database import RequestStore
     from .notifications import (
+        abba_state_notifications,
+        lazylibrarian_state_notifications,
         response_notifications,
+        service_correlation_attention_notification,
         shelfarr_attention_notification,
         shelfarr_correlation_attention_notification,
         shelfarr_state_notifications,
@@ -29,11 +33,14 @@ try:
     from .results import sanitize_display_text
     from .services import ServiceRegistry
 except ImportError:  # Direct execution from /app/scripts/huey/huey.py.
-    from clients import ServiceError
+    from clients import CanonicalAcquisition, ServiceError, ServiceRejected
     from config import ChannelConfig, load_channel_config
     from database import RequestStore
     from notifications import (
+        abba_state_notifications,
+        lazylibrarian_state_notifications,
         response_notifications,
+        service_correlation_attention_notification,
         shelfarr_attention_notification,
         shelfarr_correlation_attention_notification,
         shelfarr_state_notifications,
@@ -107,11 +114,16 @@ def format_candidate_prompt(
             raise ValueError("Candidate prompt contains an invalid label")
         lines.append(f"{ordinal}. {label}")
     minutes = max(1, (int(ttl_seconds) + 59) // 60)
+    choice_kind = (
+        "audiobook choice"
+        if str(response.get("service") or "").casefold() == "abba"
+        else "metadata choice"
+    )
     return (
-        f"⚠️ Request #{response['request_id']} needs one metadata choice\n"
+        f"⚠️ Request #{response['request_id']} needs one {choice_kind}\n"
         f"Type: {media_type}\n"
         + "\n".join(lines)
-        + f"\nReply directly to this message with one number within {minutes} minute"
+        + f"\nUse Discord's Reply action on this message, then send one number within {minutes} minute"
         + ("" if minutes == 1 else "s")
         + "."
     )
@@ -172,8 +184,15 @@ async def _reply_targets_huey_candidate_prompt(
         return None
     return bool(
         content.startswith("⚠️ Request #")
-        and " needs one metadata choice\n" in content
-        and "\nReply directly to this message with one number within " in content
+        and (
+            " needs one metadata choice\n" in content
+            or " needs one audiobook choice\n" in content
+        )
+        and (
+            "\nUse Discord's Reply action on this message, then send one number within "
+            in content
+            or "\nReply directly to this message with one number within " in content
+        )
     )
 
 
@@ -181,13 +200,20 @@ def selection_correction(outcome: str, request_id: object = None) -> str:
     suffix = f" for request #{request_id}" if request_id is not None else ""
     if outcome == "expired":
         return (
-            f"⚠️ That metadata prompt{suffix} expired. "
+            f"⚠️ That candidate-choice prompt{suffix} expired. "
             "Submit the title again to start a new search."
         )
     if outcome == "inactive":
         return (
-            "⚠️ That Huey metadata prompt is not active. "
+            "⚠️ That Huey candidate-choice prompt is not active. "
             "Submit the title as a new standalone message to start another search."
+        )
+    if outcome == "unreferenced":
+        return (
+            "⚠️ Huey did not apply that number because it was not sent with "
+            "Discord's Reply action on a candidate-choice prompt. Use Reply on the "
+            "Huey prompt and send one listed whole number; if the prompt expired, "
+            "submit the title again."
         )
     return (
         f"⚠️ That is not a valid choice{suffix}. "
@@ -361,6 +387,35 @@ def reconcile_arr_requests(store: RequestStore, services: Any) -> int:
     return completed_count
 
 
+def reconcile_ebook_cascades(store: RequestStore, services: Any) -> int:
+    """Resume only search-safe ebook attempts preserved across a restart."""
+
+    return RequestProcessor(store, services=services).resume_ebook_cascades()
+
+
+class _OneShotAsyncRecovery:
+    """Share one cached startup result (including failure) across all waiters."""
+
+    def __init__(self, callback: Any, *args: Any):
+        self.callback = callback
+        self.args = args
+        self.task: asyncio.Task | None = None
+        self.ready = asyncio.Event()
+        self.complete = False
+
+    async def ensure(self) -> Any:
+        if self.task is None:
+            self.task = asyncio.create_task(
+                asyncio.to_thread(self.callback, *self.args),
+                name="huey-ebook-startup-recovery",
+            )
+        value = await asyncio.shield(self.task)
+        self.complete = True
+        self.ready.set()
+        await self.ready.wait()
+        return value
+
+
 def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
     """Poll correlated Shelfarr requests and persist each lifecycle edge once."""
 
@@ -370,7 +425,11 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
         response = {
             "request_id": int(request["id"]),
             "status": "queued",
-            "message": "Recovered a Shelfarr request after correlation completed.",
+            "message": (
+                "Recovered the ebook acquisition and queued it safely."
+                if str(request.get("media_type") or "").casefold() == "ebooks"
+                else "Recovered a Shelfarr request after correlation completed."
+            ),
             "duplicate": False,
             "service": "shelfarr",
             "external_id": str(recovered["id"]),
@@ -382,6 +441,84 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
         }
         return response_notifications(
             str(request.get("media_type") or "ebooks"), response, request
+        )
+
+    def persist_recovered_shelfarr(
+        request: dict[str, Any],
+        recovered: dict[str, Any],
+        plans: tuple[Any, ...],
+        *,
+        message: str,
+    ) -> None:
+        """Promote new cascade rows atomically while retaining legacy recovery."""
+
+        external_title = sanitize_display_text(
+            recovered.get("book", {}).get("title"), limit=300
+        ) or request.get("title")
+        external_status = str(recovered["status"]).casefold()
+        if external_status == "failed":
+            plans = response_notifications(
+                str(request.get("media_type") or "ebooks"),
+                {
+                    "request_id": int(request["id"]),
+                    "status": "failed",
+                    "message": (
+                        "Huey recovered a definitive failed ebook acquisition."
+                        if str(request.get("media_type") or "").casefold() == "ebooks"
+                        else "Recovered a definitive failed Shelfarr acquisition."
+                    ),
+                    "duplicate": False,
+                    "service": "shelfarr",
+                    "external_id": str(recovered["id"]),
+                    "external_title": external_title,
+                    "external_status": "failed",
+                },
+                request,
+            )
+        notifications = tuple(
+            (plan.event_key, plan.route, plan.message) for plan in plans
+        )
+        cascade = store.get_ebook_cascade(int(request["id"]))
+        if cascade is not None and external_status == "failed":
+            store.persist_ebook_result(
+                int(request["id"]),
+                "shelfarr",
+                {
+                    "status": "failed",
+                    "message": message,
+                    "external_id": str(recovered["id"]),
+                    "external_title": external_title,
+                    "external_status": "failed",
+                },
+                notifications=notifications,
+            )
+            return
+        if cascade is not None:
+            store.record_ebook_recovered_handoff(
+                int(request["id"]),
+                "shelfarr",
+                str(recovered["id"]),
+                external_title,
+                external_status,
+                message,
+                backend_identity=str(
+                    recovered.get("book", {}).get("work_id") or ""
+                ),
+                event_type="shelfarr_recovered",
+                notifications=notifications,
+            )
+            return
+        store.transition(
+            int(request["id"]),
+            "failed" if external_status == "failed" else "queued",
+            message,
+            event_type="shelfarr_recovered",
+            service="shelfarr",
+            external_id=str(recovered["id"]),
+            external_title=external_title,
+            external_status=external_status,
+            error=message if external_status == "failed" else None,
+            notifications=notifications,
         )
 
     def recovered_identity_matches(
@@ -400,6 +537,25 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
             return False
 
         try:
+            cascade = store.get_ebook_cascade(int(request["id"]))
+            if cascade is not None:
+                ordinal = int(cascade["current_ordinal"])
+                attempts = cascade.get("attempts", ())
+                if not 0 <= ordinal < len(attempts):
+                    return False
+                backend_identity = attempts[ordinal].get("backend_identity")
+                backend_identities = set(
+                    attempts[ordinal].get("backend_identities", ())
+                )
+                return bool(
+                    str(request.get("media_type") or "") == "ebooks"
+                    and cascade["policy"][ordinal] == "shelfarr"
+                    and isinstance(book, dict)
+                    and book.get("content_kind") == "book"
+                    and backend_identity is not None
+                    and str(backend_identity) in backend_identities
+                    and str(book.get("work_id") or "") in backend_identities
+                )
             confirmation = store.get_candidate_confirmation(int(request["id"]))
             if confirmation is None:
                 return True
@@ -475,21 +631,11 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
             quarantine_format_mismatch(uncertain, startup=False)
             continue
         plans = recovered_acceptance_plans(uncertain, recovered)
-        store.transition(
-            int(uncertain["id"]),
-            "queued",
-            "Recovered Shelfarr correlation after an uncertain submission",
-            event_type="shelfarr_recovered",
-            service="shelfarr",
-            external_id=str(recovered["id"]),
-            external_status=str(recovered["status"]).casefold(),
-            external_title=sanitize_display_text(
-                recovered.get("book", {}).get("title"), limit=300
-            )
-            or uncertain.get("title"),
-            notifications=tuple(
-                (plan.event_key, plan.route, plan.message) for plan in plans
-            ),
+        persist_recovered_shelfarr(
+            uncertain,
+            recovered,
+            plans,
+            message="Recovered ebook acquisition correlation after an uncertain submission",
         )
         changed_count += 1
 
@@ -524,21 +670,11 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
             quarantine_format_mismatch(interrupted, startup=True)
             continue
         plans = recovered_acceptance_plans(interrupted, recovered)
-        store.transition(
-            int(interrupted["id"]),
-            "queued",
-            "Recovered Shelfarr correlation after interrupted Huey dispatch",
-            event_type="shelfarr_recovered",
-            service="shelfarr",
-            external_id=str(recovered["id"]),
-            external_status=str(recovered["status"]).casefold(),
-            external_title=sanitize_display_text(
-                recovered.get("book", {}).get("title"), limit=300
-            )
-            or interrupted.get("title"),
-            notifications=tuple(
-                (plan.event_key, plan.route, plan.message) for plan in plans
-            ),
+        persist_recovered_shelfarr(
+            interrupted,
+            recovered,
+            plans,
+            message="Recovered ebook acquisition correlation after interrupted Huey dispatch",
         )
         changed_count += 1
 
@@ -722,6 +858,561 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
     return changed_count
 
 
+def reconcile_lazylibrarian_requests(
+    store: RequestStore, services: Any
+) -> int:
+    """Recover exact LL BookID/history correlations without repeating search."""
+
+    def recovered_plans(
+        request: dict[str, Any], recovered: dict[str, Any]
+    ) -> tuple[Any, ...]:
+        response = {
+            "request_id": int(request["id"]),
+            "status": "queued",
+            "message": "Recovered the ebook acquisition and queued it safely.",
+            "duplicate": False,
+            "service": "lazylibrarian",
+            "external_id": recovered["external_id"],
+            "external_title": recovered["external_title"],
+            "external_status": recovered.get("external_status") or "queued",
+        }
+        return response_notifications("ebooks", response, request)
+
+    def attention(
+        request: dict[str, Any], *, startup: bool, identity_mismatch: bool = False
+    ) -> None:
+        plan = service_correlation_attention_notification(
+            request,
+            service="LazyLibrarian",
+            startup=startup,
+            identity_mismatch=identity_mismatch,
+        )
+        store.enqueue_notification(
+            int(request["id"]), plan.event_key, plan.route, plan.message
+        )
+
+    def inspect(request: dict[str, Any], *, startup: bool) -> bool:
+        try:
+            remote = services.lazylibrarian().recover_submission(
+                request.get("lazylibrarian_book_id")
+            )
+        except ServiceRejected as error:
+            attention(request, startup=startup, identity_mismatch=True)
+            LOGGER.warning(
+                "LazyLibrarian recovery rejected exact history for request %s (%s); "
+                "automatic search retry is blocked",
+                request["id"],
+                type(error).__name__,
+            )
+            return False
+        except ServiceError as error:
+            LOGGER.warning(
+                "LazyLibrarian recovery deferred for request %s (%s)",
+                request["id"],
+                type(error).__name__,
+            )
+            return False
+        except Exception as error:
+            LOGGER.warning(
+                "LazyLibrarian recovery could not inspect request %s (%s)",
+                request["id"],
+                type(error).__name__,
+            )
+            return False
+
+        if not isinstance(remote, dict) or remote.get("state") not in {
+            "unknown",
+            "pending",
+            "queued",
+        }:
+            attention(request, startup=startup, identity_mismatch=True)
+            return False
+        if remote["state"] != "queued":
+            attention(request, startup=startup)
+            LOGGER.warning(
+                "LazyLibrarian exact history is not yet available for request %s; "
+                "automatic search retry is blocked",
+                request["id"],
+            )
+            return False
+
+        plans = recovered_plans(request, remote)
+        try:
+            return store.record_lazylibrarian_download(
+                int(request["id"]),
+                str(remote["book_id"]),
+                str(remote["external_id"]),
+                str(remote["external_title"]),
+                "Recovered exact LazyLibrarian BookID and qBittorrent DownloadID",
+                external_status=str(remote.get("external_status") or "queued"),
+                notifications=tuple(
+                    (plan.event_key, plan.route, plan.message) for plan in plans
+                ),
+            )
+        except Exception as error:
+            attention(request, startup=startup, identity_mismatch=True)
+            LOGGER.warning(
+                "LazyLibrarian recovery could not bind request %s (%s)",
+                request["id"],
+                type(error).__name__,
+            )
+            return False
+
+    changed_count = 0
+    for request in store.uncertain_lazylibrarian_requests():
+        changed_count += inspect(request, startup=False)
+    for request in store.interrupted_lazylibrarian_requests():
+        changed_count += inspect(request, startup=True)
+
+    queued_requests = store.queued_lazylibrarian_requests()
+    if not queued_requests:
+        return changed_count
+    try:
+        qbittorrent = services.qbittorrent()
+    except Exception as error:
+        LOGGER.warning(
+            "LazyLibrarian qBittorrent status client is unavailable (%s)",
+            type(error).__name__,
+        )
+        return changed_count
+
+    terminal_failure_states = {"error", "missingfiles"}
+    active_download_states = {"downloading", "forceddl"}
+    downloaded_states = {
+        "checkingup",
+        "forcedup",
+        "pausedup",
+        "queuedup",
+        "stalledup",
+        "stoppedup",
+        "uploading",
+    }
+    known_nonterminal_states = active_download_states | downloaded_states | {
+        "allocating",
+        "checkingdl",
+        "checkingresumedata",
+        "forcedmetadl",
+        "metadl",
+        "moving",
+        "pauseddl",
+        "queueddl",
+        "stalleddl",
+        "stoppeddl",
+    }
+
+    for request in queued_requests:
+        expected_hash = str(request.get("external_id") or "").casefold()
+        try:
+            torrent = qbittorrent.find_torrent(expected_hash)
+        except ServiceError as error:
+            LOGGER.warning(
+                "LazyLibrarian qBittorrent status polling is unavailable (%s)",
+                type(error).__name__,
+            )
+            break
+        except Exception as error:
+            LOGGER.warning(
+                "LazyLibrarian qBittorrent status deferred for request %s (%s)",
+                request["id"],
+                type(error).__name__,
+            )
+            continue
+        if torrent is None:
+            # Absence is not a terminal failure: BookBot may already have
+            # completed retention, or qBittorrent may be transiently stale.
+            continue
+        if not isinstance(torrent, Mapping):
+            attention(request, startup=False, identity_mismatch=True)
+            continue
+        observed_hash = str(torrent.get("hash") or "").casefold()
+        category = str(torrent.get("category") or "")
+        save_path = str(torrent.get("save_path") or "")
+        if (
+            observed_hash != expected_hash
+            or category not in {"ebooks", "ebooks-imported"}
+            or save_path != "/downloads/ebooks"
+        ):
+            attention(request, startup=False, identity_mismatch=True)
+            LOGGER.warning(
+                "LazyLibrarian qBittorrent routing changed for request %s",
+                request["id"],
+            )
+            continue
+
+        qbit_state = str(torrent.get("state") or "").strip().casefold()
+        try:
+            download_complete = (
+                float(torrent.get("progress", 0.0)) >= 1.0
+                and int(torrent.get("amount_left", 1)) == 0
+            )
+        except (TypeError, ValueError):
+            download_complete = False
+
+        if category == "ebooks-imported":
+            phase = "processing"
+        elif qbit_state in terminal_failure_states:
+            detail = (
+                "qBittorrent reports a terminal ebook download failure; "
+                "BookBot cannot import this payload."
+            )
+            response = {
+                "request_id": int(request["id"]),
+                "status": "failed",
+                "message": detail,
+                "duplicate": False,
+                "service": "lazylibrarian",
+                "external_id": expected_hash,
+                "external_title": request.get("external_title"),
+                "external_status": "failed",
+            }
+            plans = response_notifications("ebooks", response, request)
+            if store.record_lazylibrarian_state(
+                int(request["id"]),
+                expected_hash,
+                "failed",
+                detail,
+                terminal=True,
+                error=detail,
+                notifications=tuple(
+                    (plan.event_key, plan.route, plan.message) for plan in plans
+                ),
+            ):
+                changed_count += 1
+            continue
+        elif download_complete or qbit_state in downloaded_states:
+            phase = "processing"
+        elif qbit_state in active_download_states:
+            phase = "downloading"
+        elif qbit_state in known_nonterminal_states:
+            phase = "queued"
+        else:
+            # Unknown/new qB states are never guessed into failure.
+            continue
+
+        current = {**dict(request), "external_status": phase}
+        plans = lazylibrarian_state_notifications(current, phase)
+        if store.record_lazylibrarian_state(
+            int(request["id"]),
+            expected_hash,
+            phase,
+            f"LazyLibrarian qBittorrent handoff reports {phase}",
+            notifications=tuple(
+                (plan.event_key, plan.route, plan.message) for plan in plans
+            ),
+        ):
+            changed_count += 1
+    return changed_count
+
+
+def reconcile_abba_requests(store: RequestStore, services: Any) -> int:
+    """Recover ABBA grabs and observe qBittorrent progress without polling spam."""
+
+    recovery_groups = (
+        (store.uncertain_abba_requests(), False),
+        (store.interrupted_abba_requests(), True),
+    )
+    if (
+        not any(requests for requests, _startup in recovery_groups)
+        and not store.queued_abba_requests()
+    ):
+        return 0
+    try:
+        abba = services.abba()
+    except Exception as error:
+        LOGGER.warning(
+            "ABBA reconciliation client is unavailable (%s)", type(error).__name__
+        )
+        return 0
+
+    def identity_matches(request: dict[str, Any], job: dict[str, Any]) -> bool:
+        expected_candidate_id = str(request.get("abba_candidate_id") or "")
+        if (
+            not expected_candidate_id
+            or str(job.get("candidate_id") or "") != expected_candidate_id
+        ):
+            return False
+        confirmation = store.get_candidate_confirmation(int(request["id"]))
+        if confirmation is None:
+            return True
+        if confirmation.get("status") != "claimed":
+            return False
+        selected = [
+            option
+            for option in confirmation.get("options", ())
+            if isinstance(option, dict)
+            and option.get("ordinal") == confirmation.get("selected_ordinal")
+        ]
+        if len(selected) != 1:
+            return False
+        matcher = getattr(abba, "recovered_request_matches_candidate", None)
+        return bool(
+            callable(matcher)
+            and matcher(job, selected[0].get("candidate")) is True
+        )
+
+    def quarantine(request: dict[str, Any], *, startup: bool) -> None:
+        plan = service_correlation_attention_notification(
+            request,
+            service="ABBA",
+            startup=startup,
+            identity_mismatch=True,
+        )
+        store.enqueue_notification(
+            int(request["id"]), plan.event_key, plan.route, plan.message
+        )
+        LOGGER.warning(
+            "ABBA correlation has an unexpected candidate for request %s",
+            request["id"],
+        )
+
+    def coalesce_alias(
+        request: dict[str, Any],
+        *,
+        owner_request_id: int,
+        candidate_id: str,
+        canonical_candidate_id: str,
+        info_hash: str,
+    ) -> bool:
+        try:
+            store.coalesce_abba_request(
+                int(request["id"]),
+                int(owner_request_id),
+                candidate_id=candidate_id,
+                canonical_candidate_id=canonical_candidate_id,
+                info_hash=info_hash,
+                reason="ABBA restart correlation",
+            )
+            return True
+        except Exception as error:
+            LOGGER.warning(
+                "ABBA canonical correlation could not be persisted for request %s (%s)",
+                request["id"],
+                type(error).__name__,
+            )
+            return False
+
+    def persist_recovered(
+        request: dict[str, Any], remote: dict[str, Any], *, resumed: bool
+    ) -> None:
+        """Atomically attach the exact qBit hash, or persist pre-hash failure."""
+
+        raw_status = str(remote.get("status") or "").casefold()
+        external_status = str(remote.get("external_status") or raw_status).casefold()
+        failed = raw_status == "failed"
+        external_id = remote.get("info_hash", remote.get("external_id"))
+        if external_id is not None:
+            external_id = str(external_id).lower()
+        external_title = (
+            remote.get("title")
+            or remote.get("external_title")
+            or request.get("title")
+        )
+        if failed:
+            operator_detail = sanitize_display_text(
+                remote.get("error") or remote.get("message"), limit=500
+            ) or "The persisted audiobook acquisition failed during recovery."
+            response = {
+                "request_id": int(request["id"]),
+                "status": "failed",
+                "message": (
+                    "The audiobook acquisition could not be completed during "
+                    "recovery. An administrator can review the saved workflow."
+                ),
+                "duplicate": False,
+                "service": "abba",
+                "external_id": external_id,
+                "external_title": external_title,
+                "external_status": "failed",
+            }
+            message = "Recovered a terminal ABBA failure after interrupted submission"
+            event_type = "abba_failed"
+            error = operator_detail
+        else:
+            response = {
+                "request_id": int(request["id"]),
+                "status": "queued",
+                "message": (
+                    "Safely resumed the persisted audiobook acquisition."
+                    if resumed
+                    else "Recovered the correlated audiobook acquisition."
+                ),
+                "duplicate": False,
+                "service": "abba",
+                "external_id": external_id,
+                "external_title": external_title,
+                "external_status": external_status,
+            }
+            message = "Recovered ABBA correlation after an interrupted submission"
+            event_type = "abba_recovered"
+            error = None
+        plans = response_notifications("audiobooks", response, request)
+        store.transition(
+            int(request["id"]),
+            str(response["status"]),
+            message,
+            event_type=event_type,
+            service="abba",
+            external_id=external_id,
+            external_title=str(external_title) if external_title else None,
+            external_status=str(response["external_status"]),
+            error=error,
+            notifications=tuple(
+                (plan.event_key, plan.route, plan.message) for plan in plans
+            ),
+        )
+
+    def reject_unrecoverable_candidate(request: dict[str, Any]) -> None:
+        message = (
+            "The audiobook workflow could not revalidate the persisted result. "
+            "Submit the title again to search anew."
+        )
+        response = {
+            "request_id": int(request["id"]),
+            "status": "needs_selection",
+            "message": message,
+            "duplicate": False,
+            "service": "abba",
+        }
+        plans = response_notifications("audiobooks", response, request)
+        store.transition(
+            int(request["id"]),
+            "needs_selection",
+            message,
+            event_type="abba_recovery_rejected",
+            service="abba",
+            error=message,
+            notifications=tuple(
+                (plan.event_key, plan.route, plan.message) for plan in plans
+            ),
+        )
+
+    changed_count = 0
+    for requests, startup in recovery_groups:
+        for request in requests:
+            try:
+                job = abba.recover_request(int(request["id"]))
+            except Exception as error:
+                LOGGER.warning(
+                    "ABBA correlation recovery deferred for request %s (%s)",
+                    request["id"],
+                    type(error).__name__,
+                )
+                plan = service_correlation_attention_notification(
+                    request, service="ABBA", startup=startup
+                )
+                store.enqueue_notification(
+                    int(request["id"]), plan.event_key, plan.route, plan.message
+                )
+                continue
+            if job is None:
+                candidate_id = str(request.get("abba_candidate_id") or "")
+                resume = getattr(abba, "resume_grab", None)
+                if not candidate_id or not callable(resume):
+                    quarantine(request, startup=startup)
+                    continue
+                try:
+                    response = resume(int(request["id"]), candidate_id)
+                except CanonicalAcquisition as canonical:
+                    if coalesce_alias(
+                        request,
+                        owner_request_id=canonical.owner_request_id,
+                        candidate_id=canonical.candidate_id,
+                        canonical_candidate_id=canonical.canonical_candidate_id,
+                        info_hash=canonical.info_hash,
+                    ):
+                        changed_count += 1
+                    else:
+                        quarantine(request, startup=startup)
+                    continue
+                except ServiceRejected:
+                    reject_unrecoverable_candidate(request)
+                    changed_count += 1
+                    continue
+                except Exception as error:
+                    LOGGER.warning(
+                        "ABBA exact-candidate recovery deferred for request %s (%s)",
+                        request["id"],
+                        type(error).__name__,
+                    )
+                    plan = service_correlation_attention_notification(
+                        request, service="ABBA", startup=startup
+                    )
+                    store.enqueue_notification(
+                        int(request["id"]), plan.event_key, plan.route, plan.message
+                    )
+                    continue
+                persist_recovered(request, dict(response), resumed=True)
+                changed_count += 1
+                continue
+            if str(job.get("status") or "").casefold() == "duplicate":
+                if coalesce_alias(
+                    request,
+                    owner_request_id=int(job.get("canonical_request_id") or 0),
+                    candidate_id=str(job.get("candidate_id") or ""),
+                    canonical_candidate_id=str(
+                        job.get("canonical_candidate_id") or ""
+                    ),
+                    info_hash=str(job.get("info_hash") or ""),
+                ):
+                    changed_count += 1
+                else:
+                    quarantine(request, startup=startup)
+                continue
+            if not identity_matches(request, job):
+                quarantine(request, startup=startup)
+                continue
+            persist_recovered(request, dict(job), resumed=False)
+            changed_count += 1
+
+    for request in store.queued_abba_requests():
+        try:
+            job = abba.get_request(int(request["id"]))
+        except Exception as error:
+            LOGGER.warning(
+                "ABBA status reconciliation deferred for request %s (%s)",
+                request["id"],
+                type(error).__name__,
+            )
+            continue
+        if job is None:
+            LOGGER.warning("ABBA has not exposed status for request %s", request["id"])
+            continue
+        external_status = str(job["status"]).casefold()
+        observed_hash = str(job.get("info_hash") or "").casefold()
+        expected_hash = str(request.get("external_id") or "").casefold()
+        hash_mismatch = observed_hash != expected_hash
+        if hash_mismatch or not identity_matches(request, job):
+            quarantine(request, startup=False)
+            continue
+
+        if external_status == "failed":
+            detail = sanitize_display_text(job.get("error"), limit=500) or (
+                "The audiobook workflow could not complete the download."
+            )
+            if store.record_abba_state(
+                int(request["id"]),
+                "failed",
+                detail,
+                terminal=True,
+                error=detail,
+            ):
+                changed_count += 1
+            continue
+
+        current = {**dict(request), "external_status": external_status}
+        plans = abba_state_notifications(current, external_status)
+        if store.record_abba_state(
+            int(request["id"]),
+            external_status,
+            f"ABBA reports {external_status}",
+            notifications=tuple(
+                (plan.event_key, plan.route, plan.message) for plan in plans
+            ),
+        ):
+            changed_count += 1
+    return changed_count
+
+
 async def notification_loop(
     client: Any,
     channel_config: ChannelConfig,
@@ -776,6 +1467,47 @@ async def shelfarr_reconciliation_loop(
         await asyncio.sleep(max(1.0, interval_seconds))
 
 
+async def lazylibrarian_reconciliation_loop(
+    client: Any,
+    store: RequestStore,
+    services: Any,
+    interval_seconds: float = 30,
+) -> None:
+    """Recover LL history independently without repeating provider searches."""
+
+    while not client.is_closed():
+        try:
+            await asyncio.to_thread(
+                reconcile_lazylibrarian_requests, store, services
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.error(
+                "LazyLibrarian correlation reconciliation failed (%s)",
+                type(error).__name__,
+            )
+        await asyncio.sleep(max(1.0, interval_seconds))
+
+
+async def abba_reconciliation_loop(
+    client: Any,
+    store: RequestStore,
+    services: Any,
+    interval_seconds: float = 30,
+) -> None:
+    """Poll ABBA independently so its outage cannot affect other workflows."""
+
+    while not client.is_closed():
+        try:
+            await asyncio.to_thread(reconcile_abba_requests, store, services)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.error("ABBA lifecycle reconciliation failed (%s)", type(error).__name__)
+        await asyncio.sleep(max(1.0, interval_seconds))
+
+
 def build_client(
     channel_config: ChannelConfig,
     processor: RequestProcessor,
@@ -794,10 +1526,24 @@ def build_client(
     client = discord.Client(intents=intents)
     reconcile_task: asyncio.Task | None = None
     shelfarr_task: asyncio.Task | None = None
+    lazylibrarian_task: asyncio.Task | None = None
+    abba_task: asyncio.Task | None = None
+    ebook_recovery = _OneShotAsyncRecovery(
+        reconcile_ebook_cascades,
+        processor.store,
+        processor.services,
+    )
+
+    async def ensure_ebook_recovery() -> None:
+        """Serialize startup recovery ahead of every Discord intake path."""
+
+        # A cancelled Discord callback cannot cancel the shared one-shot, and
+        # a failed task remains cached so another waiter cannot repeat searches.
+        await ebook_recovery.ensure()
 
     @client.event
     async def on_ready():
-        nonlocal reconcile_task, shelfarr_task
+        nonlocal reconcile_task, shelfarr_task, lazylibrarian_task, abba_task
         try:
             await validate_discord_channels(client, channel_config)
         except RuntimeError as error:
@@ -805,6 +1551,17 @@ def build_client(
             LOGGER.error("Huey Discord channel validation failed: %s", error)
             await client.close()
             return
+        if not ebook_recovery.complete:
+            try:
+                await ensure_ebook_recovery()
+            except Exception as error:
+                remove_ready_marker(ready_path)
+                LOGGER.error(
+                    "Huey ebook cascade startup recovery failed (%s)",
+                    type(error).__name__,
+                )
+                await client.close()
+                return
         write_ready_marker(ready_path)
         LOGGER.info("Huey is ready as %s; watching %d channel(s)", client.user, len(channel_config.request_channels))
         if reconcile_task is None or reconcile_task.done():
@@ -827,6 +1584,26 @@ def build_client(
                     reconcile_seconds,
                 ),
                 name="huey-shelfarr-reconciliation",
+            )
+        if lazylibrarian_task is None or lazylibrarian_task.done():
+            lazylibrarian_task = asyncio.create_task(
+                lazylibrarian_reconciliation_loop(
+                    client,
+                    processor.store,
+                    processor.services,
+                    reconcile_seconds,
+                ),
+                name="huey-lazylibrarian-reconciliation",
+            )
+        if abba_task is None or abba_task.done():
+            abba_task = asyncio.create_task(
+                abba_reconciliation_loop(
+                    client,
+                    processor.store,
+                    processor.services,
+                    reconcile_seconds,
+                ),
+                name="huey-abba-reconciliation",
             )
 
     async def deliver_response(message: Any, media_type: str, response: dict[str, Any]) -> None:
@@ -883,6 +1660,14 @@ def build_client(
         media_type = channel_config.request_channels.get(str(message.channel.id))
         if media_type is None:
             return
+        try:
+            await ensure_ebook_recovery()
+        except Exception as error:
+            LOGGER.error(
+                "Huey ebook cascade startup recovery blocked Discord intake (%s)",
+                type(error).__name__,
+            )
+            return
 
         delivery = {
             "discord_user_id": str(message.author.id),
@@ -912,7 +1697,7 @@ def build_client(
                 try:
                     await message.reply(
                         "❌ Huey could not save this selection. Do not retry it yet; "
-                        "an administrator should check Huey and Shelfarr."
+                        "an administrator should check Huey and the acquisition service."
                     )
                 except Exception as reply_error:
                     LOGGER.warning(
@@ -974,7 +1759,7 @@ def build_client(
             and _selection_ordinal(message.content) in {1, 2, 3}
         ):
             try:
-                await message.reply(selection_correction("inactive"))
+                await message.reply(selection_correction("unreferenced"))
             except Exception as error:
                 LOGGER.warning(
                     "Could not send standalone selection correction (%s)",

@@ -1,5 +1,5 @@
-from .common import handle_book
+from .common import handle_audiobook
 
 
 def handle(request, services=None):
-    return handle_book(request, services)
+    return handle_audiobook(request, services)

@@ -10,6 +10,7 @@ from typing import Any
 RESULT_STATUSES = frozenset(
     {"queued", "awaiting_selection", "needs_selection", "failed", "completed"}
 )
+BACKEND_OUTCOMES = frozenset({"miss", "ambiguous"})
 _SENSITIVE_DISPLAY_TEXT = re.compile(
     r"(?:https?://|ftp://|www\.|discord\.gg/|magnet:|"
     r"(?:api[\s_-]*key|token|password|secret|authorization)\s*[:=]|"
@@ -51,7 +52,9 @@ def safe_display_title(value: object, fallback: object = None) -> str:
 
 _SELECTION_FINGERPRINT = re.compile(r"\A[0-9a-f]{64}\Z")
 _SELECTION_WORK_ID = re.compile(
-    r"\A(?:hardcover|google_books|openlibrary):[A-Za-z0-9][A-Za-z0-9._:-]{0,230}\Z"
+    r"\A(?:(?:hardcover|google_books|openlibrary):"
+    r"[A-Za-z0-9][A-Za-z0-9._:-]{0,230}|"
+    r"(?:abba|lazylibrarian):[0-9a-f]{64})\Z"
 )
 _SENSITIVE_SELECTION_IDENTITY = re.compile(
     r"(?:api[_-]?key|token|password|secret|authorization)", re.IGNORECASE
@@ -59,7 +62,7 @@ _SENSITIVE_SELECTION_IDENTITY = re.compile(
 
 
 def _normalize_selection_proposal(value: object) -> tuple[dict[str, Any], ...]:
-    """Copy the small, inert Shelfarr metadata-choice contract.
+    """Copy the small, inert acquisition-choice contract.
 
     The client computes the identity fingerprint.  This boundary independently
     rejects URL-like/free-form provider data so handler normalization cannot
@@ -128,6 +131,30 @@ def _normalize_selection_proposal(value: object) -> tuple[dict[str, Any], ...]:
     return tuple(normalized)
 
 
+def _normalize_resolved_identity(value: object) -> dict[str, Any] | None:
+    """Validate one backend-independent work identity.
+
+    This uses the same inert snapshot contract as a candidate option, but a
+    resolved identity is singular.  Keeping it in handler results lets the
+    orchestrator persist an automatic high-confidence match before any remote
+    mutation and constrain every later backend to that exact work.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("Resolved work identity is invalid")
+    # Reuse the candidate boundary without weakening its two-option prompt
+    # invariant by validating two temporary copies, then return one copy.
+    first = dict(value)
+    second = dict(value)
+    second["fingerprint"] = (
+        "0" * 64 if first.get("fingerprint") != "0" * 64 else "1" * 64
+    )
+    normalized = _normalize_selection_proposal((first, second))[0]
+    return normalized
+
+
 def result(
     status: str,
     message: str,
@@ -138,6 +165,8 @@ def result(
     external_status: str | None = None,
     manual_intervention: bool = False,
     selection_proposal: object = (),
+    backend_outcome: str | None = None,
+    resolved_identity: object = None,
 ) -> dict[str, Any]:
     if status not in RESULT_STATUSES:
         raise ValueError(f"Invalid handler result status: {status}")
@@ -148,6 +177,9 @@ def result(
         raise ValueError("Awaiting-selection results require candidate proposals")
     if status != "awaiting_selection" and proposal:
         raise ValueError("Only awaiting-selection results may include candidates")
+    if backend_outcome is not None and backend_outcome not in BACKEND_OUTCOMES:
+        raise ValueError(f"Invalid backend outcome: {backend_outcome}")
+    identity = _normalize_resolved_identity(resolved_identity)
     return {
         "status": status,
         "message": message.strip(),
@@ -157,6 +189,8 @@ def result(
         "external_status": external_status,
         "manual_intervention": bool(manual_intervention),
         "selection_proposal": proposal,
+        "backend_outcome": backend_outcome,
+        "resolved_identity": identity,
     }
 
 
@@ -172,4 +206,6 @@ def normalize_result(value: Any) -> dict[str, Any]:
         external_status=value.get("external_status"),
         manual_intervention=value.get("manual_intervention") is True,
         selection_proposal=value.get("selection_proposal", ()),
+        backend_outcome=value.get("backend_outcome"),
+        resolved_identity=value.get("resolved_identity"),
     )

@@ -428,6 +428,28 @@ class ShelfarrClientTests(unittest.TestCase):
 
         self.assertEqual(response["status"], "needs_selection")
         self.assertEqual(response["selection_proposal"], ())
+
+    def test_supplied_author_must_match_all_metadata_author_tokens_before_post(self):
+        for candidate_author in (None, "Herbert", "Brian Herbert"):
+            with self.subTest(author=candidate_author):
+                session = FakeSession(
+                    [
+                        FakeResponse(
+                            json_value={
+                                "results": [
+                                    self.metadata_result(author=candidate_author)
+                                ]
+                            }
+                        )
+                    ]
+                )
+                response = ShelfarrClient(
+                    "http://shelfarr", "shf_secret", session=session
+                ).submit("ebooks", "Dune", "Frank Herbert", 42)
+
+                self.assertEqual(response["status"], "needs_selection")
+                self.assertEqual(len(session.calls), 1)
+                self.assertEqual(session.calls[0][0], "GET")
         self.assertEqual(len(session.calls), 1)
 
     def test_ambiguous_proposal_is_bounded_sanitized_and_normalized(self):
@@ -1027,6 +1049,51 @@ class ShelfarrClientTests(unittest.TestCase):
             ).submit("ebooks", "Dune", "Frank Herbert", 42)
 
         self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+
+    def test_request_list_horizon_is_never_treated_as_authoritative_absence(self):
+        def page(count, *, include_correlation=False):
+            requests = [
+                self.request_payload(
+                    id=index + 1,
+                    request={"external_source": f"huey:{1000 + index}"},
+                )
+                for index in range(count)
+            ]
+            if include_correlation:
+                requests[-1] = self.request_payload(
+                    id=count,
+                    request={"external_source": "huey:42"},
+                )
+            return {"requests": requests}
+
+        for count in (100, 101):
+            with self.subTest(kind="correlation", count=count):
+                client = ShelfarrClient(
+                    "http://shelfarr",
+                    "shf_secret",
+                    session=FakeSession([FakeResponse(json_value=page(count))]),
+                )
+                with self.assertRaises(SubmissionUncertain):
+                    client.recover_request(42)
+            with self.subTest(kind="work", count=count):
+                client = ShelfarrClient(
+                    "http://shelfarr",
+                    "shf_secret",
+                    session=FakeSession([FakeResponse(json_value=page(count))]),
+                )
+                with self.assertRaises(SubmissionUncertain):
+                    client._find_existing_work_request(
+                        {"openlibrary:NOT-IN-PAGE"}, "ebook"
+                    )
+
+        client = ShelfarrClient(
+            "http://shelfarr",
+            "shf_secret",
+            session=FakeSession(
+                [FakeResponse(json_value=page(100, include_correlation=True))]
+            ),
+        )
+        self.assertEqual(client.recover_request(42)["id"], 100)
 
     def test_completed_evaluation_work_is_reused_by_new_huey_request(self):
         completed = self.request_payload(

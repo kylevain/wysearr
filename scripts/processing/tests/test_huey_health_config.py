@@ -8,7 +8,7 @@ from contextlib import closing
 from pathlib import Path
 
 from bookbot_lib.config import BookBotConfig
-from bookbot_lib.errors import ConfigurationError
+from bookbot_lib.errors import ConfigurationError, MetadataCorrelationError
 from bookbot_lib.health import check_health_marker, write_health_marker
 from bookbot_lib.huey import HueyUpdater
 
@@ -27,8 +27,14 @@ class HueyUpdaterTests(unittest.TestCase):
                 CREATE TABLE requests (
                     id INTEGER PRIMARY KEY,
                     status TEXT NOT NULL,
+                    media_type TEXT,
+                    service TEXT,
+                    title TEXT,
+                    author TEXT,
                     torrent_hash TEXT,
                     external_id TEXT,
+                    external_status TEXT,
+                    canonical_request_id INTEGER,
                     library_path TEXT,
                     error_message TEXT,
                     updated_at TEXT
@@ -70,7 +76,7 @@ class HueyUpdaterTests(unittest.TestCase):
 
     def test_failure_by_huey_tag_records_error_and_event(self) -> None:
         updater = HueyUpdater(self.database)
-        self.assertTrue(updater.failed(HASH, "unsupported payload", "huey:42"))
+        self.assertTrue(updater.failed(HASH, "unsupported payload", "huey-42"))
         raw_connection = sqlite3.connect(self.database)
         with closing(raw_connection) as connection, connection:
             request = connection.execute(
@@ -83,7 +89,7 @@ class HueyUpdaterTests(unittest.TestCase):
         self.assertEqual("failed", event[0])
         self.assertIn("unsupported payload", event[1])
 
-    def test_completion_updates_all_tags_and_matching_hash_requests(self) -> None:
+    def test_completion_updates_only_the_exact_tagged_hash_owner(self) -> None:
         raw_connection = sqlite3.connect(self.database)
         with closing(raw_connection) as connection, connection:
             connection.execute(
@@ -97,7 +103,7 @@ class HueyUpdaterTests(unittest.TestCase):
         destination = Path("/media/ebooks/Books/Shared")
         self.assertTrue(
             HueyUpdater(self.database).complete(
-                HASH, destination, "huey-42, huey-45"
+                HASH, destination, "huey-42"
             )
         )
         raw_connection = sqlite3.connect(self.database)
@@ -108,8 +114,11 @@ class HueyUpdaterTests(unittest.TestCase):
             event_ids = connection.execute(
                 "SELECT request_id FROM events WHERE event_type='completed' ORDER BY request_id"
             ).fetchall()
-        self.assertEqual(rows, [(42, "complete"), (44, "complete"), (45, "complete")])
-        self.assertEqual(event_ids, [(42,), (44,), (45,)])
+        self.assertEqual(
+            rows,
+            [(42, "complete"), (44, "downloading"), (45, "downloading")],
+        )
+        self.assertEqual(event_ids, [(42,)])
 
     def test_mismatched_tag_and_terminal_request_are_not_overwritten(self) -> None:
         raw_connection = sqlite3.connect(self.database)
@@ -122,7 +131,7 @@ class HueyUpdaterTests(unittest.TestCase):
                 "INSERT INTO requests (id, status, torrent_hash, external_id) VALUES (47, 'failed', ?, ?)",
                 (HASH, HASH),
             )
-        self.assertTrue(
+        self.assertFalse(
             HueyUpdater(self.database).complete(
                 HASH, Path("/media/ebooks/Books/Shared"), "huey-46,huey-47"
             )
@@ -136,12 +145,203 @@ class HueyUpdaterTests(unittest.TestCase):
 
     def test_missing_or_incompatible_database_is_non_blocking(self) -> None:
         self.assertFalse(HueyUpdater(None).complete(HASH, Path("/media/book")))
+        self.assertIsNone(
+            HueyUpdater(None).abba_audiobook_metadata(HASH, "huey-42")
+        )
         incompatible = Path(self.temporary.name) / "incompatible.db"
         sqlite3.connect(incompatible).close()
         self.assertFalse(
             HueyUpdater(incompatible).failed(HASH, "failed", "huey-42")
         )
+        self.assertIsNone(
+            HueyUpdater(incompatible).abba_audiobook_metadata(HASH, "huey-42")
+        )
 
+    def test_abba_metadata_requires_exact_huey_tag_and_hash_binding(self) -> None:
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            connection.execute(
+                """
+                UPDATE requests
+                SET media_type='audiobooks', service='abba',
+                    title=?, author=?, status='queued', external_id=?,
+                    external_status='downloading'
+                WHERE id=42
+                """,
+                ("Tourist Season", "Brynne Weaver", HASH),
+            )
+
+        updater = HueyUpdater(self.database)
+        metadata = updater.abba_audiobook_metadata(HASH, "other,huey-42")
+        assert metadata is not None
+        self.assertEqual("Tourist Season", metadata.title)
+        self.assertEqual("Brynne Weaver", metadata.author)
+        self.assertIsNone(updater.abba_audiobook_metadata(HASH, "huey-43"))
+        with self.assertRaises(MetadataCorrelationError):
+            updater.abba_audiobook_metadata("b" * 40, "huey-42")
+
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            connection.execute("UPDATE requests SET author=NULL WHERE id=42")
+        without_author = updater.abba_audiobook_metadata(HASH, "huey-42")
+        assert without_author is not None
+        self.assertIsNone(without_author.author)
+
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            connection.execute(
+                "UPDATE requests SET service='shelfarr' WHERE id=42"
+            )
+        self.assertIsNone(updater.abba_audiobook_metadata(HASH, "huey-42"))
+
+    def test_abba_metadata_fails_closed_for_multiple_matching_rows(self) -> None:
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            connection.execute(
+                """
+                UPDATE requests
+                SET media_type='audiobooks', service='abba',
+                    title='First', author='Author One', status='queued',
+                    external_id=?, external_status='downloading'
+                WHERE id=42
+                """,
+                (HASH,),
+            )
+            connection.execute(
+                """
+                INSERT INTO requests (
+                    id, status, media_type, service, title, author, external_id
+                ) VALUES (
+                    44, 'downloading', 'audiobooks', 'abba',
+                    'Second', 'Author Two', ?
+                )
+                """,
+                (HASH,),
+            )
+
+        updater = HueyUpdater(self.database)
+        single = updater.abba_audiobook_metadata(HASH, "huey-42")
+        assert single is not None
+        self.assertEqual("First", single.title)
+        with self.assertRaises(MetadataCorrelationError):
+            updater.abba_audiobook_metadata(HASH, "huey-42,huey-44")
+
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            connection.execute(
+                "UPDATE requests SET external_id=? WHERE id=44", ("b" * 40,)
+            )
+        with self.assertRaises(MetadataCorrelationError):
+            updater.abba_audiobook_metadata(HASH, "huey-42,huey-44")
+
+    def test_abba_alias_tags_converge_on_one_exact_owner(self) -> None:
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            connection.execute(
+                """
+                UPDATE requests
+                SET media_type='audiobooks', service='abba', status='downloading',
+                    title='Canonical', author='Author', external_id=?,
+                    external_status='downloading'
+                WHERE id=42
+                """,
+                (HASH,),
+            )
+            connection.execute(
+                """
+                INSERT INTO requests (
+                    id, status, media_type, service, title, author, external_id,
+                    external_status, canonical_request_id
+                ) VALUES (
+                    44, 'failed', 'audiobooks', 'abba', 'Duplicate', 'Author', ?,
+                    'canonical_duplicate', 42
+                )
+                """,
+                (HASH,),
+            )
+
+        updater = HueyUpdater(self.database)
+        metadata = updater.abba_audiobook_metadata(
+            HASH, "huey-42,huey-44"
+        )
+        assert metadata is not None
+        self.assertEqual(metadata.title, "Canonical")
+        self.assertTrue(
+            updater.complete(
+                HASH,
+                Path("/media/audiobooks/Canonical"),
+                "huey-42,huey-44",
+            )
+        )
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            rows = connection.execute(
+                "SELECT id, status FROM requests WHERE id IN (42,44) ORDER BY id"
+            ).fetchall()
+        self.assertEqual(rows, [(42, "complete"), (44, "failed")])
+
+    def test_abba_metadata_rejects_any_unrelated_or_missing_huey_tag(self) -> None:
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            connection.execute(
+                """
+                UPDATE requests
+                SET media_type='audiobooks', service='abba', status='queued',
+                    title='Canonical', author='Author', external_id=?,
+                    external_status='queued'
+                WHERE id=42
+                """,
+                (HASH,),
+            )
+            connection.execute(
+                """
+                INSERT INTO requests (
+                    id, status, media_type, service, title, external_id,
+                    external_status
+                ) VALUES (
+                    44, 'queued', 'audiobooks', 'qbittorrent', 'Unrelated', ?,
+                    'queued'
+                )
+                """,
+                (HASH,),
+            )
+
+        updater = HueyUpdater(self.database)
+        for tags in ("huey-42,huey-44", "huey-42,huey-99"):
+            with self.subTest(tags=tags):
+                with self.assertRaises(MetadataCorrelationError):
+                    updater.abba_audiobook_metadata(HASH, tags)
+                self.assertFalse(
+                    updater.complete(HASH, Path("/media/audiobooks/Book"), tags)
+                )
+
+    def test_huey_tag_grammar_rejects_leading_zero_and_oversized_ids(self) -> None:
+        updater = HueyUpdater(self.database)
+        self.assertEqual(
+            (9_223_372_036_854_775_807,),
+            updater._request_ids_from_tags("huey-9223372036854775807"),
+        )
+        for tags in (
+            "huey-042",
+            "HUEY-42",
+            "huey:42",
+            "huey:9223372036854775808",
+            "huey:9999999999999999999",
+            "huey:12345678901234567890",
+        ):
+            with self.subTest(tags=tags):
+                with self.assertRaises(MetadataCorrelationError):
+                    updater.abba_audiobook_metadata(HASH, tags)
+                self.assertFalse(
+                    updater.complete(HASH, Path("/media/audiobooks/Book"), tags)
+                )
+
+        self.assertIsNone(updater.abba_audiobook_metadata(HASH, "not huey-42"))
+        self.assertFalse(
+            updater.complete(
+                HASH, Path("/media/audiobooks/Book"), "not huey-42"
+            )
+        )
 
 class HealthTests(unittest.TestCase):
     def test_marker_is_atomic_parseable_and_age_checked(self) -> None:

@@ -6,10 +6,13 @@
 its local SSD under `/home/wyseadmin/homelab/state/torrents`. Permanent media
 lives on the Pi-SSD/DAS CIFS share mounted at `/mnt/media`.
 
-qBittorrent intentionally has no DAS mount. ARR services, BookBot, and the
-feature-gated Shelfarr evaluator can read local downloads and write their DAS
-destinations. This keeps active torrent I/O and disposable payloads off
-permanent storage.
+qBittorrent intentionally has no DAS mount. ARR services and BookBot can read
+local downloads and write their DAS destinations; retained Shelfarr can do so
+only for ebooks. LazyLibrarian and ABBA have neither a download-payload mount
+nor a DAS mount: they can submit only their exact ebook or audiobook handoff
+through qBittorrent's private API. This keeps active torrent I/O and disposable
+payloads off permanent storage. BookBot finalizes LazyLibrarian ebooks and ABBA
+audiobooks; Shelfarr retains its separate ebook finalizer for fallback jobs.
 
 ## Managed media flow
 
@@ -41,23 +44,70 @@ routine subtitle activity.
 Discord request channel
         v
 Huey: parse -> deduplicate -> persist -> deterministic handler
-        |                |                         |
-        | movies/tv      | ebooks/audiobooks       | comics/ROMs/sheet music
-        v                v                         v
-Sonarr or Radarr   Shelfarr API             Prowlarr + qBittorrent
-        |          direct/SAB/qBittorrent           |
-        |                |                       BookBot
-        |                v                          |
-        +--------> confirmed DAS import <-----------+
-                         |
-                Huey lifecycle router
+        |               |                                |
+        | movies/tv     | ebooks                         | audiobooks / direct media
+        v               v                                v
+Sonarr or Radarr   LazyLibrarian primary             ABBA or Prowlarr
+                   | accepted       | safe pre-mutation   |
+                   v                | miss/failure         v
+            qBit category ebooks    v                  BookBot
+                   |          Shelfarr secondary          |
+                BookBot             |                     |
+                   |         qBit category shelfarr       |
+                   |                |                     |
+                   |        Shelfarr finalizer            |
+                   |                |                     |
+                   +-------- confirmed DAS import --------+
+                                    |
+                        Huey lifecycle router
 ```
 
-The Shelfarr branch exists only while `SHELFARR_ENABLED=true`. Shelfarr owns
-book finalization directly; BookBot does not process its isolated `shelfarr`
-download category. When the flag is false, ebook/audiobook handlers return to
-the preserved Prowlarr/qBittorrent/BookBot branch. Movies and TV never depend on
-Shelfarr.
+`EBOOK_ACQUISITION_BACKENDS=lazylibrarian,shelfarr` is the authoritative and
+only validated production order. Huey tries the backends serially for one
+durable ebook request; Shelfarr is never tried first or in parallel. After
+resolving one work identity, Huey uses deterministic, read-only Prowlarr
+searches restricted to ebook category `7020` before allowing the
+LazyLibrarian attempt to mutate its wanted list. A supplied author is a hard
+identity and release gate: all normalized author tokens must occur in the
+metadata candidate's author and in the release title, in addition to the
+normal title score and ebook-format/media checks. Only a metadata miss, zero
+plausible `7020` ebook releases, an administratively disabled primary, or
+another service failure still proven to be before the durable mutation marker
+may advance the same request and selected identity to Shelfarr. Any plausible
+result keeps LazyLibrarian primary. Once Huey writes that marker, a timeout,
+transport failure, raw API `OK` plus missing history, or any other uncertain
+outcome must reconcile or quarantine and never authorizes fallback. The
+deprecated `EBOOK_ACQUISITION_OWNER=lazylibrarian` remains only as a
+compatibility primary assertion and must match the first backend. Validation
+rejects blank, unknown, noncanonical, duplicate, reversed, disabled, or
+uncredentialed production backends. At runtime an administratively false
+feature flag is a pre-mutation unavailable attempt and may advance to the next
+configured backend; deployment/validation still reports that degraded policy
+as not ready.
+
+LazyLibrarian owns work discovery and provider acquisition on the primary path,
+Prowlarr supplies ebook-only Torznab providers, qBittorrent uses category
+`ebooks`, and BookBot alone imports that payload. Shelfarr is the secondary
+backend: it uses its isolated `shelfarr` category and its own proven finalizer;
+BookBot never finalizes a Shelfarr job. The backends never acquire in parallel.
+The old direct ebook handler remains only as a non-production compatibility
+route when `EBOOK_ACQUISITION_BACKENDS` is absent and the legacy owner explicitly
+selects `direct`; it is not a cascade member.
+`ABBA_ENABLED=true` independently makes the private ABBA service the sole
+discovery/submission owner for new audiobook requests, while BookBot remains
+the audiobook importer and retention owner. An enabled ABBA failure never
+falls through to direct acquisition. After in-flight work is drained, setting
+the flag to `false` restores the preserved Prowlarr/qBittorrent/BookBot route
+for new audiobooks, independent of `SHELFARR_ENABLED`. The former Shelfarr
+audiobook route is available only by a deliberate full code-and-state rollback,
+not by feature-flag fallback. Movies and TV never depend on either feature.
+
+Huey has no Compose startup dependency on optional ABBA, LazyLibrarian,
+Shelfarr, or SABnzbd. Deployment health-gates each optional service enabled by
+the active policy before reopening intake, while a later optional outage cannot
+prevent unrelated request channels from starting or operating. An ebook outage
+may advance only under the safe serial pre-mutation rules above; an enabled but
+unavailable ABBA service does not silently become the direct audiobook route.
 
 Huey stores request and event state in `state/huey/huey.db`. Discord
 `message_id` plus durable delivery aliases make gateway redelivery idempotent.
@@ -66,25 +116,74 @@ when media type, movie/TV kind, case/space-normalized title, and normalized
 author match an active or completed request exactly. Punctuation, accents, year,
 edition, platform, and format remain significant; failed and `needs_selection`
 requests remain retryable.
+
+Each ebook request has one row in `ebook_cascades`: immutable `policy_json`,
+`current_ordinal`, shared work identity/fingerprint, request-wide
+`mutation_backend`, and the proven `final_backend`/`finalizer`. Ordered rows in
+`ebook_backend_attempts` retain each backend's status, local identity, external
+correlation, mutation timestamps, and outcome. `ebook_backend_reservations`
+uniquely binds backend-local identities across active/successful requests. The
+active identity and resume indexes make restart recovery select the current
+attempt without repeating an earlier mutation.
+
 Historical active/completed requests receive the same key during migration but
 are never replayed or silently merged. Titles are never silently guessed. When
-Shelfarr owns an ebook/audiobook request and metadata has two or three close,
-safe matches, Huey reserves the exact target in `awaiting_selection` and replies
-with at most three numbered candidates. Only the original requester may reply
-directly to that persisted Huey prompt, in the same request channel, with one
-strict whole-number choice. The default confirmation lifetime is 15 minutes
+an ebook request or ABBA audiobook request has two or three close safe metadata
+matches, Huey reserves the exact target in
+`awaiting_selection` and replies with at most three numbered candidates. Only
+the original requester may use Discord's Reply action on that persisted Huey
+prompt, in the same request channel, with one strict whole-number choice. The
+resulting Discord message must reference the exact persisted prompt ID; a nearby
+standalone number is deliberately rejected. The default confirmation lifetime is 15 minutes
 (`HUEY_SELECTION_TTL_SECONDS=900`); expiry releases the target and stages one
 request-status rejection. Legacy parse failures, no-result/low-confidence
-matches, and every non-Shelfarr `needs_selection` result remain terminal and are
+matches, and every non-book `needs_selection` result remain terminal and are
 not resumable.
 
-Candidate confirmation selects metadata, not an acquisition release. Huey
-persists a bounded Shelfarr search snapshot, freshly searches and verifies the
-same fingerprint after confirmation, then creates the Shelfarr request with the
-original Huey request ID and `huey:<id>` correlation. It does not call
-Shelfarr's `/grab` endpoint. No accepted/download lifecycle event is emitted
-until that request creation succeeds. Movies/TV and every direct-media handler
-remain on their existing paths.
+For ebooks, candidate confirmation selects one catalog work rather than an
+acquisition release. Huey applies the persisted source, work identifier,
+title/author metadata, and fingerprint to every backend attempt; it never asks
+the user to resolve the same identity twice. For LazyLibrarian it persists the
+exact `BookID`, adds/verifies that work, queues an ebook-only search, and treats the API's raw
+`OK` only as command acceptance—not as a successful grab. It then binds the
+exact active `getHistory` row to qBittorrent's live hash, save path
+`/downloads/ebooks`, and the `ebooks` handoff (or an already BookBot-transitioned
+`ebooks-imported` job). An imported-category race remains nonterminal until
+BookBot revalidates its ledger/destination and reports completion. For
+audiobooks, Huey uses ABBA's bounded JSON
+search result, freshly verifies the selected result before calling `/api/grab`,
+persists correlation, and then follows `/api/status/<hash>` through the exact
+qBittorrent job. ABBA's `/health` checks only local database and qBittorrent
+readiness; health validation never searches AudioBookBay. No accepted/download
+lifecycle event is emitted until the selected backend has accepted the request.
+
+The private ABBA contract is `POST /api/search`, `POST /api/grab`, and
+`GET /api/status/<40-character-hash>` (with correlation lookup available at
+`GET /api/status?correlation_id=...`). Huey sends a title plus optional author,
+keeps the returned opaque candidate ID/fingerprint bound to its durable Discord
+confirmation, and never consumes ABBA's HTML UI. ABBA persists only sanitized
+candidate/correlation state and never returns magnet links or credentials to
+Discord.
+
+ABBA and Huey enforce acquisition ownership independently in their own SQLite
+ledgers. Each durably reserves both the opaque ABBA candidate ID and the resolved
+lowercase v1 hash, so loss, delay, or restart on one side cannot authorize a
+second submission on the other. A second request for the same candidate, or a
+different candidate that resolves to the same hash, becomes an inert alias of
+the one canonical request: its original Discord message and any claimed Reply
+selection resolve to that owner, pending duplicate lifecycle delivery is
+discarded, and no second grab is submitted. One candidate resolving to a
+different hash is not a safe alias and is quarantined as an identity conflict.
+Self-aliases, missing owners, alias chains/cycles, and mismatched candidate/hash
+owners fail closed.
+
+Restart migration elects the same deterministic canonical owner in both
+ledgers and preserves post-mutation failed/uncertain ownership. A failure proven
+to precede mutation may release its adapter reservation and remain retryable;
+it is never backfilled into a permanent hash owner merely because an old row
+contains a resolved hash. Recovery uses only the exact persisted candidate and
+hash. It may attach to a proven canonical owner, but it never replays a
+different candidate or turns a candidate/hash conflict into an alias.
 
 An existing ARR entity is read before mutation. Imported media returns an
 already-imported result; a monitored item starts no duplicate search; an
@@ -101,8 +200,19 @@ format/size hints are shown; provider IDs, URLs, hashes, and credentials are
 never included. Poor or low-confidence metadata retains the generic refinement
 response.
 
-BookBot-owned qBittorrent jobs carry a `huey-<request-id>` tag so BookBot can reconcile
-the terminal import with the original request. Huey records delivery per logical
+Direct and ABBA BookBot-owned qBittorrent jobs use exact lowercase
+`huey-<positive-decimal-request-id>` correlation tags in qBittorrent's
+comma-delimited tag field. A Huey token is valid only as a complete comma-bounded
+token; uppercase, `huey:`, whitespace-delimited, partial, zero, negative, and
+out-of-SQLite-range lookalikes are not accepted. Other ordinary qBittorrent tags
+may coexist. If more than one valid Huey tag is present on an ABBA job, BookBot
+continues only when every tag and stored hash resolves to the same root canonical
+ABBA audiobook owner; an unknown, mixed-media, chained, or conflicting owner
+fails closed before copy or lifecycle mutation.
+LazyLibrarian-created ebook jobs instead bind their exact qBittorrent hash into
+Huey's durable external ID; BookBot's case-insensitive hash reconciliation maps
+that terminal import without requiring LazyLibrarian to synthesize a tag. Huey
+records delivery per logical
 event and destination. Discord itself does not provide an atomic exactly-once
 send transaction, so a route is marked delivered only after its send succeeds.
 
@@ -124,12 +234,20 @@ the sole Discord producer; native Discord delivery in Radarr, Sonarr, Lidarr, an
 Bazarr stays disabled to prevent bypasses and duplicates. Lidarr music and
 Whisparr adult-media requests remain Web-UI-only.
 
+Every requester-facing acknowledgement, candidate prompt, accepted/queued/
+download state, uncertainty notice, completion, rejection, and failure uses
+backend-neutral language. LazyLibrarian, Shelfarr, ABBA, Prowlarr, qBittorrent,
+and BookBot names are reserved for operator logs and service/runtime health
+diagnostics; a backend transition never exposes a second user-visible request
+or prompt.
+
 An ARR terminal completion currently means Sonarr or Radarr reports imported
 media on the DAS; Huey does not yet trigger or confirm a Plex scan, so the
 matching Plex library must be scanned manually until that integration is
-authorized. A Shelfarr book completion proves Shelfarr's final DAS publication;
-a BookBot completion proves its validated atomic copy. None of those boundaries
-proves that a downstream playback or catalog application has indexed the item.
+authorized. A LazyLibrarian ebook and an ABBA audiobook do not complete until
+BookBot proves the validated atomic copy; a Shelfarr fallback completion proves
+Shelfarr's final DAS publication. None of those boundaries
+prove that a downstream playback or catalog application has indexed the item.
 
 BookBot-owned direct acquisition accepts only payloads whose BitTorrent v1 identity can be
 derived and cross-checked from the magnet or exact torrent metadata. Pure v2
@@ -141,12 +259,35 @@ normalizes names, copies through a temporary file with an atomic final rename,
 and records completed imports in its SQLite ledger. Existing conflicting files
 are preserved in `/media/duplicates/<type>` rather than overwritten.
 
+For a fresh ABBA audiobook import, BookBot trusts Huey's request metadata only
+when every exact Huey tag resolves to one root ABBA audiobook owner whose stored
+hash exactly matches the job's v1 hash. A normal job has one tag; multiple tags
+are accepted only for safe aliases that converge on that same owner. No valid
+Huey correlation leaves the existing source-derived direct-import behavior
+unchanged, while malformed, unknown, mixed, chained, or conflicting correlation
+fails closed before copying. A trusted match makes the sanitized request title
+the single directory component directly below `/media/audiobooks`, regardless
+of the release payload's name. Slashes, traversal-like text, reserved
+characters, whitespace, and length remain subject to BookBot's normal component
+sanitizer.
+
+During that same atomic import, BookBot stages an XML-escaped `metadata.opf` with
+the trusted title, BitTorrent identifier, and optional request author. It never
+overwrites metadata supplied by the release: if any source `.opf` or `.nfo`
+exists, that sidecar is copied byte-for-byte and no generated OPF is added. The
+production Audiobookshelf library gives `folderStructure` first metadata
+precedence, so the trusted one-level folder is the authoritative title boundary;
+the OPF supplies compatible structured metadata without weakening it. Direct
+fallback audiobooks and every non-audiobook category retain their existing
+source-derived layout and sidecar behavior. Reconciliation of an already imported
+item never renames its directory or retrofits metadata.
+
 Direct destinations are:
 
 | Request type | DAS destination |
 | --- | --- |
-| ebooks | `/media/ebooks/Books` (Shelfarr during evaluation; otherwise BookBot) |
-| audiobooks | `/media/audiobooks` (Shelfarr during evaluation; otherwise BookBot) |
+| ebooks | `/media/ebooks/Books` (BookBot for the LazyLibrarian primary path; Shelfarr's own finalizer for fallback) |
+| audiobooks | `/media/audiobooks/<sanitized-request-title>` for a newly correlated ABBA import; otherwise BookBot's source-derived one-level folder |
 | manga/comics | `/media/ebooks/Comics` |
 | roms | `/media/roms` |
 | sheet-music | `/media/sheetmusic` |
@@ -154,16 +295,21 @@ Direct destinations are:
 ## Lifecycle and safety
 
 Every ARR/BookBot-owned qBittorrent media category has a base and `-imported`
-category. The isolated `shelfarr` category is owned and finalized by Shelfarr
-and deliberately has no BookBot `-imported` peer. Payloads
+category. LazyLibrarian may submit only category `ebooks` with save path
+`/downloads/ebooks`; ABBA may submit only category `audiobooks` with save path
+`/downloads/audiobooks`. BookBot changes a successfully imported job to the
+matching `-imported` category, which shares that save path. The isolated `shelfarr`
+category is ebook-only, owned and finalized by Shelfarr, and deliberately has no
+BookBot `-imported` peer. Payloads
 remain in the base category when acquisition or import fails. Only a successful
 ARR/BookBot import moves a job to `-imported`; BookBot may delete that job and
 its local payload after the configured 14-day retention interval. This makes a
 failed import fail safe and preserves seeding after a successful import.
 
 Shelfarr uses a private local nested staging mount for Project Gutenberg ebook
-downloads before publishing to the CIFS DAS. Direct LibriVox audiobooks are
-disabled because Shelfarr requires atomic same-filesystem directory publication.
+downloads before publishing to the CIFS DAS. Its old audiobook output setting
+may remain in historical state, but the container has no `/audiobooks` mount and
+Huey never sends it new audiobook requests.
 The enabled-Usenet source preference is direct, then Usenet, then torrent;
 when disabled it is direct, then torrent and Shelfarr's SAB client is off.
 Usenet is fail-closed behind `WYSEARR_USENET_ENABLED`: the repository manages one
@@ -174,9 +320,33 @@ available to those applications and to Shelfarr fallback. No NNTP provider or
 book Newznab credentials were available for the initial or 2026-08-12 Usenet
 preflight, so this branch remains disabled and unproven end to end.
 
+LazyLibrarian is pinned to one LinuxServer manifest digest, binds its management
+port to host loopback only, and persists only `config/lazylibrarian`. Its
+postprocessor, search-on-add, scheduled searches, native final-library paths,
+non-qBittorrent downloaders, built-in providers, telemetry, and automatic
+updates are disabled. Prowlarr tags only enabled torrent indexers whose
+advertised capabilities explicitly include ebook category `7020` and whose
+retained indexer status has no failure; its LazyLibrarian application full-syncs
+the one-element category list `[7020]`. LazyLibrarian receives exactly those
+tagged indexers as Torznab providers. Each active provider is converged to
+`BOOKCAT=7020`, `DLTYPES=E`, and `MANUAL=1`.
+
+The pinned LazyLibrarian provider API refreshes capabilities while applying a
+change and may repopulate canonical `AUDIOCAT`, `MAGCAT`, or `COMICCAT` metadata.
+Those fields are deliberately dormant: with `DLTYPES=E`, the pinned search
+dispatcher rejects audiobook, magazine, and comic work before consulting their
+categories. `MANUAL=1` prevents LazyLibrarian's unrelated background provider
+refreshes. Prowlarr's scheduled six-hour full sync may refresh capability
+metadata, but cannot change `DLTYPES` or `MANUAL`; convergence and validation
+require `BOOKCAT` to return to exactly `7020`. Usenet, built-in, failed,
+non-`7020`, and rival-provider lanes remain disabled or untagged.
+
 All containers use bind-mounted persistence, `restart: unless-stopped`, bounded
 JSON logs, and Docker healthchecks. Official images and Python build bases are
-pinned by digest. Huey and BookBot run as UID/GID 1000 rather than root.
+pinned by digest. Huey, BookBot, and ABBA run as UID/GID 1000 rather than root.
+ABBA has a read-only root filesystem, drops every Linux capability, applies
+`no-new-privileges`, uses a bounded `/tmp` tmpfs, persists only
+`config/abba/abba.db`, and publishes no host port.
 
 The CIFS share is mounted by the host with `_netdev`, `nofail`, and systemd
 automount semantics. Deployment refuses to start unless `/mnt/media` is the
@@ -193,15 +363,25 @@ and live service state are not committed:
 - `backups/<timestamp>` and matching deployment checkpoint pairs contain private
   runtime rollback metadata.
 
-`scripts/backup.py` makes an integrity-checked copy of each SQLite database and
+`scripts/backup.py` makes an integrity-checked copy of each SQLite database,
+including ABBA's correlation ledger and LazyLibrarian's database discovered
+under their private config trees, and
 writes a hash manifest. It also captures a bounded, file-stable snapshot of
 qBittorrent's `BT_backup` resume metadata. That resume snapshot is only
 cross-file exact when qBittorrent is stopped.
 
-Checkpoints deliberately exclude `state/torrents` payloads and all `/mnt/media`
-library content. Git plus a compatible checkpoint can recover the service
-control plane and request history; the DAS library, CIFS credential, local Git
-history, and any irreplaceable active payloads require independent protection.
+The manifest records the exact Git HEAD and `git_dirty` provenance. A checkpoint
+with `git_dirty=true` is useful state evidence but cannot identify an exact code
+generation. The release rollback point must be created after the acquisition
+commit from a clean worktree, verified, and show that commit as `git_head` with
+`git_dirty=false`; a dirty `post-deploy-*` name does not satisfy this rule.
+
+Checkpoints deliberately exclude `state/torrents/**` payloads,
+`state/shelfarr-staging/**` direct-download staging, all `/mnt/media/**` library
+content, and service `logs.db` diagnostic databases. Git plus a compatible
+checkpoint can recover the service control plane and request history; the DAS
+library, CIFS credential, local Git history, and any irreplaceable active
+payloads require independent protection.
 A downgraded image must never be started against newer persisted state: restore
 the matching database generation, with its owning service stopped, before
 starting the older image.

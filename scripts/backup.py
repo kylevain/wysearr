@@ -23,11 +23,20 @@ MAX_QBITTORRENT_RESUME_FILES = 20_000
 MAX_QBITTORRENT_RESUME_FILE_BYTES = 32 * 1024 * 1024
 MAX_QBITTORRENT_RESUME_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_ENV_BYTES = 1024 * 1024
 SHELFARR_STORAGE_RELATIVE = Path("config/shelfarr")
 MAX_SHELFARR_STORAGE_FILES = 100_000
 MAX_SHELFARR_STORAGE_FILE_BYTES = 8 * 1024 * 1024 * 1024
 MAX_SHELFARR_STORAGE_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
+LAZYLIBRARIAN_CONFIG_RELATIVE = Path("config/lazylibrarian/config.ini")
+MAX_LAZYLIBRARIAN_CONFIG_BYTES = 16 * 1024 * 1024
 SQLITE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
+EXCLUDED_SQLITE_NAMES = frozenset({"logs.db"})
+EXCLUDED_PAYLOAD_ROOTS = (
+    Path("state/torrents"),
+    Path("state/shelfarr-staging"),
+)
+EPHEMERAL_ENV_KEYS = frozenset({b"AUDIOBOOKSHELF_API_TOKEN"})
 
 
 def private_mkdir(path: Path, *, anchor: Path = BACKUP_ROOT) -> None:
@@ -64,6 +73,73 @@ def sqlite_backup(source: Path, destination: Path, *, anchor: Path = BACKUP_ROOT
 def copy_private(source: Path, destination: Path, *, anchor: Path = BACKUP_ROOT) -> None:
     private_mkdir(destination.parent, anchor=anchor)
     shutil.copy2(source, destination)
+    destination.chmod(0o600)
+
+
+def sanitize_env_bytes(value: bytes) -> bytes:
+    """Remove validation-only credentials that must not persist in checkpoints."""
+
+    kept: list[bytes] = []
+    for line in value.splitlines(keepends=True):
+        name = line.partition(b"=")[0].strip()
+        if name.startswith(b"export "):
+            name = name.removeprefix(b"export ").strip()
+        if name not in EPHEMERAL_ENV_KEYS:
+            kept.append(line)
+    return b"".join(kept)
+
+
+def copy_private_env(
+    source: Path,
+    destination: Path,
+    *,
+    anchor: Path = BACKUP_ROOT,
+) -> None:
+    """Copy a stable dotenv file while excluding validation-only credentials."""
+
+    private_mkdir(destination.parent, anchor=anchor)
+    before = source.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"checkpoint environment source is not a regular file: {source}")
+    if before.st_size > MAX_ENV_BYTES:
+        raise RuntimeError(f"checkpoint environment source exceeds its size limit: {source}")
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    destination_created = False
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (before.st_dev, before.st_ino):
+            raise RuntimeError(
+                f"checkpoint environment source changed before it was read: {source}"
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            value = stream.read(MAX_ENV_BYTES + 1)
+        after = os.fstat(descriptor)
+        if len(value) > MAX_ENV_BYTES:
+            raise RuntimeError(
+                f"checkpoint environment source exceeds its size limit: {source}"
+            )
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(opened, field) != getattr(after, field) for field in stable_fields):
+            raise RuntimeError(
+                f"checkpoint environment source changed while it was read: {source}"
+            )
+        with destination.open("xb") as output:
+            destination_created = True
+            output.write(sanitize_env_bytes(value))
+            output.flush()
+            os.fsync(output.fileno())
+    except Exception:
+        if destination_created:
+            destination.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(descriptor)
+
     destination.chmod(0o600)
 
 
@@ -201,6 +277,8 @@ def copy_shelfarr_storage(
             raise RuntimeError(
                 f"Shelfarr storage contains an unsupported file type: {source}"
             )
+        if source.name.casefold() in EXCLUDED_SQLITE_NAMES:
+            continue
         # SQLite files are copied transactionally by sqlite_backup(). Their
         # live journal sidecars must never be copied independently.
         if source in sqlite_sources:
@@ -239,6 +317,27 @@ def git_head() -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def git_dirty() -> bool | None:
+    """Record whether a checkpoint came from an uncommitted code generation."""
+
+    result = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=STACK_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return bool(result.stdout) if result.returncode == 0 else None
+
+
+def _is_payload_path(source: Path) -> bool:
+    relative = source.relative_to(STACK_ROOT)
+    return any(
+        relative == root or root in relative.parents
+        for root in EXCLUDED_PAYLOAD_ROOTS
+    )
+
+
 def create_backup(output: Path) -> dict[str, object]:
     if output.exists():
         raise FileExistsError(output)
@@ -253,6 +352,8 @@ def create_backup(output: Path) -> dict[str, object]:
         for root in (STACK_ROOT / "config", STACK_ROOT / "state")
         for source in root.glob("**/*")
         if source.suffix.casefold() in SQLITE_SUFFIXES
+        and source.name.casefold() not in EXCLUDED_SQLITE_NAMES
+        and not _is_payload_path(source)
     }
     linked_databases = sorted(
         source for source in sqlite_candidates if source.is_symlink()
@@ -281,6 +382,7 @@ def create_backup(output: Path) -> dict[str, object]:
         "config/qbittorrent/qBittorrent/watched_folders.json",
         "config/sabnzbd/sabnzbd.ini",
         "config/sabnzbd/admin/*.sab",
+        str(LAZYLIBRARIAN_CONFIG_RELATIVE),
     )
     seen: set[Path] = set()
     for pattern in config_patterns:
@@ -290,7 +392,17 @@ def create_backup(output: Path) -> dict[str, object]:
             seen.add(source)
             relative = source.relative_to(STACK_ROOT)
             destination = output / relative
-            copy_private(source, destination, anchor=output)
+            if relative == Path(".env"):
+                copy_private_env(source, destination, anchor=output)
+            elif relative == LAZYLIBRARIAN_CONFIG_RELATIVE:
+                copy_stable_bounded_private(
+                    source,
+                    destination,
+                    maximum_bytes=MAX_LAZYLIBRARIAN_CONFIG_BYTES,
+                    anchor=output,
+                )
+            else:
+                copy_private(source, destination, anchor=output)
             copied.append({"path": str(relative), "sha256": sha256(destination)})
 
     copy_shelfarr_storage(
@@ -305,16 +417,23 @@ def create_backup(output: Path) -> dict[str, object]:
         "format_version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "git_head": git_head(),
+        "git_dirty": git_dirty(),
         "boundary": {
-            "includes": "selected configuration, SQLite-safe databases, complete bounded Shelfarr storage, and bounded qBittorrent resume metadata",
+            "includes": "selected configuration including LazyLibrarian config.ini, SQLite-safe databases, complete bounded Shelfarr storage, and bounded qBittorrent resume metadata",
             "excludes": [
                 "state/torrents/** download payloads",
                 "state/shelfarr-staging/** direct-download staging payloads",
                 "/mnt/media/** library media",
+                "service logs.db diagnostic databases",
             ],
             "shelfarr_consistency": (
                 "service-stopped generation required for exact stateful rollback"
                 if shelfarr_present
+                else "not present"
+            ),
+            "lazylibrarian_consistency": (
+                "service-stopped generation required for exact config/database rollback"
+                if (STACK_ROOT / "config/lazylibrarian").is_dir()
                 else "not present"
             ),
         },

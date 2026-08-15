@@ -39,6 +39,80 @@ strict_env_value() {
     ' .env
 }
 
+trim_ascii_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+validate_ebook_backend_policy() {
+    local raw="$1"
+    local owner="$2"
+    local part backend normalized="" first=""
+    local explicit_policy=1
+    local -a parts=()
+    local -A seen=()
+
+    [ "$raw" != "__WYSEARR_INVALID__" ] || \
+        fail "EBOOK_ACQUISITION_BACKENDS must have one exact assignment"
+    [ "$owner" != "__WYSEARR_INVALID__" ] || \
+        fail "EBOOK_ACQUISITION_OWNER must have one exact assignment"
+
+    raw="$(trim_ascii_whitespace "$raw")"
+    if [ -z "$(trim_ascii_whitespace "$owner")" ]; then
+        owner=""
+    fi
+    if [ -z "$raw" ]; then
+        # Compatibility only: Huey synthesizes a singleton policy from the old
+        # owner setting. Production still fails the exact two-backend gate
+        # below until the explicit cascade is configured.
+        explicit_policy=0
+        raw="${owner:-shelfarr}"
+    fi
+
+    [[ "$raw" != ,* && "$raw" != *, ]] || \
+        fail "EBOOK_ACQUISITION_BACKENDS contains a blank backend"
+    IFS=',' read -r -a parts <<< "$raw"
+    [ "${#parts[@]}" -gt 0 ] || \
+        fail "EBOOK_ACQUISITION_BACKENDS must not be empty"
+    for part in "${parts[@]}"; do
+        backend="$(trim_ascii_whitespace "$part")"
+        [ -n "$backend" ] || \
+            fail "EBOOK_ACQUISITION_BACKENDS contains a blank backend"
+        case "$backend" in
+            lazylibrarian|shelfarr) ;;
+            direct)
+                [ "$explicit_policy" -eq 0 ] || \
+                    fail "EBOOK_ACQUISITION_BACKENDS contains unknown or noncanonical backend"
+                ;;
+            *) fail "EBOOK_ACQUISITION_BACKENDS contains unknown or noncanonical backend" ;;
+        esac
+        [ -z "${seen[$backend]+present}" ] || \
+            fail "EBOOK_ACQUISITION_BACKENDS contains duplicate backend: $backend"
+        seen[$backend]=1
+        [ -n "$first" ] || first="$backend"
+        normalized="${normalized:+$normalized,}$backend"
+    done
+
+    if [ -n "$owner" ]; then
+        case "$owner" in
+            lazylibrarian|shelfarr) ;;
+            direct)
+                [ "$explicit_policy" -eq 0 ] || \
+                    fail "EBOOK_ACQUISITION_OWNER=direct requires EBOOK_ACQUISITION_BACKENDS to be absent"
+                ;;
+            *) fail "EBOOK_ACQUISITION_OWNER must be lazylibrarian, shelfarr, or legacy direct with no backend policy" ;;
+        esac
+        [ "$owner" = "$first" ] || \
+            fail "EBOOK_ACQUISITION_OWNER must match the first configured ebook backend"
+    fi
+
+    [ "$normalized" = "lazylibrarian,shelfarr" ] || \
+        fail "production EBOOK_ACQUISITION_BACKENDS must be exactly lazylibrarian,shelfarr"
+    printf '%s' "$normalized"
+}
+
 wait_for_health() {
     local timeout_seconds="$1"
     shift
@@ -80,7 +154,7 @@ media_root="${media_root:-/mnt/media}"
 torrent_root="${torrent_root:-$stack_root/state/torrents}"
 
 mkdir -p \
-    config/{qbittorrent,prowlarr,sonarr,radarr,lidarr,whisparr,bazarr,bookbot,huey,sabnzbd,shelfarr} \
+    config/{qbittorrent,prowlarr,sonarr,radarr,lidarr,whisparr,bazarr,bookbot,huey,sabnzbd,shelfarr,abba,lazylibrarian} \
     state/huey \
     state/shelfarr-evaluation \
     state/shelfarr-staging/ebooks \
@@ -101,9 +175,13 @@ mkdir -p \
     "$media_root"/duplicates/{ebooks,audiobooks,manga-comics,roms,sheet-music}
 
 chmod 775 config/bookbot state/huey "$torrent_root" "$torrent_root"/*
+# qBittorrent and ARR config trees persist credential material alongside
+# databases and logs. Restrict traversal at the directory boundary even when
+# an application creates a file with a more permissive mode.
+chmod 700 config/{qbittorrent,prowlarr,sonarr,radarr,lidarr,whisparr}
 # Shelfarr stores the Prowlarr key and encrypted client credentials in SQLite.
 # Keep its entire state private even when individual SQLite files use 0644.
-chmod 700 config/sabnzbd config/shelfarr
+chmod 700 config/abba config/lazylibrarian config/sabnzbd config/shelfarr
 chmod 700 state/shelfarr-evaluation state/shelfarr-staging state/shelfarr-staging/ebooks
 find state/shelfarr-evaluation -maxdepth 1 -type f -exec chmod 600 {} +
 chmod 600 .env
@@ -131,29 +209,57 @@ unset openvpn_user openvpn_password
 docker compose config --quiet
 deployment_id="$(date -u +%Y%m%d-%H%M%S)-$$"
 
-feature_flag="$(env_value SHELFARR_ENABLED)"
+shelfarr_flag="$(strict_env_value SHELFARR_ENABLED)"
+abba_flag="$(strict_env_value ABBA_ENABLED)"
+lazylibrarian_flag="$(strict_env_value LAZYLIBRARIAN_ENABLED)"
+ebook_backends="$(strict_env_value EBOOK_ACQUISITION_BACKENDS)"
+ebook_owner="$(strict_env_value EBOOK_ACQUISITION_OWNER)"
 usenet_flag="$(strict_env_value WYSEARR_USENET_ENABLED)"
-core_services=(qbittorrent prowlarr sonarr radarr lidarr whisparr bazarr)
-evaluation_services=()
-case "$feature_flag" in
-    true) evaluation_services=(sabnzbd shelfarr) ;;
+core_services=(prowlarr sonarr radarr lidarr whisparr bazarr)
+shelfarr_services=()
+abba_services=()
+lazylibrarian_services=()
+case "$shelfarr_flag" in
+    true) shelfarr_services=(sabnzbd shelfarr) ;;
     false|"") ;;
     *) fail "SHELFARR_ENABLED must be literal true or false" ;;
 esac
+case "$abba_flag" in
+    true) abba_services=(abba) ;;
+    false|"") ;;
+    *) fail "ABBA_ENABLED must be literal true or false" ;;
+esac
+case "$lazylibrarian_flag" in
+    true) lazylibrarian_services=(lazylibrarian) ;;
+    false|"") ;;
+    *) fail "LAZYLIBRARIAN_ENABLED must be literal true or false" ;;
+esac
 case "$usenet_flag" in
-    true) [ "$feature_flag" = "true" ] || fail "WYSEARR_USENET_ENABLED requires SHELFARR_ENABLED=true" ;;
+    true) [ "$shelfarr_flag" = "true" ] || fail "WYSEARR_USENET_ENABLED requires SHELFARR_ENABLED=true" ;;
     false|"") ;;
     *) fail "WYSEARR_USENET_ENABLED must be literal true or false" ;;
 esac
+ebook_backends="$(validate_ebook_backend_policy "$ebook_backends" "$ebook_owner")"
+ebook_owner="${ebook_owner:-${ebook_backends%%,*}}"
+[ "$lazylibrarian_flag" = "true" ] || \
+    fail "EBOOK_ACQUISITION_BACKENDS requires LAZYLIBRARIAN_ENABLED=true"
+[ "$shelfarr_flag" = "true" ] || \
+    fail "EBOOK_ACQUISITION_BACKENDS requires SHELFARR_ENABLED=true"
 
 service_is_running() {
     [ -n "$(docker compose ps --status running -q "$1" 2>/dev/null)" ]
 }
 
 huey_was_running=0
+bookbot_was_running=0
+abba_was_running=0
+lazylibrarian_was_running=0
 sabnzbd_was_running=0
 shelfarr_was_running=0
 service_is_running huey && huey_was_running=1
+service_is_running bookbot && bookbot_was_running=1
+service_is_running abba && abba_was_running=1
+service_is_running lazylibrarian && lazylibrarian_was_running=1
 service_is_running sabnzbd && sabnzbd_was_running=1
 service_is_running shelfarr && shelfarr_was_running=1
 deployment_complete=0
@@ -175,6 +281,21 @@ restore_previous_runtime() {
             else
                 docker compose stop shelfarr >/dev/null 2>&1 || true
             fi
+            if [ "$abba_was_running" -eq 1 ]; then
+                docker compose start abba >/dev/null 2>&1 || true
+            else
+                docker compose stop abba >/dev/null 2>&1 || true
+            fi
+            if [ "$lazylibrarian_was_running" -eq 1 ]; then
+                docker compose start lazylibrarian >/dev/null 2>&1 || true
+            else
+                docker compose stop lazylibrarian >/dev/null 2>&1 || true
+            fi
+            if [ "$bookbot_was_running" -eq 1 ]; then
+                docker compose start bookbot >/dev/null 2>&1 || true
+            else
+                docker compose stop bookbot >/dev/null 2>&1 || true
+            fi
             if [ "$huey_was_running" -eq 1 ]; then
                 docker compose start huey >/dev/null 2>&1 || true
             else
@@ -185,9 +306,9 @@ restore_previous_runtime() {
             # merely restarting it as rollback: leave intake/evaluation closed
             # until the verified pre-deploy checkpoint is restored or the
             # deployment error is repaired and validation rerun.
-            echo "ERROR: deployment failed after runtime replacement; Huey/Shelfarr/SABnzbd are left stopped" >&2
+            echo "ERROR: deployment failed after runtime replacement; Huey/BookBot/ABBA/LazyLibrarian/Shelfarr/SABnzbd are left stopped" >&2
             echo "ERROR: recover from backups/pre-deploy-$deployment_id before resuming intake" >&2
-            docker compose stop huey shelfarr sabnzbd >/dev/null 2>&1 || true
+            docker compose stop huey bookbot abba lazylibrarian shelfarr sabnzbd >/dev/null 2>&1 || true
         fi
     fi
     exit "$status"
@@ -195,15 +316,20 @@ restore_previous_runtime() {
 trap restore_previous_runtime EXIT
 
 # Freeze request intake before inspecting BookBot ownership or allowing a
-# persisted Shelfarr queue to resume. Stop both evaluation services so the
-# checkpoint represents one coherent Shelfarr/SAB generation.
-docker compose stop huey shelfarr sabnzbd
+# persisted Shelfarr, LazyLibrarian, or ABBA queue to resume. Stop every book
+# acquisition owner and the importer so the checkpoint represents one coherent
+# request/acquisition/import generation.
+docker compose stop huey bookbot abba lazylibrarian shelfarr sabnzbd
 python3 scripts/backup.py \
     --output "$stack_root/backups/pre-deploy-$deployment_id" \
     --quiet
 
 docker compose pull --ignore-buildable
-docker compose build --pull bookbot huey
+application_build_services=(bookbot huey)
+if [ "${#abba_services[@]}" -gt 0 ]; then
+    application_build_services+=(abba)
+fi
+docker compose build --pull "${application_build_services[@]}"
 
 runtime_replaced=1
 # Gluetun owns the published WebUI port and the `qbittorrent` network alias.
@@ -249,19 +375,15 @@ wait_for_health 180 whisparr
 
 python3 scripts/bootstrap.py
 
-# Bootstrap creates/rotates credentials consumed by Compose. Recreate the
-# qBittorrent clients so every service receives the newly persisted values.
-docker compose up -d --force-recreate --no-deps qbittorrent
+# Bootstrap itself performs a guarded qBittorrent restart only when it actually
+# repairs WebUI credentials. Ordinary idempotent bootstrap runs leave the
+# existing container and every transfer uninterrupted.
 wait_for_health 180 qbittorrent
-# Preserve Compose dependency metadata/config hashes. qBittorrent is already
-# healthy, so including dependencies here does not recreate it unnecessarily.
-docker compose up -d --force-recreate sonarr radarr lidarr whisparr
+# Bootstrap persists ARR downloader repairs through their APIs. A second
+# Compose recreation would only interrupt unrelated monitoring activity.
 wait_for_health 300 sonarr radarr lidarr whisparr
 
-if [ "${#evaluation_services[@]}" -gt 0 ]; then
-    # This gate runs before Shelfarr's persisted worker queue is allowed to
-    # resume, then full convergence repeats it immediately before enablement.
-    python3 scripts/bootstrap_shelfarr.py --check-drain-only
+if [ "${#shelfarr_services[@]}" -gt 0 ]; then
     # A first SAB start creates its INI on a fresh installation. Stop it before
     # disabling API parameter logging on disk, so the first authenticated
     # configuration request cannot write credentials into SAB's logs.
@@ -274,7 +396,7 @@ if [ "${#evaluation_services[@]}" -gt 0 ]; then
     python3 scripts/bootstrap_shelfarr.py --prepare-sab-config
     docker compose start sabnzbd
     wait_for_health 180 sabnzbd
-    docker compose up -d --remove-orphans shelfarr
+    docker compose up -d --remove-orphans --no-deps shelfarr
     wait_for_health 300 shelfarr
     python3 scripts/bootstrap_shelfarr.py
 else
@@ -289,28 +411,61 @@ else
     docker compose stop shelfarr sabnzbd
 fi
 
+if [ "${#lazylibrarian_services[@]}" -gt 0 ]; then
+    # LazyLibrarian owns catalog/search/acquisition only and receives neither a
+    # download payload mount nor final-library authority.
+    python3 scripts/bootstrap_lazylibrarian.py --prepare-config
+    docker compose up -d --remove-orphans --no-deps lazylibrarian
+    wait_for_health 300 lazylibrarian
+    python3 scripts/bootstrap_lazylibrarian.py
+else
+    docker compose stop lazylibrarian
+fi
+
+if [ "${#abba_services[@]}" -gt 0 ]; then
+    # qBittorrent credentials and the dedicated audiobook category have already
+    # been converged. ABBA receives no media mount and can only submit the exact
+    # `/downloads/audiobooks` path through qBittorrent's private Compose API.
+    docker compose up -d --remove-orphans --no-deps abba
+    wait_for_health 300 abba
+else
+    docker compose stop abba
+fi
+
 if ! grep -Eq '^DISCORD_BOT_TOKEN=.{20,}$' .env; then
     fail "DISCORD_BOT_TOKEN is missing from .env"
 fi
 
-docker compose up -d --build --remove-orphans bookbot huey
+# Required dependencies and every enabled optional acquisition service are
+# already health-gated above. Keep this recreation scoped to the two rebuilt
+# application containers so unrelated services and active transfers stay put.
+docker compose up -d --remove-orphans --no-deps bookbot huey
 wait_for_health 300 bookbot huey
 
 python3 scripts/validate_qbittorrent_vpn.py
 python3 scripts/validate.py
 
-# Take the post-deploy rollback generation while every Shelfarr state writer
-# and its Discord submitter are stopped, then validate the restarted runtime.
-docker compose stop huey shelfarr sabnzbd
+# Take the post-deploy rollback generation while every book acquisition state
+# writer and its Discord submitter are stopped, then validate the restarted
+# runtime.
+docker compose stop huey bookbot abba lazylibrarian shelfarr sabnzbd
 python3 scripts/backup.py \
     --output "$stack_root/backups/post-deploy-$deployment_id" \
     --quiet
-if [ "${#evaluation_services[@]}" -gt 0 ]; then
+if [ "${#shelfarr_services[@]}" -gt 0 ]; then
     docker compose start sabnzbd shelfarr
     wait_for_health 300 sabnzbd shelfarr
 fi
-docker compose start huey
-wait_for_health 180 huey
+if [ "${#lazylibrarian_services[@]}" -gt 0 ]; then
+    docker compose start lazylibrarian
+    wait_for_health 180 lazylibrarian
+fi
+if [ "${#abba_services[@]}" -gt 0 ]; then
+    docker compose start abba
+    wait_for_health 180 abba
+fi
+docker compose start bookbot huey
+wait_for_health 180 bookbot huey
 python3 scripts/validate_qbittorrent_vpn.py
 python3 scripts/validate.py
 

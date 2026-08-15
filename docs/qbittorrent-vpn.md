@@ -22,9 +22,10 @@ host port of its own. Gluetun owns the `qbittorrent` alias on `wysearr_default`
 and publishes the same `${WYSEARR_BIND_ADDRESS}:${QBITTORRENT_PORT}` WebUI mapping
 used before the migration. Sonarr, Radarr, Lidarr, Whisparr, ABBA, Huey, BookBot,
 Shelfarr, and LazyLibrarian therefore continue to use
-`http://qbittorrent:8080`. The old host `6881/tcp` and `6881/udp` mappings are
-intentionally absent: PIA's assigned port arrives through `tun0`, not the host
-NIC.
+`http://qbittorrent:8080`. The old fixed host `6881/tcp` and `6881/udp` peer
+mappings are intentionally absent. Gluetun owns PIA's transient forwarded-port
+lease and permits that port through the VPN firewall on `tun0`; no peer port is
+published on the host NIC.
 
 The persistent qBittorrent mounts are unchanged:
 
@@ -72,28 +73,30 @@ Upstream references:
 
 ## Dynamic PIA port forwarding
 
-Gluetun obtains and refreshes PIA's transient forwarded port, dynamically opens
-it on `tun0`, and writes it to `/gluetun/forwarded_port`. The read-only
+Gluetun obtains and refreshes PIA's transient forwarded port, permits it through
+the VPN firewall on `tun0`, and writes the lease to
+`/gluetun/forwarded_port`. The filesystem-read-only, capability-free
 `qbittorrent-port-forward` helper checks that file every 15 seconds, logs in to
 qBittorrent over shared loopback using the existing private WebUI credentials,
-and enforces all four preferences:
+and mutates exactly four qBittorrent preferences:
 
 - `listen_port` equals PIA's current forwarded port;
 - `current_network_interface` is `tun0`;
 - random-port selection is disabled;
 - UPnP/NAT-PMP is disabled.
 
-The helper is read-only, capability-free, and has only a private tmpfs plus
-read-only access to the port file and its script. It URL-encodes credentials in
-the request body and never prints them. Its continuous reconciliation avoids the
-initial startup race of a one-shot port-forward hook and repairs drift after a
-Gluetun, qBittorrent, or host restart.
+The helper cannot alter Gluetun's lease, firewall, routes, or network namespace.
+It has only a private tmpfs plus read-only mounts for the port file and script,
+URL-encodes credentials in the request body, and never prints them. Its
+continuous qBittorrent reconciliation avoids the initial startup race of a
+one-shot hook and repairs client-preference drift after a Gluetun, qBittorrent,
+or host restart.
 
 LazyLibrarian's early config loader can echo downloader settings before its own
-redaction policy initializes. Its Docker logging driver is therefore `none`;
-operator logs remain in its private `/config/Logs` tree, where log/host/file
-redaction is enforced. Do not re-enable Docker stdout logging for LazyLibrarian
-without first verifying that the upstream loader redacts `QBITTORRENT_PASS`.
+redaction policy initializes, so its Docker logging driver is `none` and it must
+not be included in Docker-log collection commands. Its private `/config/Logs`
+tree remains access-controlled; inspect it only with secret-safe, count-only
+diagnostics unless upstream redaction has been independently verified.
 
 Check the live, non-secret forwarding state with:
 
@@ -142,10 +145,13 @@ requests VPN recovery if the test is interrupted:
 ```
 
 This is an acceptance/maintenance test, not a routine healthcheck. Do not call a
-deployment PASS unless it completes successfully. Gluetun `v3.41.3` can retain
-a stale Docker-health result after an intentional API stop, so the script checks
-the control API and real Internet behavior rather than inferring the result from
-container health.
+new or changed VPN boundary accepted unless it completes successfully. For an
+application-only acquisition release on the same unchanged qBittorrent/Gluetun
+runtime, retain the prior live kill-switch proof and run the non-disruptive VPN
+validator instead; do not stop a working tunnel merely to repeat identical
+evidence. Gluetun `v3.41.3` can retain a stale Docker-health result after an
+intentional API stop, so the script checks the control API and real Internet
+behavior rather than inferring the result from container health.
 
 ## Deployment and recovery
 
@@ -155,6 +161,13 @@ starts and health-gates Gluetun, recreates qBittorrent in the VPN namespace, and
 then starts the port reconciler. On later deployments it leaves a correctly
 attached running qBittorrent alone unless Gluetun was recreated or the namespace
 link is stale.
+
+For acquisition-only releases, record a secret-free aggregate torrent inventory
+before and after deployment and require it to be unchanged unless a separately
+authorized acquisition or cleanup explains the difference. A correctly attached
+runtime retains the same qBittorrent configuration/download mounts, shared
+Gluetun namespace, LAN WebUI ownership, and active jobs; rebuilding Huey,
+BookBot, or ABBA is not a reason to recreate qBittorrent or Gluetun.
 
 Before manual recovery, create and verify a private checkpoint:
 

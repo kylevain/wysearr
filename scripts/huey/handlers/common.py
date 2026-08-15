@@ -41,3 +41,12 @@ def handle_book(request: dict[str, Any], services: Any | None = None):
     if hasattr(resolved, "book"):
         return resolved.book(request)
     return handle_direct(request, resolved)
+
+
+def handle_audiobook(request: dict[str, Any], services: Any | None = None):
+    """Use ABBA when available while retaining the configured rollback path."""
+
+    resolved = registry(services)
+    if hasattr(resolved, "audiobook"):
+        return resolved.audiobook(request)
+    return handle_direct(request, resolved)

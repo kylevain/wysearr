@@ -254,20 +254,14 @@ class QbittorrentTests(unittest.TestCase):
             def set_web_credentials(self, username, password):
                 self.credentials.append((username, password))
 
-        class VerifiedClient:
-            def __init__(self):
-                self.logins = []
-
-            def login(self, username, password):
-                self.logins.append((username, password))
-                return username == "admin" and password == persisted
+            def torrents(self, category=None):
+                self.assert_category = category
+                return []
 
         initial = InitialClient()
-        verified = VerifiedClient()
-        clients = iter((initial, verified))
 
         def factory(*args, **kwargs):
-            return next(clients)
+            return initial
 
         logs = (
             "A temporary password is provided for this session: "
@@ -277,7 +271,7 @@ class QbittorrentTests(unittest.TestCase):
         )
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-            result = bootstrap.authenticate_qbittorrent(
+            result = bootstrap.authenticate_qbittorrent_with_state(
                 "http://qbit.invalid",
                 "admin",
                 persisted,
@@ -285,11 +279,158 @@ class QbittorrentTests(unittest.TestCase):
                 logs_reader=lambda: logs,
                 sleep=lambda _: None,
             )
-        self.assertIs(result, verified)
+        self.assertIs(result.client, initial)
+        self.assertTrue(result.credentials_repaired)
         self.assertEqual(initial.logins[-1], ("admin", current_temporary))
+        self.assertIsNone(initial.assert_category)
         self.assertEqual(initial.credentials, [("admin", persisted)])
         for secret in (old_temporary, current_temporary, persisted):
             self.assertNotIn(secret, output.getvalue())
+
+    def test_valid_persisted_credentials_do_not_signal_rotation(self):
+        client = mock.Mock()
+        client.login.return_value = True
+        result = bootstrap.authenticate_qbittorrent_with_state(
+            "http://qbit.invalid",
+            "admin",
+            "persisted-secret",
+            client_factory=lambda *args, **kwargs: client,
+            logs_reader=lambda: self.fail("logs were unexpectedly inspected"),
+        )
+        self.assertIs(result.client, client)
+        self.assertFalse(result.credentials_repaired)
+        client.torrents.assert_not_called()
+        client.set_web_credentials.assert_not_called()
+
+    def test_credential_repair_refuses_to_restart_with_incomplete_transfers(self):
+        client = mock.Mock()
+        client.login.side_effect = [False, True]
+        client.torrents.return_value = [
+            {"progress": 1.0},
+            {"progress": 0.25},
+        ]
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError, r"incomplete transfers are present \(1\)"
+        ):
+            bootstrap.authenticate_qbittorrent_with_state(
+                "http://qbit.invalid",
+                "admin",
+                "persisted-secret",
+                client_factory=lambda *args, **kwargs: client,
+                logs_reader=lambda: (
+                    "A temporary password is provided for this session: temporary"
+                ),
+            )
+        client.torrents.assert_called_once_with()
+        client.set_web_credentials.assert_not_called()
+
+    def test_unfiltered_inventory_omits_the_category_query_parameter(self):
+        client = bootstrap.QbittorrentClient("http://qbit.invalid", retries=1)
+        client.api = mock.Mock()
+        client.api.get_json.return_value = []
+
+        self.assertEqual(client.torrents(), [])
+        client.api.get_json.assert_called_once_with("/api/v2/torrents/info")
+
+        client.api.get_json.reset_mock()
+        self.assertEqual(client.torrents("movies"), [])
+        client.api.get_json.assert_called_once_with(
+            "/api/v2/torrents/info?category=movies"
+        )
+
+    def test_bootstrap_skips_rotation_restart_when_credentials_are_current(self):
+        qbit = mock.Mock()
+        environment = {
+            "QBITTORRENT_USERNAME": "admin",
+            "QBITTORRENT_PASSWORD": "secret",
+            "QBITTORRENT_PORT": "8080",
+            "WYSEARR_BIND_ADDRESS": "127.0.0.1",
+        }
+        api_keys = {key: "api-key" for key in bootstrap.API_KEY_CONFIGS}
+        with (
+            mock.patch.object(
+                bootstrap,
+                "prepare_environment",
+                return_value=(environment, api_keys),
+            ),
+            mock.patch.object(bootstrap, "ensure_download_directories", return_value=()),
+            mock.patch.object(
+                bootstrap,
+                "authenticate_qbittorrent_with_state",
+                return_value=bootstrap.QbittorrentAuthentication(qbit, False),
+            ),
+            mock.patch.object(
+                bootstrap, "configure_qbittorrent", return_value=(0, 0)
+            ),
+            mock.patch.object(
+                bootstrap, "configure_arr_services", return_value=0
+            ) as configure_arr,
+            mock.patch.object(bootstrap, "configure_prowlarr", return_value=[]),
+            mock.patch.object(bootstrap, "configure_bazarr", return_value=False),
+            mock.patch.object(
+                bootstrap, "restart_qbittorrent_with_rotation_guard"
+            ) as restart,
+        ):
+            bootstrap.bootstrap(
+                Path("/unused"), timeout=1, retries=1, reporter=mock.Mock()
+            )
+        restart.assert_not_called()
+        qbit.set_preferences.assert_not_called()
+        self.assertFalse(configure_arr.call_args.kwargs["force_credentials"])
+
+    def test_bootstrap_restarts_only_after_signaled_credential_repair(self):
+        authenticated = mock.Mock()
+        restarted = mock.Mock()
+        environment = {
+            "QBITTORRENT_USERNAME": "admin",
+            "QBITTORRENT_PASSWORD": "secret",
+            "QBITTORRENT_PORT": "8080",
+            "WYSEARR_BIND_ADDRESS": "127.0.0.1",
+        }
+        api_keys = {key: "api-key" for key in bootstrap.API_KEY_CONFIGS}
+        with (
+            mock.patch.object(
+                bootstrap,
+                "prepare_environment",
+                return_value=(environment, api_keys),
+            ),
+            mock.patch.object(bootstrap, "ensure_download_directories", return_value=()),
+            mock.patch.object(
+                bootstrap,
+                "authenticate_qbittorrent_with_state",
+                return_value=bootstrap.QbittorrentAuthentication(
+                    authenticated, True
+                ),
+            ),
+            mock.patch.object(
+                bootstrap, "configure_qbittorrent", return_value=(0, 0)
+            ),
+            mock.patch.object(
+                bootstrap, "configure_arr_services", return_value=0
+            ) as configure_arr,
+            mock.patch.object(bootstrap, "configure_prowlarr", return_value=[]),
+            mock.patch.object(bootstrap, "configure_bazarr", return_value=False),
+            mock.patch.object(
+                bootstrap,
+                "restart_qbittorrent_with_rotation_guard",
+                return_value=restarted,
+            ) as restart,
+        ):
+            bootstrap.bootstrap(
+                Path("/unused"), timeout=1, retries=1, reporter=mock.Mock()
+            )
+        restart.assert_called_once_with(
+            authenticated,
+            "http://127.0.0.1:8080",
+            "admin",
+            "secret",
+            timeout=1,
+            retries=1,
+        )
+        restarted.set_preferences.assert_called_once_with(
+            {"web_ui_max_auth_fail_count": bootstrap.QBITTORRENT_AUTH_FAILURE_LIMIT}
+        )
+        self.assertTrue(configure_arr.call_args.kwargs["force_credentials"])
 
 
 class FakeArrApi:
@@ -345,6 +486,37 @@ class ArrTests(unittest.TestCase):
         runner.assert_called_once()
         ready.login.assert_called_once_with("admin", "secret")
 
+    def test_rotation_guard_timeout_reports_unrestored_security_limit(self):
+        original = mock.Mock()
+        original.set_preferences.side_effect = [None, RuntimeError("stale session")]
+        unready = mock.Mock()
+        unready.login.return_value = False
+        unready.set_preferences.side_effect = RuntimeError("not authenticated")
+        ticks = iter((0.0, 1.0, 61.0))
+
+        with self.assertRaisesRegex(
+            bootstrap.BootstrapError,
+            "SECURITY CRITICAL.*authentication-failure limit",
+        ):
+            bootstrap.restart_qbittorrent_with_rotation_guard(
+                original,
+                "http://qbit.invalid",
+                "admin",
+                "secret",
+                timeout=1,
+                retries=1,
+                runner=mock.Mock(return_value=mock.Mock(returncode=0)),
+                client_factory=lambda *args, **kwargs: unready,
+                sleep=lambda _: None,
+                clock=lambda: next(ticks),
+            )
+
+        unready.login.assert_called_once_with("admin", "secret")
+        unready.set_preferences.assert_called_once_with(
+            {"web_ui_max_auth_fail_count": bootstrap.QBITTORRENT_AUTH_FAILURE_LIMIT}
+        )
+        self.assertEqual(original.set_preferences.call_count, 2)
+
     def test_download_client_repair_payload_and_mask_aware_idempotency(self):
         api = FakeArrApi()
         service = bootstrap.ARR_SERVICES[0]
@@ -379,6 +551,77 @@ class ArrTests(unittest.TestCase):
             0,
         )
         self.assertEqual(len(api.puts), 1)
+        tests_before_forced_update = len(api.tests)
+
+        # A successful test of the masked current definition can be backed by
+        # a surviving qBittorrent SID after password rotation.  Rotation
+        # callers must be able to force the new credential through forceSave.
+        self.assertEqual(
+            bootstrap.configure_arr_service(
+                api,
+                service,
+                "admin",
+                "new-password",
+                prefix="/api/v3",
+                force_credentials=True,
+            ),
+            1,
+        )
+        self.assertEqual(len(api.puts), 2)
+        self.assertEqual(
+            api.puts[-1][0], "/api/v3/downloadclient/1?forceSave=true"
+        )
+        self.assertEqual(
+            bootstrap.get_provider_field(api.puts[-1][1], "password"),
+            "new-password",
+        )
+        self.assertEqual(len(api.tests), tests_before_forced_update + 2)
+        self.assertEqual(
+            bootstrap.get_provider_field(api.tests[-2], "password"),
+            "new-password",
+        )
+        self.assertEqual(
+            bootstrap.get_provider_field(api.tests[-1], "password"), "********"
+        )
+
+    def test_force_credentials_is_propagated_to_every_arr_service(self):
+        environment = {"WYSEARR_BIND_ADDRESS": "127.0.0.1"}
+        api_keys = {
+            f"{service.name.upper()}_API_KEY": "api-key"
+            for service in bootstrap.ARR_SERVICES
+        }
+        clients = [mock.Mock() for _ in bootstrap.ARR_SERVICES]
+        client_factory = mock.Mock(side_effect=clients)
+
+        with mock.patch.object(
+            bootstrap, "configure_arr_service", return_value=1
+        ) as configure:
+            updates = bootstrap.configure_arr_services(
+                environment,
+                api_keys,
+                "admin",
+                "new-password",
+                timeout=1,
+                retries=1,
+                force_credentials=True,
+                client_factory=client_factory,
+            )
+
+        self.assertEqual(updates, len(bootstrap.ARR_SERVICES))
+        self.assertEqual(configure.call_count, len(bootstrap.ARR_SERVICES))
+        for call, client, service in zip(
+            configure.call_args_list, clients, bootstrap.ARR_SERVICES
+        ):
+            self.assertEqual(
+                call,
+                mock.call(
+                    client,
+                    service,
+                    "admin",
+                    "new-password",
+                    force_credentials=True,
+                ),
+            )
 
     def test_all_service_category_mappings(self):
         for service in bootstrap.ARR_SERVICES:

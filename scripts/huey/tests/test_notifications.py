@@ -9,7 +9,9 @@ sys.path.insert(0, str(HUEY_ROOT))
 from notifications import (  # noqa: E402
     EVENT_ROUTES,
     RoutedNotification,
+    abba_state_notifications,
     response_notifications,
+    service_correlation_attention_notification,
     shelfarr_state_notifications,
     shelfarr_correlation_attention_notification,
     terminal_notifications,
@@ -257,7 +259,9 @@ class NotificationPolicyTests(unittest.TestCase):
         self.assertCountEqual(
             [plan.route for plan in plans], ["request-status", "recent-additions"]
         )
-        self.assertIn("by Shelfarr", " ".join(plan.message for plan in plans))
+        combined = " ".join(plan.message for plan in plans)
+        self.assertIn("ebook DAS library path", combined)
+        self.assertNotIn("Shelfarr", combined)
 
     def test_bookbot_terminal_success_has_distinct_status_and_addition_events(self):
         plans = terminal_notifications(
@@ -334,6 +338,64 @@ class NotificationPolicyTests(unittest.TestCase):
         self.assertIn("Arrival", combined)
         for secret in ("@everyone", "https://", "token", "apikey", "do-not-post"):
             self.assertNotIn(secret, combined)
+
+    def test_audiobook_requester_lifecycle_text_is_backend_neutral(self):
+        request = self.request(
+            media_type="audiobooks",
+            title="Dune",
+            external_title="Dune",
+            service="abba",
+        )
+        plan_groups = [
+            response_notifications(
+                "audiobooks",
+                self.response(
+                    "queued",
+                    service="abba",
+                    message="ABBA queued Dune in qBittorrent through Prowlarr.",
+                ),
+                request,
+            ),
+            response_notifications(
+                "audiobooks",
+                self.response(
+                    "failed",
+                    service="abba",
+                    message="ABBA and BookBot failed in qBittorrent.",
+                ),
+                {**request, "status": "failed"},
+            ),
+            response_notifications(
+                "audiobooks",
+                self.response(
+                    "queued",
+                    service="abba",
+                    external_status="submission_uncertain",
+                    message="ABBA/qBittorrent status is uncertain.",
+                ),
+                request,
+            ),
+            abba_state_notifications(request, "downloading"),
+            abba_state_notifications(request, "processing"),
+            terminal_notifications(
+                {
+                    **request,
+                    "status": "failed",
+                    "error": "ABBA qBittorrent Prowlarr BookBot failure",
+                    "terminal_event_type": "bookbot_failed",
+                }
+            ),
+            (
+                service_correlation_attention_notification(
+                    request, service="ABBA", startup=False
+                ),
+            ),
+        ]
+        combined = " ".join(
+            plan.message for plans in plan_groups for plan in plans
+        ).casefold()
+        for backend in ("abba", "qbittorrent", "prowlarr", "bookbot"):
+            self.assertNotIn(backend.casefold(), combined)
 
 
 if __name__ == "__main__":

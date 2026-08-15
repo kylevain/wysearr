@@ -12,6 +12,7 @@ from typing import Any
 from .config import CATEGORY_SPECS, BookBotConfig, CategorySpec
 from .errors import (
     ConfigurationError,
+    MetadataCorrelationError,
     UnsafeSourceError,
     UnsupportedMediaError,
 )
@@ -19,7 +20,7 @@ from .health import write_health_marker
 from .huey import HueyUpdater
 from .ledger import ImportLedger
 from .qbittorrent import QbittorrentClient
-from .storage import LibraryImporter
+from .storage import AudiobookMetadata, LibraryImporter
 
 
 LOGGER = logging.getLogger(__name__)
@@ -230,8 +231,13 @@ class BookBotService:
                     str(torrent.get("save_path") or ""),
                     dry_run=True,
                 )
+                metadata = self._audiobook_metadata(torrent, spec, torrent_hash)
                 result = self.importer.import_payload(
-                    content_path, spec, torrent_hash, dry_run=True
+                    content_path,
+                    spec,
+                    torrent_hash,
+                    dry_run=True,
+                    audiobook_metadata=metadata,
                 )
                 LOGGER.info(
                     "Dry run: would import hash=%s to %s (%d files)",
@@ -240,7 +246,11 @@ class BookBotService:
                     result.copied_files,
                 )
                 return "dry_run"
-            except (UnsafeSourceError, UnsupportedMediaError) as exc:
+            except (
+                MetadataCorrelationError,
+                UnsafeSourceError,
+                UnsupportedMediaError,
+            ) as exc:
                 LOGGER.error("Dry-run payload rejected hash=%s: %s", torrent_hash[:12], exc)
                 return "rejected"
             except Exception as exc:
@@ -267,9 +277,19 @@ class BookBotService:
                 spec.imported_name,
                 str(torrent.get("save_path") or ""),
             )
-            result = self.importer.import_payload(content_path, spec, torrent_hash)
+            metadata = self._audiobook_metadata(torrent, spec, torrent_hash)
+            result = self.importer.import_payload(
+                content_path,
+                spec,
+                torrent_hash,
+                audiobook_metadata=metadata,
+            )
             self.ledger.mark_copied(torrent_hash, result.destination, timestamp)
-        except (UnsafeSourceError, UnsupportedMediaError) as exc:
+        except (
+            MetadataCorrelationError,
+            UnsafeSourceError,
+            UnsupportedMediaError,
+        ) as exc:
             self.ledger.mark_rejected(torrent_hash, exc, timestamp)
             self.huey.failed(torrent_hash, exc, str(torrent.get("tags") or ""))
             LOGGER.error("Payload rejected hash=%s: %s", torrent_hash[:12], exc)
@@ -422,6 +442,19 @@ class BookBotService:
         )
         self.huey.complete(torrent_hash, destination, tags)
         return True
+
+    def _audiobook_metadata(
+        self,
+        torrent: dict[str, Any],
+        spec: CategorySpec,
+        torrent_hash: str,
+    ) -> AudiobookMetadata | None:
+        if spec.name != "audiobooks":
+            return None
+        return self.huey.abba_audiobook_metadata(
+            torrent_hash,
+            str(torrent.get("tags") or ""),
+        )
 
     @staticmethod
     def _is_complete(torrent: dict[str, Any]) -> bool:

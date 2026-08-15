@@ -21,7 +21,6 @@ try:
     from .bootstrap import (
         BootstrapError,
         QbittorrentClient,
-        authenticate_qbittorrent,
         load_dotenv,
         update_dotenv,
     )
@@ -29,7 +28,6 @@ except ImportError:
     from bootstrap import (
         BootstrapError,
         QbittorrentClient,
-        authenticate_qbittorrent,
         load_dotenv,
         update_dotenv,
     )
@@ -37,11 +35,9 @@ except ImportError:
 
 STACK_ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_SENTINEL = "WYSEARR_BOOTSTRAP_RESULT="
-BOOKBOT_BOOK_CATEGORIES = (
+BOOKBOT_EBOOK_CATEGORIES = (
     "ebooks",
     "ebooks-imported",
-    "audiobooks",
-    "audiobooks-imported",
 )
 MANAGED_USENET_SERVER_NAME = "WyseARR Primary"
 INI_SECTION_RE = re.compile(
@@ -156,31 +152,31 @@ def parse_managed_usenet_settings(
     )
 
 
-def require_drained_bookbot_book_categories(
+def require_drained_bookbot_ebook_categories(
     environment: Mapping[str, str],
     *,
     client_factory=QbittorrentClient,
 ) -> None:
-    """Refuse a Shelfarr ownership transition while BookBot book jobs exist."""
+    """Refuse a Shelfarr ebook transition while BookBot ebook jobs exist."""
 
     bind_address = environment.get("WYSEARR_BIND_ADDRESS", "192.168.4.86")
     base_url = (
         "http://" + bind_address + ":" + environment.get("QBITTORRENT_PORT", "8080")
     )
-    client = authenticate_qbittorrent(
-        base_url,
+    client = client_factory(base_url)
+    if not client.login(
         environment.get("QBITTORRENT_USERNAME", "admin"),
         environment.get("QBITTORRENT_PASSWORD", ""),
-        client_factory=client_factory,
-    )
+    ):
+        raise BootstrapError("qBittorrent rejected the drain-check credentials")
     active = [
         category
-        for category in BOOKBOT_BOOK_CATEGORIES
+        for category in BOOKBOT_EBOOK_CATEGORIES
         if client.torrents(category)
     ]
     if active:
         raise BootstrapError(
-            "Cannot enable Shelfarr while BookBot book-category torrents remain: "
+            "Cannot enable Shelfarr while BookBot ebook-category torrents remain: "
             + ", ".join(active)
         )
 
@@ -794,13 +790,11 @@ def bootstrap_shelfarr(root: Path, *, enable: bool = False) -> dict[str, Any]:
     env_path = root / ".env"
     environment = load_dotenv(env_path)
     usenet_settings = parse_managed_usenet_settings(environment)
-    enabling_now = enable or environment.get("SHELFARR_ENABLED", "") == "true"
-    if usenet_settings.enabled is True and not enabling_now:
+    shelfarr_enabled = enable or environment.get("SHELFARR_ENABLED", "") == "true"
+    if usenet_settings.enabled is True and not shelfarr_enabled:
         raise BootstrapError(
             "WYSEARR_USENET_ENABLED requires SHELFARR_ENABLED=true"
         )
-    if enabling_now:
-        require_drained_bookbot_book_categories(environment)
     updates: dict[str, str] = {}
     if not environment.get("SHELFARR_ADMIN_USERNAME"):
         updates["SHELFARR_ADMIN_USERNAME"] = "wyseadmin"
@@ -836,7 +830,7 @@ def bootstrap_shelfarr(root: Path, *, enable: bool = False) -> dict[str, Any]:
         "token_reused": bool(value.get("huey_token_reused")),
         "settings_count": int(value.get("settings_count", 0)),
         "download_clients": list(value.get("download_clients", [])),
-        "enabled": enabling_now,
+        "enabled": shelfarr_enabled,
     }
 
 
@@ -869,12 +863,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--enable",
         action="store_true",
-        help="Enable Shelfarr ownership for new Huey ebook/audiobook requests",
+        help="Enable Shelfarr ownership for new Huey ebook requests",
     )
     parser.add_argument(
         "--check-drain-only",
         action="store_true",
-        help="Only verify that all BookBot-owned book categories are drained",
+        help="Only verify that BookBot-owned ebook categories are drained",
     )
     parser.add_argument(
         "--prepare-sab-config",
@@ -911,8 +905,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if arguments.check_drain_only:
             environment = load_dotenv(arguments.root.resolve() / ".env")
-            require_drained_bookbot_book_categories(environment)
-            print("BookBot ebook/audiobook categories are drained.")
+            require_drained_bookbot_ebook_categories(environment)
+            print("BookBot ebook categories are drained.")
             return 0
         if arguments.converge_usenet_only:
             enabled = converge_managed_usenet_only(arguments.root.resolve())

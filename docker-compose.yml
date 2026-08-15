@@ -110,6 +110,63 @@ services:
       retries: 3
       start_period: 60s
 
+  abba:
+    <<: *common
+    build:
+      context: .
+      dockerfile: docker/abba/Dockerfile
+    container_name: abba
+    user: "${PUID:-1000}:${PGID:-1000}"
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Pacific/Honolulu}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      ABB_HOSTNAME: ${ABBA_ABB_HOSTNAME:-audiobookbay.lu}
+      PAGE_LIMIT: ${ABBA_PAGE_LIMIT:-1}
+      PORT: "5078"
+      ABBA_DB_PATH: /config/abba.db
+      ABBA_SEARCH_CACHE_SECONDS: ${ABBA_SEARCH_CACHE_SECONDS:-300}
+      ABBA_SEARCH_MIN_INTERVAL_SECONDS: ${ABBA_SEARCH_MIN_INTERVAL_SECONDS:-2}
+      ABBA_RESULT_TTL_SECONDS: ${ABBA_RESULT_TTL_SECONDS:-86400}
+      ABBA_HTTP_TIMEOUT_SECONDS: ${ABBA_HTTP_TIMEOUT_SECONDS:-15}
+      ABBA_MAX_RESULTS: "10"
+      DOWNLOAD_CLIENT: qbittorrent
+      DL_SCHEME: http
+      DL_HOST: qbittorrent
+      DL_PORT: "8080"
+      DL_USERNAME: ${QBITTORRENT_USERNAME:-admin}
+      DL_PASSWORD: ${QBITTORRENT_PASSWORD}
+      DL_CATEGORY: audiobooks
+      SAVE_PATH_BASE: /downloads/audiobooks
+      DL_VERIFY_TLS: "true"
+    volumes:
+      - ./config/abba:/config
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    depends_on:
+      qbittorrent:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:5078/health', timeout=5).read()
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
   prowlarr:
     <<: *common
     image: lscr.io/linuxserver/prowlarr@sha256:1295cff29d10b486c0d8324d1559a552140a5932bf8b3d87e398654414f63f92
@@ -120,6 +177,39 @@ services:
       - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${PROWLARR_PORT:-9696}:9696"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9696/ping >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  lazylibrarian:
+    <<: *common
+    # LinuxServer image build 02af0464-ls331, published 2026-08-13.
+    image: lscr.io/linuxserver/lazylibrarian@sha256:f2fd332fb4c5918571f8babd4d52fbcb9ca514be254ba101a47c275cd57eb33f
+    container_name: lazylibrarian
+    # LazyLibrarian's early config loader can echo downloader credentials before
+    # its application-level redactor initializes. Persisted /config logs remain
+    # available and redacted; disable Docker stdout retention for this service.
+    logging:
+      driver: none
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Pacific/Honolulu}
+      UMASK: "077"
+    volumes:
+      # LazyLibrarian owns search/acquisition only. BookBot owns downloaded
+      # payloads and the final library, so neither filesystem is mounted here.
+      - ./config/lazylibrarian:/config
+    ports:
+      - "127.0.0.1:${LAZYLIBRARIAN_ADMIN_PORT:-5299}:5299"
+    depends_on:
+      qbittorrent:
+        condition: service_healthy
+      prowlarr:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5299/home >/dev/null"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -158,14 +248,15 @@ services:
       # Persist the complete tree: SQLite databases, encryption keys, queue
       # state, and Active Storage all live below /rails/storage.
       - ./config/shelfarr:/rails/storage
-      # Limit filesystem authority to Shelfarr's two acquisition roots. Its
+      # Limit filesystem authority to Shelfarr's ebook acquisition roots. Its
       # qBittorrent and SAB clients still address these as /downloads/shelfarr
       # and /downloads/usenet respectively.
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}/shelfarr:/downloads/shelfarr
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}/usenet:/downloads/usenet
-      # Shelfarr is the exclusive finalizer for these two evaluation lanes.
+      # Shelfarr is the exclusive finalizer for its own ebook lane.
+      # Audiobooks are acquired by ABBA and finalized through the preserved
+      # BookBot category pipeline.
       - ${MEDIA_ROOT:-/mnt/media}/ebooks/Books:/ebooks
-      - ${MEDIA_ROOT:-/mnt/media}/audiobooks:/audiobooks
       # Direct ebook downloads need a mode-0700 staging tree. The DAS is
       # CIFS and intentionally synthesizes broader modes, so keep staging on
       # local storage while Shelfarr remains the final library publisher.
@@ -355,6 +446,22 @@ services:
       QBITTORRENT_URL: http://qbittorrent:8080
       QBITTORRENT_USERNAME: ${QBITTORRENT_USERNAME:-admin}
       QBITTORRENT_PASSWORD: ${QBITTORRENT_PASSWORD}
+      ABBA_ENABLED: ${ABBA_ENABLED:-false}
+      ABBA_URL: ${ABBA_URL:-http://abba:5078}
+      ABBA_TIMEOUT_SECONDS: ${ABBA_TIMEOUT_SECONDS:-30}
+      ABBA_SEARCH_LIMIT: ${ABBA_SEARCH_LIMIT:-10}
+      HUEY_ABBA_MINIMUM_CONFIDENCE: ${HUEY_ABBA_MINIMUM_CONFIDENCE:-0.82}
+      HUEY_ABBA_RUNNER_UP_GAP: ${HUEY_ABBA_RUNNER_UP_GAP:-0.08}
+      EBOOK_ACQUISITION_BACKENDS: ${EBOOK_ACQUISITION_BACKENDS:-}
+      EBOOK_ACQUISITION_OWNER: ${EBOOK_ACQUISITION_OWNER:-}
+      LAZYLIBRARIAN_ENABLED: ${LAZYLIBRARIAN_ENABLED:-false}
+      LAZYLIBRARIAN_URL: ${LAZYLIBRARIAN_URL:-http://lazylibrarian:5299}
+      LAZYLIBRARIAN_API_KEY: ${LAZYLIBRARIAN_API_KEY:-}
+      LAZYLIBRARIAN_TIMEOUT_SECONDS: ${LAZYLIBRARIAN_TIMEOUT_SECONDS:-30}
+      LAZYLIBRARIAN_SEARCH_LIMIT: ${LAZYLIBRARIAN_SEARCH_LIMIT:-10}
+      LAZYLIBRARIAN_METADATA_SOURCE: ${LAZYLIBRARIAN_METADATA_SOURCE:-OpenLibrary}
+      HUEY_LAZYLIBRARIAN_MINIMUM_CONFIDENCE: ${HUEY_LAZYLIBRARIAN_MINIMUM_CONFIDENCE:-0.80}
+      HUEY_LAZYLIBRARIAN_RUNNER_UP_GAP: ${HUEY_LAZYLIBRARIAN_RUNNER_UP_GAP:-0.05}
       SHELFARR_ENABLED: ${SHELFARR_ENABLED:-false}
       SHELFARR_URL: ${SHELFARR_URL:-http://shelfarr}
       SHELFARR_API_TOKEN: ${SHELFARR_API_TOKEN:-}

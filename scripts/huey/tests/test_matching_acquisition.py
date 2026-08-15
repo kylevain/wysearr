@@ -15,7 +15,12 @@ from acquisition import (
     magnet_info_hash,
     torrent_info_hash,
 )
-from matching import normalize_text, select_arr_candidate, select_release
+from matching import (
+    normalize_text,
+    select_arr_candidate,
+    select_release,
+    select_shelfarr_candidate,
+)
 from results import safe_display_title
 
 
@@ -77,6 +82,45 @@ class MatchingTests(unittest.TestCase):
             safe_display_title("Release token=do-not-show", "Requested Book"),
             "Requested Book",
         )
+
+    def test_book_metadata_requires_every_requested_author_token_before_deduping(self):
+        def candidate(author, *, work_id="openlibrary:OL893415W"):
+            return {
+                "work_id": work_id,
+                "title": "Dune",
+                "author": author,
+                "content_kind": "book",
+                "available_book_types": ["ebook"],
+            }
+
+        for author in (None, "", "Herbert", "Brian Herbert"):
+            with self.subTest(author=author):
+                selection = select_shelfarr_candidate(
+                    "Dune", "Frank Herbert", "ebooks", [candidate(author)]
+                )
+                self.assertIsNone(selection.selected)
+                self.assertEqual(selection.reason, "no_results")
+
+        for author in (
+            "Frank Herbert",
+            "HERBERT, FRANK",
+            "Frank-Herbert",
+        ):
+            with self.subTest(author=author):
+                selection = select_shelfarr_candidate(
+                    "Dune", "Frank Herbert", "ebooks", [candidate(author)]
+                )
+                self.assertEqual(selection.reason, "selected")
+
+        # An invalid first duplicate cannot shadow a later valid copy.
+        selection = select_shelfarr_candidate(
+            "Dune",
+            "Frank Herbert",
+            "ebooks",
+            [candidate("Brian Herbert"), candidate("Herbert, Frank")],
+        )
+        self.assertEqual(selection.reason, "selected")
+        self.assertEqual(selection.selected["author"], "Herbert, Frank")
 
 
 class DirectAcquirerTests(unittest.TestCase):

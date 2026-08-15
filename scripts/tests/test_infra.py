@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from contextlib import closing
 from pathlib import Path
 from unittest import mock
@@ -15,6 +16,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
 import backup
+import bootstrap_lazylibrarian
 import repair_whisparr_quality
 import validate
 
@@ -65,6 +67,21 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
             self.assertEqual(output.stat().st_mode & 0o777, 0o700)
 
+    def test_checkpoint_records_committed_generation_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "checkpoint"
+            with (
+                mock.patch.object(backup, "STACK_ROOT", root),
+                mock.patch.object(backup, "git_head", return_value="a" * 40),
+                mock.patch.object(backup, "git_dirty", return_value=True),
+            ):
+                manifest = backup.create_backup(output)
+
+            self.assertEqual(manifest["git_head"], "a" * 40)
+            self.assertIs(manifest["git_dirty"], True)
+            self.assertEqual(backup.verify_backup(output), manifest)
+
     def test_checkpoint_includes_bounded_qbittorrent_resume_metadata_not_payloads(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -75,6 +92,14 @@ class BackupTests(unittest.TestCase):
             payload = root / "state/torrents/complete/movie.mkv"
             payload.parent.mkdir(parents=True)
             payload.write_bytes(b"payload bytes")
+            # Payload names are untrusted. Database-like suffixes below either
+            # excluded payload root must never enter SQLite discovery or make a
+            # control-state checkpoint fail.
+            (payload.parent / "not-a-database.db").write_bytes(b"payload")
+            staged_database = root / "state/shelfarr-staging/ebook/book.sqlite3"
+            staged_database.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(staged_database)) as connection, connection:
+                connection.execute("CREATE TABLE payload (value TEXT)")
             output = root / "checkpoint"
 
             with mock.patch.object(backup, "STACK_ROOT", root):
@@ -88,6 +113,8 @@ class BackupTests(unittest.TestCase):
                 "config/qbittorrent/qBittorrent/BT_backup/abc.fastresume", paths
             )
             self.assertNotIn("state/torrents/complete/movie.mkv", paths)
+            self.assertNotIn("state/torrents/complete/not-a-database.db", paths)
+            self.assertNotIn("state/shelfarr-staging/ebook/book.sqlite3", paths)
             self.assertIn(
                 "state/torrents/** download payloads",
                 manifest["boundary"]["excludes"],
@@ -114,6 +141,9 @@ class BackupTests(unittest.TestCase):
                 connection.execute("PRAGMA journal_mode=WAL")
                 connection.execute("CREATE TABLE requests (title TEXT)")
                 connection.execute("INSERT INTO requests VALUES ('kept')")
+            with closing(sqlite3.connect(storage / "Logs.DB")) as connection, connection:
+                connection.execute("CREATE TABLE logs (message TEXT)")
+                connection.execute("INSERT INTO logs VALUES ('sensitive-log-data')")
             output = root / "checkpoint"
 
             with mock.patch.object(backup, "STACK_ROOT", root):
@@ -123,6 +153,7 @@ class BackupTests(unittest.TestCase):
             self.assertIn("config/shelfarr/.secret_key_base", paths)
             self.assertIn("config/shelfarr/blobs/ab/cd/book.epub", paths)
             self.assertIn("config/shelfarr/production.sqlite3", paths)
+            self.assertNotIn("config/shelfarr/Logs.DB", paths)
             self.assertIn("state/shelfarr-evaluation/results.json", paths)
             self.assertNotIn("config/shelfarr/production.sqlite3-wal", paths)
             self.assertNotIn("config/shelfarr/production.sqlite3-shm", paths)
@@ -130,6 +161,124 @@ class BackupTests(unittest.TestCase):
                 "state/shelfarr-staging/** direct-download staging payloads",
                 manifest["boundary"]["excludes"],
             )
+            self.assertEqual(backup.verify_backup(output), manifest)
+
+    def test_checkpoint_omits_ephemeral_audiobookshelf_validation_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text(
+                "PERMANENT_SETTING=kept\n"
+                "AUDIOBOOKSHELF_API_TOKEN=temporary-secret\n"
+                "ANOTHER_SETTING=also-kept\n",
+                encoding="utf-8",
+            )
+            output = root / "checkpoint"
+
+            with mock.patch.object(backup, "STACK_ROOT", root):
+                manifest = backup.create_backup(output)
+
+            checkpoint_env = (output / ".env").read_text(encoding="utf-8")
+            self.assertEqual(
+                checkpoint_env,
+                "PERMANENT_SETTING=kept\nANOTHER_SETTING=also-kept\n",
+            )
+            self.assertEqual(backup.verify_backup(output), manifest)
+
+    def test_checkpoint_discovers_abba_sqlite_safely_without_sidecars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage = root / "config" / "abba"
+            storage.mkdir(parents=True)
+            database = storage / "abba.db"
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute(
+                    "CREATE TABLE correlations (id INTEGER PRIMARY KEY, value TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO correlations (value) VALUES ('kept')"
+                )
+            output = root / "checkpoint"
+
+            with mock.patch.object(backup, "STACK_ROOT", root):
+                manifest = backup.create_backup(output)
+
+            paths = {entry["path"] for entry in manifest["files"]}
+            self.assertIn("config/abba/abba.db", paths)
+            self.assertNotIn("config/abba/abba.db-wal", paths)
+            self.assertNotIn("config/abba/abba.db-shm", paths)
+            with closing(sqlite3.connect(output / "config" / "abba" / "abba.db")) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT value FROM correlations").fetchone()[0],
+                    "kept",
+                )
+                self.assertEqual(
+                    connection.execute("PRAGMA integrity_check").fetchone()[0],
+                    "ok",
+                )
+            self.assertEqual(backup.verify_backup(output), manifest)
+
+    def test_checkpoint_excludes_diagnostic_log_databases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage = root / "config" / "sonarr"
+            storage.mkdir(parents=True)
+            for filename in ("sonarr.db", "logs.db"):
+                with closing(sqlite3.connect(storage / filename)) as connection, connection:
+                    connection.execute("CREATE TABLE records (value TEXT)")
+                    connection.execute("INSERT INTO records VALUES ('sensitive-log-data')")
+            output = root / "checkpoint"
+
+            with mock.patch.object(backup, "STACK_ROOT", root):
+                manifest = backup.create_backup(output)
+
+            paths = {entry["path"] for entry in manifest["files"]}
+            self.assertIn("config/sonarr/sonarr.db", paths)
+            self.assertNotIn("config/sonarr/logs.db", paths)
+            self.assertIn(
+                "service logs.db diagnostic databases",
+                manifest["boundary"]["excludes"],
+            )
+            self.assertEqual(backup.verify_backup(output), manifest)
+
+    def test_checkpoint_includes_lazylibrarian_config_and_sqlite_safely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage = root / "config" / "lazylibrarian"
+            storage.mkdir(parents=True)
+            (storage / "config.ini").write_text(
+                "[API]\napi_key=private-runtime-value\n", encoding="utf-8"
+            )
+            database = storage / "lazylibrarian.db"
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("CREATE TABLE books (title TEXT)")
+                connection.execute("INSERT INTO books VALUES ('kept')")
+            output = root / "checkpoint"
+
+            with mock.patch.object(backup, "STACK_ROOT", root):
+                manifest = backup.create_backup(output)
+
+            paths = {entry["path"] for entry in manifest["files"]}
+            self.assertIn("config/lazylibrarian/config.ini", paths)
+            self.assertIn("config/lazylibrarian/lazylibrarian.db", paths)
+            self.assertNotIn("config/lazylibrarian/lazylibrarian.db-wal", paths)
+            self.assertNotIn("config/lazylibrarian/lazylibrarian.db-shm", paths)
+            self.assertEqual(
+                (output / "config/lazylibrarian/config.ini").stat().st_mode & 0o777,
+                0o600,
+            )
+            with closing(
+                sqlite3.connect(output / "config/lazylibrarian/lazylibrarian.db")
+            ) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT title FROM books").fetchone()[0],
+                    "kept",
+                )
+                self.assertEqual(
+                    connection.execute("PRAGMA integrity_check").fetchone()[0],
+                    "ok",
+                )
             self.assertEqual(backup.verify_backup(output), manifest)
 
     def test_qbittorrent_resume_checkpoint_rejects_links_and_oversized_files(self):
@@ -278,6 +427,15 @@ class WhisparrRepairTests(unittest.TestCase):
 
 
 class DeploymentCheckpointTests(unittest.TestCase):
+    def test_deploy_keeps_qbittorrent_and_arr_config_directories_owner_only(self):
+        deploy = (SCRIPTS.parent / "deploy.sh").read_text(encoding="utf-8")
+        private_permissions = deploy.index(
+            "chmod 700 config/{qbittorrent,prowlarr,sonarr,radarr,lidarr,whisparr}"
+        )
+        self.assertLess(
+            private_permissions, deploy.index("docker compose config --quiet")
+        )
+
     def test_deploy_pairs_pre_and_post_validation_checkpoints(self):
         deploy = (SCRIPTS.parent / "deploy.sh").read_text(encoding="utf-8")
         pre = deploy.index("pre-deploy-$deployment_id")
@@ -288,23 +446,46 @@ class DeploymentCheckpointTests(unittest.TestCase):
         self.assertLess(validation, post)
         self.assertLess(post, success)
 
-    def test_deploy_quiesces_owners_and_gates_shelfarr_before_start(self):
+    def test_deploy_quiesces_and_health_gates_book_owners_before_intake(self):
         deploy = (SCRIPTS.parent / "deploy.sh").read_text(encoding="utf-8")
-        self.assertIn('case "$feature_flag" in', deploy)
-        self.assertIn("evaluation_services=(sabnzbd shelfarr)", deploy)
-        self.assertIn('if [ "${#evaluation_services[@]}" -gt 0 ]', deploy)
+        self.assertIn('case "$shelfarr_flag" in', deploy)
+        self.assertIn('case "$abba_flag" in', deploy)
+        self.assertIn('case "$lazylibrarian_flag" in', deploy)
+        self.assertIn('shelfarr_flag="$(strict_env_value SHELFARR_ENABLED)"', deploy)
+        self.assertIn('abba_flag="$(strict_env_value ABBA_ENABLED)"', deploy)
+        self.assertIn(
+            'lazylibrarian_flag="$(strict_env_value LAZYLIBRARIAN_ENABLED)"',
+            deploy,
+        )
+        self.assertIn(
+            'ebook_backends="$(strict_env_value EBOOK_ACQUISITION_BACKENDS)"',
+            deploy,
+        )
+        self.assertIn(
+            'ebook_owner="$(strict_env_value EBOOK_ACQUISITION_OWNER)"', deploy
+        )
+        self.assertIn("shelfarr_services=(sabnzbd shelfarr)", deploy)
+        self.assertIn("abba_services=(abba)", deploy)
+        self.assertIn("lazylibrarian_services=(lazylibrarian)", deploy)
+        self.assertIn("application_build_services=(bookbot huey)", deploy)
+        self.assertIn("application_build_services+=(abba)", deploy)
+        self.assertIn(
+            'docker compose build --pull "${application_build_services[@]}"',
+            deploy,
+        )
+        self.assertNotIn("docker compose build --pull abba bookbot huey", deploy)
+        self.assertIn('if [ "${#shelfarr_services[@]}" -gt 0 ]', deploy)
+        self.assertIn('if [ "${#abba_services[@]}" -gt 0 ]', deploy)
+        self.assertIn('if [ "${#lazylibrarian_services[@]}" -gt 0 ]', deploy)
         pre_stop = deploy.index(
-            "docker compose stop huey shelfarr sabnzbd",
+            "docker compose stop huey bookbot abba lazylibrarian shelfarr sabnzbd",
             deploy.index("trap restore_previous_runtime EXIT"),
         )
         # Ignore the recovery hint in the EXIT trap and select the operational
         # pre-deploy checkpoint created after the owners are quiesced.
         pre_checkpoint = deploy.index("pre-deploy-$deployment_id", pre_stop)
-        drain_check = deploy.index(
-            "python3 scripts/bootstrap_shelfarr.py --check-drain-only"
-        )
         start_sabnzbd = deploy.index(
-            "docker compose up -d --remove-orphans sabnzbd", drain_check
+            "docker compose up -d --remove-orphans sabnzbd", pre_checkpoint
         )
         stop_sabnzbd = deploy.index("docker compose stop sabnzbd", start_sabnzbd)
         prepare_sabnzbd = deploy.index(
@@ -313,43 +494,103 @@ class DeploymentCheckpointTests(unittest.TestCase):
         )
         restart_sabnzbd = deploy.index("docker compose start sabnzbd", prepare_sabnzbd)
         start_shelfarr = deploy.index(
-            "docker compose up -d --remove-orphans shelfarr", restart_sabnzbd
+            "docker compose up -d --remove-orphans --no-deps shelfarr",
+            restart_sabnzbd,
         )
         bootstrap_shelfarr = deploy.index(
             "python3 scripts/bootstrap_shelfarr.py\n", start_shelfarr
         )
-        start_huey = deploy.index("docker compose up -d --build --remove-orphans bookbot huey")
+        prepare_lazylibrarian = deploy.index(
+            "python3 scripts/bootstrap_lazylibrarian.py --prepare-config",
+            bootstrap_shelfarr,
+        )
+        start_lazylibrarian = deploy.index(
+            "docker compose up -d --remove-orphans --no-deps lazylibrarian",
+            prepare_lazylibrarian,
+        )
+        health_lazylibrarian = deploy.index(
+            "wait_for_health 300 lazylibrarian", start_lazylibrarian
+        )
+        bootstrap_lazylibrarian = deploy.index(
+            "python3 scripts/bootstrap_lazylibrarian.py\n",
+            health_lazylibrarian,
+        )
+        start_abba = deploy.index(
+            "docker compose up -d --remove-orphans --no-deps abba",
+            bootstrap_lazylibrarian,
+        )
+        health_abba = deploy.index("wait_for_health 300 abba", start_abba)
+        start_huey = deploy.index(
+            "docker compose up -d --remove-orphans --no-deps bookbot huey"
+        )
         first_validation = deploy.index("python3 scripts/validate.py")
         post_stop = deploy.index(
-            "docker compose stop huey shelfarr sabnzbd", pre_stop + 1
+            "docker compose stop huey bookbot abba lazylibrarian shelfarr sabnzbd",
+            pre_stop + 1,
         )
         post_checkpoint = deploy.index("post-deploy-$deployment_id")
         restart_evaluation = deploy.index(
             "docker compose start sabnzbd shelfarr", post_checkpoint
         )
-        restart_huey = deploy.index("docker compose start huey", post_checkpoint)
+        restart_lazylibrarian = deploy.index(
+            "docker compose start lazylibrarian", post_checkpoint
+        )
+        restart_abba = deploy.index("docker compose start abba", post_checkpoint)
+        restart_intake = deploy.index(
+            "docker compose start bookbot huey", post_checkpoint
+        )
+        restart_intake_health = deploy.index(
+            "wait_for_health 180 bookbot huey", restart_intake
+        )
         second_validation = deploy.index(
             "python3 scripts/validate.py", first_validation + 1
         )
 
         self.assertLess(pre_stop, pre_checkpoint)
-        self.assertLess(pre_checkpoint, drain_check)
-        self.assertLess(drain_check, start_sabnzbd)
+        self.assertLess(pre_checkpoint, start_sabnzbd)
         self.assertLess(start_sabnzbd, stop_sabnzbd)
         self.assertLess(stop_sabnzbd, prepare_sabnzbd)
         self.assertLess(prepare_sabnzbd, restart_sabnzbd)
         self.assertLess(restart_sabnzbd, start_shelfarr)
         self.assertLess(start_shelfarr, bootstrap_shelfarr)
+        self.assertLess(bootstrap_shelfarr, prepare_lazylibrarian)
+        self.assertLess(prepare_lazylibrarian, start_lazylibrarian)
+        self.assertLess(start_lazylibrarian, health_lazylibrarian)
+        self.assertLess(health_lazylibrarian, bootstrap_lazylibrarian)
+        self.assertLess(bootstrap_lazylibrarian, start_abba)
+        self.assertLess(start_abba, health_abba)
+        self.assertLess(health_abba, start_huey)
         self.assertLess(bootstrap_shelfarr, start_huey)
         self.assertLess(start_huey, first_validation)
         self.assertLess(first_validation, post_stop)
         self.assertLess(post_stop, post_checkpoint)
         self.assertLess(post_checkpoint, restart_evaluation)
-        self.assertLess(restart_evaluation, restart_huey)
-        self.assertLess(restart_huey, second_validation)
+        self.assertLess(restart_evaluation, restart_lazylibrarian)
+        self.assertLess(restart_lazylibrarian, restart_abba)
+        self.assertLess(restart_abba, restart_intake)
+        self.assertLess(restart_intake, restart_intake_health)
+        self.assertLess(restart_intake_health, second_validation)
+
+        abba_if = deploy.index(
+            'if [ "${#abba_services[@]}" -gt 0 ]; then',
+            bootstrap_lazylibrarian,
+        )
+        abba_else = deploy.index("\nelse\n", abba_if)
+        abba_end = deploy.index("\nfi\n", abba_else)
+        self.assertIn("docker compose stop abba", deploy[abba_else:abba_end])
+
+        lazylibrarian_if = deploy.index(
+            'if [ "${#lazylibrarian_services[@]}" -gt 0 ]; then'
+        )
+        lazylibrarian_else = deploy.index("\nelse\n", lazylibrarian_if)
+        lazylibrarian_end = deploy.index("\nfi\n", lazylibrarian_else)
+        self.assertIn(
+            "docker compose stop lazylibrarian",
+            deploy[lazylibrarian_else:lazylibrarian_end],
+        )
 
         evaluation_if = deploy.index(
-            'if [ "${#evaluation_services[@]}" -gt 0 ]; then'
+            'if [ "${#shelfarr_services[@]}" -gt 0 ]; then'
         )
         disabled_else = deploy.index("\nelse\n", evaluation_if)
         disabled_end = deploy.index("\nfi\n", disabled_else)
@@ -386,17 +627,70 @@ class DeploymentCheckpointTests(unittest.TestCase):
         ownership_gate = deploy.index(
             'WYSEARR_USENET_ENABLED requires SHELFARR_ENABLED=true'
         )
-        first_stop = deploy.index("docker compose stop huey shelfarr sabnzbd")
+        first_stop = deploy.index(
+            "docker compose stop huey bookbot abba lazylibrarian shelfarr sabnzbd"
+        )
         self.assertLess(ownership_gate, first_stop)
 
-    def test_arr_recreate_preserves_compose_dependency_metadata(self):
+    def test_deploy_recreates_qbittorrent_only_for_stale_gluetun_namespace(self):
         deploy = (SCRIPTS.parent / "deploy.sh").read_text(encoding="utf-8")
         self.assertIn(
-            "docker compose up -d --force-recreate sonarr radarr lidarr whisparr",
+            "docker compose up -d --no-deps gluetun",
             deploy,
         )
-        self.assertNotIn(
-            "--force-recreate --no-deps sonarr radarr lidarr whisparr",
+        self.assertIn(
+            'if ! service_is_running qbittorrent || \\\n'
+            '    [ "$qbittorrent_network_mode" != "container:$gluetun_container" ]; then\n'
+            "    docker compose up -d --no-deps --force-recreate qbittorrent\n"
+            "fi",
+            deploy,
+        )
+        self.assertIn(
+            "docker compose up -d --no-deps qbittorrent-port-forward",
+            deploy,
+        )
+        self.assertNotIn("docker compose restart qbittorrent", deploy)
+        self.assertNotIn("docker restart qbittorrent", deploy)
+        for command in (
+            'docker compose up -d --remove-orphans --no-deps "${core_services[@]}"',
+            "docker compose up -d --remove-orphans --no-deps shelfarr",
+            "docker compose up -d --remove-orphans --no-deps lazylibrarian",
+            "docker compose up -d --remove-orphans --no-deps abba",
+            "docker compose up -d --remove-orphans --no-deps bookbot huey",
+        ):
+            self.assertIn(command, deploy)
+
+    def test_deploy_validates_ebook_cascade_before_runtime_mutation(self):
+        deploy = (SCRIPTS.parent / "deploy.sh").read_text(encoding="utf-8")
+        policy_gate = deploy.index(
+            "production EBOOK_ACQUISITION_BACKENDS must be exactly lazylibrarian,shelfarr"
+        )
+        first_stop = deploy.index(
+            "docker compose stop huey bookbot abba lazylibrarian shelfarr sabnzbd"
+        )
+        self.assertLess(policy_gate, first_stop)
+        self.assertIn(
+            "EBOOK_ACQUISITION_BACKENDS contains a blank backend",
+            deploy,
+        )
+        self.assertIn(
+            "EBOOK_ACQUISITION_BACKENDS contains duplicate backend",
+            deploy,
+        )
+        self.assertIn(
+            "EBOOK_ACQUISITION_BACKENDS contains unknown or noncanonical backend",
+            deploy,
+        )
+        self.assertIn(
+            "EBOOK_ACQUISITION_OWNER must match the first configured ebook backend",
+            deploy,
+        )
+        self.assertIn(
+            "EBOOK_ACQUISITION_BACKENDS requires LAZYLIBRARIAN_ENABLED=true",
+            deploy,
+        )
+        self.assertIn(
+            "EBOOK_ACQUISITION_BACKENDS requires SHELFARR_ENABLED=true",
             deploy,
         )
 
@@ -408,16 +702,106 @@ class DeploymentCheckpointTests(unittest.TestCase):
         )[0]
         self.assertIn('if [ "$runtime_replaced" -eq 0 ]', restore)
         self.assertIn(
-            "deployment failed after runtime replacement; Huey/Shelfarr/SABnzbd are left stopped",
+            "deployment failed after runtime replacement; Huey/BookBot/ABBA/LazyLibrarian/Shelfarr/SABnzbd are left stopped",
             restore,
         )
-        self.assertIn("docker compose stop huey shelfarr sabnzbd", restore)
-        for service in ("huey", "sabnzbd", "shelfarr"):
+        self.assertIn(
+            "docker compose stop huey bookbot abba lazylibrarian shelfarr sabnzbd",
+            restore,
+        )
+        for service in (
+            "huey",
+            "bookbot",
+            "abba",
+            "lazylibrarian",
+            "sabnzbd",
+            "shelfarr",
+        ):
             self.assertIn(f"{service}_was_running=0", deploy)
             self.assertIn(f"service_is_running {service}", deploy)
             self.assertIn(f'if [ "${service}_was_running" -eq 1 ]', restore)
             self.assertIn(f"docker compose start {service}", restore)
             self.assertIn(f"docker compose stop {service}", restore)
+
+
+class LazyLibrarianDeploymentTests(unittest.TestCase):
+    def test_lazylibrarian_is_digest_pinned_private_persistent_and_mount_minimal(self):
+        compose = (SCRIPTS.parent / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(
+            r"(?ms)^  lazylibrarian:\n(.*?)(?=^  \S|\Z)", compose
+        )
+        self.assertIsNotNone(match)
+        service = match.group(1)
+        self.assertIn(
+            "lscr.io/linuxserver/lazylibrarian@sha256:"
+            "f2fd332fb4c5918571f8babd4d52fbcb9ca514be254ba101a47c275cd57eb33f",
+            service,
+        )
+        self.assertIn("02af0464-ls331", service)
+        self.assertIn("<<: *common", service)
+        self.assertIn("PUID: ${PUID:-1000}", service)
+        self.assertIn("PGID: ${PGID:-1000}", service)
+        self.assertIn("TZ: ${TZ:-Pacific/Honolulu}", service)
+        self.assertIn('UMASK: "077"', service)
+        self.assertIn("./config/lazylibrarian:/config", service)
+        self.assertIn(
+            '"127.0.0.1:${LAZYLIBRARIAN_ADMIN_PORT:-5299}:5299"', service
+        )
+        self.assertIn("http://127.0.0.1:5299/home", service)
+        self.assertIn("qbittorrent:\n        condition: service_healthy", service)
+        self.assertIn("prowlarr:\n        condition: service_healthy", service)
+        self.assertNotIn(":/downloads", service)
+        self.assertNotIn(":/media", service)
+        self.assertNotIn("/mnt/media", service)
+
+    def test_huey_receives_ordered_backends_and_lazylibrarian_api_contract(self):
+        compose = (SCRIPTS.parent / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(r"(?ms)^  huey:\n(.*?)(?=^  \S|\Z)", compose)
+        self.assertIsNotNone(match)
+        huey = match.group(1)
+        expected = (
+            "EBOOK_ACQUISITION_BACKENDS: ${EBOOK_ACQUISITION_BACKENDS:-}",
+            "EBOOK_ACQUISITION_OWNER: ${EBOOK_ACQUISITION_OWNER:-}",
+            "LAZYLIBRARIAN_ENABLED: ${LAZYLIBRARIAN_ENABLED:-false}",
+            "LAZYLIBRARIAN_URL: ${LAZYLIBRARIAN_URL:-http://lazylibrarian:5299}",
+            "LAZYLIBRARIAN_API_KEY: ${LAZYLIBRARIAN_API_KEY:-}",
+            "LAZYLIBRARIAN_TIMEOUT_SECONDS: ${LAZYLIBRARIAN_TIMEOUT_SECONDS:-30}",
+            "LAZYLIBRARIAN_SEARCH_LIMIT: ${LAZYLIBRARIAN_SEARCH_LIMIT:-10}",
+            "LAZYLIBRARIAN_METADATA_SOURCE: ${LAZYLIBRARIAN_METADATA_SOURCE:-OpenLibrary}",
+            "HUEY_LAZYLIBRARIAN_MINIMUM_CONFIDENCE: ${HUEY_LAZYLIBRARIAN_MINIMUM_CONFIDENCE:-0.80}",
+            "HUEY_LAZYLIBRARIAN_RUNNER_UP_GAP: ${HUEY_LAZYLIBRARIAN_RUNNER_UP_GAP:-0.05}",
+        )
+        for setting in expected:
+            self.assertIn(setting, huey)
+
+        example = (SCRIPTS.parent / ".env.example").read_text(encoding="utf-8")
+        self.assertIn(
+            "EBOOK_ACQUISITION_BACKENDS=lazylibrarian,shelfarr\n", example
+        )
+        self.assertIn("EBOOK_ACQUISITION_OWNER=lazylibrarian\n", example)
+        self.assertIn("LAZYLIBRARIAN_ENABLED=true\n", example)
+        self.assertIn("SHELFARR_ENABLED=true\n", example)
+        self.assertIn("LAZYLIBRARIAN_ADMIN_PORT=5299\n", example)
+        self.assertIn("LAZYLIBRARIAN_URL=http://lazylibrarian:5299\n", example)
+        self.assertIn("LAZYLIBRARIAN_API_KEY=\n", example)
+        self.assertNotRegex(example, r"(?m)^LAZYLIBRARIAN_API_KEY=.+$")
+
+    def test_shelfarr_remains_independently_deployable_as_rollback(self):
+        compose = (SCRIPTS.parent / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        deploy = (SCRIPTS.parent / "deploy.sh").read_text(encoding="utf-8")
+        self.assertIn("  shelfarr:\n", compose)
+        self.assertIn("shelfarr_services=(sabnzbd shelfarr)", deploy)
+        self.assertNotIn("bootstrap_lazylibrarian.py --enable", deploy)
+        self.assertNotIn(
+            'EBOOK_ACQUISITION_OWNER" = "shelfarr"',
+            deploy[deploy.index('case "$shelfarr_flag" in'):],
+        )
 
 
 class ShelfarrDeploymentTests(unittest.TestCase):
@@ -432,7 +816,7 @@ class ShelfarrDeploymentTests(unittest.TestCase):
         )
         self.assertIn("enabled: usenet_enabled", convergence)
 
-    def test_evaluation_services_are_immutable_private_and_persistent(self):
+    def test_shelfarr_ebook_services_are_immutable_private_and_persistent(self):
         compose = (SCRIPTS.parent / "docker-compose.yml").read_text(
             encoding="utf-8"
         )
@@ -453,11 +837,11 @@ class ShelfarrDeploymentTests(unittest.TestCase):
             "./state/shelfarr-staging/ebooks:/ebooks/.shelfarr-staging", compose
         )
         self.assertIn("/ebooks/Books:/ebooks", compose)
-        self.assertIn("/audiobooks:/audiobooks", compose)
         shelfarr = re.search(r"(?ms)^  shelfarr:\n(.*?)(?=^  \S|\Z)", compose)
         sabnzbd = re.search(r"(?ms)^  sabnzbd:\n(.*?)(?=^  \S|\Z)", compose)
         self.assertIsNotNone(shelfarr)
         self.assertIsNotNone(sabnzbd)
+        self.assertNotIn("/audiobooks", shelfarr.group(1))
         self.assertNotIn("}:/downloads\n", shelfarr.group(1))
         self.assertNotIn("}:/downloads\n", sabnzbd.group(1))
         self.assertIn("/shelfarr:/downloads/shelfarr", shelfarr.group(1))
@@ -479,16 +863,75 @@ class ShelfarrDeploymentTests(unittest.TestCase):
             "HUEY_SELECTION_TTL_SECONDS: ${HUEY_SELECTION_TTL_SECONDS:-900}",
             compose,
         )
+        self.assertIn("ABBA_ENABLED: ${ABBA_ENABLED:-false}", compose)
+        self.assertIn("ABBA_URL: ${ABBA_URL:-http://abba:5078}", compose)
+        self.assertIn("ABBA_SEARCH_LIMIT: ${ABBA_SEARCH_LIMIT:-10}", compose)
+        self.assertIn(
+            "HUEY_ABBA_MINIMUM_CONFIDENCE: ${HUEY_ABBA_MINIMUM_CONFIDENCE:-0.82}",
+            compose,
+        )
+        self.assertIn(
+            "HUEY_ABBA_RUNNER_UP_GAP: ${HUEY_ABBA_RUNNER_UP_GAP:-0.08}",
+            compose,
+        )
 
-    def test_huey_is_not_health_coupled_to_evaluation_services(self):
+    def test_huey_has_no_hard_dependency_on_optional_book_services(self):
         compose = (SCRIPTS.parent / "docker-compose.yml").read_text(
             encoding="utf-8"
         )
         match = re.search(r"(?ms)^  huey:\n(.*?)(?=^  \S|\Z)", compose)
         self.assertIsNotNone(match)
         huey = match.group(1)
-        self.assertNotIn("shelfarr:", huey)
-        self.assertNotIn("sabnzbd:", huey)
+        dependencies = re.search(
+            r"(?ms)^    depends_on:\n(.*?)(?=^    \S|\Z)", huey
+        )
+        self.assertIsNotNone(dependencies)
+        dependency_block = dependencies.group(1)
+        for optional_service in ("abba", "lazylibrarian", "shelfarr", "sabnzbd"):
+            self.assertNotIn(f"      {optional_service}:\n", dependency_block)
+        for required_service in (
+            "qbittorrent",
+            "prowlarr",
+            "sonarr",
+            "radarr",
+            "lidarr",
+        ):
+            self.assertIn(f"      {required_service}:\n", dependency_block)
+        self.assertIn("condition: service_healthy", dependency_block)
+
+    def test_abba_is_private_read_only_and_owns_exact_downloader_path(self):
+        compose = (SCRIPTS.parent / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        dockerfile = (SCRIPTS.parent / "docker" / "abba" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(r"(?ms)^  abba:\n(.*?)(?=^  \S|\Z)", compose)
+        self.assertIsNotNone(match)
+        abba = match.group(1)
+        self.assertIn("dockerfile: docker/abba/Dockerfile", abba)
+        self.assertIn('user: "${PUID:-1000}:${PGID:-1000}"', abba)
+        self.assertIn("read_only: true", abba)
+        self.assertIn("no-new-privileges:true", abba)
+        self.assertIn("cap_drop:\n      - ALL", abba)
+        self.assertIn("./config/abba:/config", abba)
+        self.assertNotIn("/downloads:", abba)
+        self.assertNotIn("ports:", abba)
+        self.assertIn("DL_USERNAME: ${QBITTORRENT_USERNAME:-admin}", abba)
+        self.assertIn("DL_PASSWORD: ${QBITTORRENT_PASSWORD}", abba)
+        self.assertIn("DL_CATEGORY: audiobooks", abba)
+        self.assertIn("SAVE_PATH_BASE: /downloads/audiobooks", abba)
+        self.assertIn("ABBA_DB_PATH: /config/abba.db", abba)
+        self.assertIn('ABBA_MAX_RESULTS: "10"', abba)
+        self.assertIn("PORT: \"5078\"", abba)
+        self.assertIn("127.0.0.1:5078/health", abba)
+        self.assertNotIn("/api/search", abba)
+        self.assertIn(
+            "FROM ghcr.io/jamesry96/audiobookbay-automated@sha256:"
+            "be58c8a0c2ef4ec4c1a1cc6714791b5b72c8bf62a24774ee8c784257c87a2678",
+            dockerfile,
+        )
+        self.assertNotIn(":latest", dockerfile)
 
     def test_bookbot_does_not_claim_shelfarr_category(self):
         sys.path.insert(0, str(SCRIPTS / "processing"))
@@ -541,28 +984,189 @@ class ShelfarrDeploymentTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    @staticmethod
+    def _create_huey_validation_database(database: Path) -> None:
+        schema = (SCRIPTS / "huey" / "schema.sql").read_text(encoding="utf-8")
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.executescript(schema)
+            connection.executescript(
+                """
+                CREATE UNIQUE INDEX requests_message_id_uq
+                    ON requests(message_id);
+                CREATE UNIQUE INDEX requests_active_target_uq
+                    ON requests(target_key)
+                    WHERE target_key IS NOT NULL
+                      AND status IN (
+                          'new', 'processing', 'awaiting_selection',
+                          'queued', 'complete', 'completed'
+                      );
+                CREATE UNIQUE INDEX requests_active_abba_hash_uq
+                    ON requests(lower(external_id))
+                    WHERE service = 'abba'
+                      AND external_id IS NOT NULL
+                      AND canonical_request_id IS NULL
+                      AND status IN (
+                          'processing', 'queued', 'complete', 'completed'
+                      );
+                CREATE UNIQUE INDEX requests_active_abba_candidate_uq
+                    ON requests(abba_candidate_id)
+                    WHERE service = 'abba'
+                      AND abba_candidate_id IS NOT NULL
+                      AND canonical_request_id IS NULL
+                      AND status IN (
+                          'processing', 'queued', 'complete', 'completed'
+                      );
+                CREATE INDEX requests_canonical_request_idx
+                    ON requests(canonical_request_id);
+                """
+            )
+
+    @staticmethod
+    def _insert_huey_validation_request(
+        connection: sqlite3.Connection,
+        request_id: int,
+        *,
+        status: str,
+        candidate_id: str | None = None,
+        info_hash: str | None = None,
+        canonical_request_id: int | None = None,
+        service: str = "abba",
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO requests(
+                id, discord_user_id, discord_username, channel_id, message_id,
+                media_type, raw_request, status, service, external_id,
+                external_status, abba_candidate_id, canonical_request_id
+            ) VALUES (?, '1', 'requester', '3', ?, 'audiobooks', 'request',
+                      ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                f"message-{request_id}",
+                status,
+                service,
+                info_hash,
+                "canonical_duplicate" if canonical_request_id is not None else None,
+                candidate_id,
+                canonical_request_id,
+            ),
+        )
+
+    @staticmethod
+    def _create_abba_validation_database(database: Path) -> None:
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.executescript(
+                """
+                CREATE TABLE acquisitions (
+                    correlation_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL,
+                    info_hash TEXT,
+                    title TEXT,
+                    category TEXT NOT NULL,
+                    save_path TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    error_code TEXT,
+                    error_message TEXT,
+                    error_retryable INTEGER NOT NULL DEFAULT 0,
+                    error_http_status INTEGER,
+                    canonical_correlation_id TEXT,
+                    canonical_candidate_correlation_id TEXT,
+                    mutation_started_at REAL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX acquisitions_info_hash_idx
+                    ON acquisitions(info_hash);
+                CREATE UNIQUE INDEX acquisitions_hash_owner_uq
+                    ON acquisitions(info_hash)
+                    WHERE info_hash IS NOT NULL
+                      AND canonical_correlation_id IS NULL
+                      AND (
+                          state != 'failed'
+                          OR mutation_started_at IS NOT NULL
+                      );
+                CREATE UNIQUE INDEX acquisitions_candidate_owner_uq
+                    ON acquisitions(candidate_id)
+                    WHERE canonical_candidate_correlation_id IS NULL
+                      AND (
+                          state != 'failed'
+                          OR mutation_started_at IS NOT NULL
+                      );
+                CREATE INDEX acquisitions_canonical_idx
+                    ON acquisitions(canonical_correlation_id);
+                CREATE INDEX acquisitions_candidate_canonical_idx
+                    ON acquisitions(canonical_candidate_correlation_id);
+                """
+            )
+
+    @staticmethod
+    def _insert_abba_validation_acquisition(
+        connection: sqlite3.Connection,
+        correlation_id: str,
+        *,
+        candidate_id: str,
+        info_hash: str,
+        state: str = "queued",
+        canonical_correlation_id: str | None = None,
+        canonical_candidate_correlation_id: str | None = None,
+        mutation_started_at: float | None = 1.0,
+        error_code: str | None = None,
+        error_retryable: int = 0,
+        error_http_status: int | None = None,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO acquisitions(
+                correlation_id, candidate_id, info_hash, title, category,
+                save_path, tag, state, error_code, error_retryable,
+                error_http_status, canonical_correlation_id,
+                canonical_candidate_correlation_id, mutation_started_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 'title', 'audiobooks',
+                      '/downloads/audiobooks', 'huey-tag', ?, ?, ?, ?, ?, ?,
+                      ?, 1.0, 1.0)
+            """,
+            (
+                correlation_id,
+                candidate_id,
+                info_hash,
+                state,
+                error_code,
+                error_retryable,
+                error_http_status,
+                canonical_correlation_id,
+                canonical_candidate_correlation_id,
+                mutation_started_at,
+            ),
+        )
+
     def test_env_parser_ignores_comments_and_preserves_equals(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"
             path.write_text("# ignored\nONE=1\nTOKEN=abc=def\n\n", encoding="utf-8")
             self.assertEqual(validate.load_env(path), {"ONE": "1", "TOKEN": "abc=def"})
 
-    def test_usenet_feature_flag_is_literal_and_blank_means_disabled(self):
-        for value, expected_enabled in (("", False), ("false", False), ("true", True)):
-            with self.subTest(value=value):
-                valid, enabled, _detail = validate._strict_feature_flag(
-                    {"WYSEARR_USENET_ENABLED": value},
-                    "WYSEARR_USENET_ENABLED",
-                )
-                self.assertTrue(valid)
-                self.assertIs(enabled, expected_enabled)
-        for value in (" true ", "TRUE", "1", "yes"):
-            with self.subTest(value=value):
-                valid, _enabled, _detail = validate._strict_feature_flag(
-                    {"WYSEARR_USENET_ENABLED": value},
-                    "WYSEARR_USENET_ENABLED",
-                )
-                self.assertFalse(valid)
+    def test_feature_flags_are_literal_and_blank_means_disabled(self):
+        for key in validate.STRICT_FEATURE_FLAGS:
+            for value, expected_enabled in (
+                ("", False),
+                ("false", False),
+                ("true", True),
+            ):
+                with self.subTest(key=key, value=value):
+                    valid, enabled, _detail = validate._strict_feature_flag(
+                        {key: value}, key
+                    )
+                    self.assertTrue(valid)
+                    self.assertIs(enabled, expected_enabled)
+            for value in (" true ", "TRUE", "1", "yes"):
+                with self.subTest(key=key, value=value):
+                    valid, _enabled, _detail = validate._strict_feature_flag(
+                        {key: value}, key
+                    )
+                    self.assertFalse(valid)
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"
@@ -585,6 +1189,1459 @@ class ValidationTests(unittest.TestCase):
                     duplicate, "WYSEARR_USENET_ENABLED"
                 )[0]
             )
+
+            path.write_text(
+                "ABBA_ENABLED=true\nABBA_ENABLED=false\n",
+                encoding="utf-8",
+            )
+            duplicate = validate.load_env(path)
+            self.assertFalse(
+                validate._strict_feature_flag(duplicate, "ABBA_ENABLED")[0]
+            )
+
+    def test_ebook_backend_policy_order_and_availability_are_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text(
+                "LAZYLIBRARIAN_ENABLED=true\n"
+                "LAZYLIBRARIAN_ENABLED=false\n"
+                "EBOOK_ACQUISITION_BACKENDS=lazylibrarian,shelfarr\n"
+                "EBOOK_ACQUISITION_BACKENDS=lazylibrarian,shelfarr\n"
+                "EBOOK_ACQUISITION_OWNER=lazylibrarian\n"
+                "EBOOK_ACQUISITION_OWNER=shelfarr\n",
+                encoding="utf-8",
+            )
+            environment = validate.load_env(path)
+        self.assertFalse(
+            validate._strict_feature_flag(
+                environment, "LAZYLIBRARIAN_ENABLED"
+            )[0]
+        )
+        self.assertFalse(validate._strict_ebook_owner(environment)[0])
+        self.assertFalse(validate._strict_ebook_backends(environment)[0])
+
+        self.assertEqual(
+            validate._strict_ebook_owner({}),
+            (True, "shelfarr", "literal shelfarr"),
+        )
+        for owner in ("shelfarr", "lazylibrarian", "direct"):
+            with self.subTest(owner=owner):
+                valid, selected, _detail = validate._strict_ebook_owner(
+                    {"EBOOK_ACQUISITION_OWNER": owner}
+                )
+                self.assertTrue(valid)
+                self.assertEqual(selected, owner)
+        for owner in (" lazylibrarian", "LAZYLIBRARIAN", "other"):
+            with self.subTest(invalid_owner=owner):
+                self.assertFalse(
+                    validate._strict_ebook_owner(
+                        {"EBOOK_ACQUISITION_OWNER": owner}
+                    )[0]
+                )
+        self.assertTrue(
+            validate._strict_ebook_owner(
+                {"EBOOK_ACQUISITION_OWNER": "   "}
+            )[0]
+        )
+
+        valid, backends, _detail = validate._strict_ebook_backends(
+            {
+                "EBOOK_ACQUISITION_BACKENDS": " lazylibrarian , shelfarr ",
+                "EBOOK_ACQUISITION_OWNER": "lazylibrarian",
+            }
+        )
+        self.assertTrue(valid)
+        self.assertEqual(backends, ("lazylibrarian", "shelfarr"))
+        self.assertTrue(
+            validate.ebook_backend_order_check(
+                backends, policy_valid=valid
+            ).ok
+        )
+        reversed_valid, reversed_backends, _detail = (
+            validate._strict_ebook_backends(
+                {"EBOOK_ACQUISITION_BACKENDS": "shelfarr,lazylibrarian"}
+            )
+        )
+        self.assertTrue(reversed_valid)
+        self.assertFalse(
+            validate.ebook_backend_order_check(
+                reversed_backends, policy_valid=reversed_valid
+            ).ok
+        )
+
+        invalid_policies = (
+            "",
+            "lazylibrarian,",
+            ",shelfarr",
+            "lazylibrarian,,shelfarr",
+            "lazylibrarian, ,shelfarr",
+            "LazyLibrarian,shelfarr",
+            "lazylibrarian,direct",
+            "lazylibrarian,lazylibrarian",
+        )
+        for policy in invalid_policies:
+            with self.subTest(invalid_policy=policy):
+                environment = {"EBOOK_ACQUISITION_BACKENDS": policy}
+                if policy == "":
+                    # Empty is a deliberate compatibility fallback, not a
+                    # malformed list; it still fails the production order.
+                    valid, backends, _detail = validate._strict_ebook_backends(
+                        environment
+                    )
+                    self.assertTrue(valid)
+                    self.assertFalse(
+                        validate.ebook_backend_order_check(
+                            backends, policy_valid=valid
+                        ).ok
+                    )
+                else:
+                    self.assertFalse(
+                        validate._strict_ebook_backends(environment)[0]
+                    )
+
+        self.assertFalse(
+            validate._strict_ebook_backends(
+                {
+                    "EBOOK_ACQUISITION_BACKENDS": "lazylibrarian,shelfarr",
+                    "EBOOK_ACQUISITION_OWNER": "shelfarr",
+                }
+            )[0]
+        )
+        legacy_valid, legacy_backends, _detail = validate._strict_ebook_backends(
+            {"EBOOK_ACQUISITION_OWNER": "direct"}
+        )
+        self.assertTrue(legacy_valid)
+        self.assertEqual(legacy_backends, ("direct",))
+        self.assertFalse(
+            validate.ebook_backend_order_check(
+                legacy_backends, policy_valid=legacy_valid
+            ).ok
+        )
+        self.assertFalse(
+            validate._strict_ebook_backends(
+                {"EBOOK_ACQUISITION_BACKENDS": "direct"}
+            )[0]
+        )
+        credentials = {
+            "LAZYLIBRARIAN_URL": "http://lazylibrarian:5299",
+            "LAZYLIBRARIAN_API_KEY": "a" * 32,
+            "SHELFARR_URL": "http://shelfarr",
+            "SHELFARR_API_TOKEN": "private-token",
+        }
+        self.assertTrue(
+            validate.ebook_backend_availability_check(
+                ("lazylibrarian", "shelfarr"),
+                policy_valid=True,
+                environment=credentials,
+                shelfarr_enabled=True,
+                shelfarr_flag_valid=True,
+                lazylibrarian_enabled=True,
+                lazylibrarian_flag_valid=True,
+            ).ok
+        )
+        for unavailable in ("lazylibrarian", "shelfarr"):
+            with self.subTest(unavailable=unavailable):
+                self.assertFalse(
+                    validate.ebook_backend_availability_check(
+                        ("lazylibrarian", "shelfarr"),
+                        policy_valid=True,
+                        environment=credentials,
+                        shelfarr_enabled=unavailable != "shelfarr",
+                        shelfarr_flag_valid=True,
+                        lazylibrarian_enabled=unavailable != "lazylibrarian",
+                        lazylibrarian_flag_valid=True,
+                    ).ok
+                )
+        for missing_key in ("LAZYLIBRARIAN_API_KEY", "SHELFARR_API_TOKEN"):
+            with self.subTest(missing_credential=missing_key):
+                incomplete = dict(credentials)
+                incomplete[missing_key] = ""
+                self.assertFalse(
+                    validate.ebook_backend_availability_check(
+                        ("lazylibrarian", "shelfarr"),
+                        policy_valid=True,
+                        environment=incomplete,
+                        shelfarr_enabled=True,
+                        shelfarr_flag_valid=True,
+                        lazylibrarian_enabled=True,
+                        lazylibrarian_flag_valid=True,
+                    ).ok
+                )
+
+    def test_lazylibrarian_runtime_has_only_config_and_exact_huey_route(self):
+        secret = "a" * 32
+        prowlarr_secret = "prowlarr-private-key"
+        shelfarr_secret = "shelfarr-private-token"
+        environment = {
+            "PUID": "1000",
+            "PGID": "1000",
+            "TZ": "Pacific/Honolulu",
+            "EBOOK_ACQUISITION_BACKENDS": "lazylibrarian,shelfarr",
+            "EBOOK_ACQUISITION_OWNER": "lazylibrarian",
+            "LAZYLIBRARIAN_URL": "http://lazylibrarian:5299",
+            "LAZYLIBRARIAN_API_KEY": secret,
+            "PROWLARR_API_KEY": prowlarr_secret,
+            "SHELFARR_API_TOKEN": shelfarr_secret,
+        }
+        lazylibrarian_inspect = {
+            "Config": {
+                "Image": (
+                    "lscr.io/linuxserver/lazylibrarian@sha256:"
+                    "f2fd332fb4c5918571f8babd4d52fbcb9ca514be254ba101a47c275cd57eb33f"
+                ),
+                "Env": [
+                    "PUID=1000",
+                    "PGID=1000",
+                    "TZ=Pacific/Honolulu",
+                    "UMASK=077",
+                ],
+            },
+            "Mounts": [
+                {
+                    "Destination": "/config",
+                    "Source": str(
+                        (
+                            validate.STACK_ROOT / "config" / "lazylibrarian"
+                        ).resolve()
+                    ),
+                    "RW": True,
+                }
+            ],
+        }
+        huey_inspect = {
+            "Config": {
+                "Env": [
+                    "EBOOK_ACQUISITION_BACKENDS=lazylibrarian,shelfarr",
+                    "EBOOK_ACQUISITION_OWNER=lazylibrarian",
+                    "LAZYLIBRARIAN_ENABLED=true",
+                    "LAZYLIBRARIAN_URL=http://lazylibrarian:5299",
+                    f"LAZYLIBRARIAN_API_KEY={secret}",
+                    f"PROWLARR_API_KEY={prowlarr_secret}",
+                    "LAZYLIBRARIAN_TIMEOUT_SECONDS=30",
+                    "LAZYLIBRARIAN_SEARCH_LIMIT=10",
+                    "LAZYLIBRARIAN_METADATA_SOURCE=OpenLibrary",
+                    "HUEY_LAZYLIBRARIAN_MINIMUM_CONFIDENCE=0.80",
+                    "HUEY_LAZYLIBRARIAN_RUNNER_UP_GAP=0.05",
+                    "SHELFARR_ENABLED=true",
+                    "SHELFARR_URL=http://shelfarr",
+                    f"SHELFARR_API_TOKEN={shelfarr_secret}",
+                    "SHELFARR_TIMEOUT_SECONDS=20",
+                    "SHELFARR_SEARCH_LIMIT=10",
+                    "SHELFARR_LANGUAGE=en",
+                    "HUEY_SHELFARR_MINIMUM_CONFIDENCE=0.80",
+                    "HUEY_SHELFARR_RUNNER_UP_GAP=0.05",
+                ]
+            }
+        }
+
+        def runner_for(ll_inspect, huey_details=None):
+            huey_details = huey_details or huey_inspect
+            return mock.MagicMock(
+                side_effect=[
+                    mock.MagicMock(returncode=0, stdout="ll-id\n"),
+                    mock.MagicMock(returncode=0, stdout=json.dumps([ll_inspect])),
+                    mock.MagicMock(returncode=0, stdout="huey-id\n"),
+                    mock.MagicMock(returncode=0, stdout=json.dumps([huey_details])),
+                ]
+            )
+
+        checks = validate.lazylibrarian_runtime_checks(
+            environment, runner=runner_for(lazylibrarian_inspect)
+        )
+        self.assertTrue(all(check.ok for check in checks))
+        self.assertNotIn(secret, repr(checks))
+        self.assertNotIn(prowlarr_secret, repr(checks))
+        self.assertNotIn(shelfarr_secret, repr(checks))
+
+        stale_huey = json.loads(json.dumps(huey_inspect))
+        stale_huey["Config"]["Env"] = [
+            item
+            if not item.startswith("PROWLARR_API_KEY=")
+            else "PROWLARR_API_KEY=stale-key"
+            for item in stale_huey["Config"]["Env"]
+        ]
+        checks = {
+            check.name: check
+            for check in validate.lazylibrarian_runtime_checks(
+                environment,
+                runner=runner_for(lazylibrarian_inspect, stale_huey),
+            )
+        }
+        self.assertFalse(checks["huey:lazylibrarian-routing"].ok)
+        self.assertNotIn("stale-key", repr(checks))
+        self.assertNotIn(prowlarr_secret, repr(checks))
+
+        stale_policy = json.loads(json.dumps(huey_inspect))
+        stale_policy["Config"]["Env"] = [
+            item
+            if not item.startswith("EBOOK_ACQUISITION_BACKENDS=")
+            else "EBOOK_ACQUISITION_BACKENDS=shelfarr,lazylibrarian"
+            for item in stale_policy["Config"]["Env"]
+        ]
+        checks = {
+            check.name: check
+            for check in validate.lazylibrarian_runtime_checks(
+                environment,
+                runner=runner_for(lazylibrarian_inspect, stale_policy),
+            )
+        }
+        self.assertFalse(checks["huey:lazylibrarian-routing"].ok)
+
+        excessive = json.loads(json.dumps(lazylibrarian_inspect))
+        excessive["Mounts"].append(
+            {"Destination": "/downloads", "Source": "/private/payload", "RW": True}
+        )
+        checks = {
+            check.name: check
+            for check in validate.lazylibrarian_runtime_checks(
+                environment, runner=runner_for(excessive)
+            )
+        }
+        self.assertFalse(checks["lazylibrarian:persistence"].ok)
+
+    def test_lazylibrarian_admin_port_must_be_loopback(self):
+        def runner_for(host_ip):
+            return mock.MagicMock(
+                side_effect=[
+                    mock.MagicMock(returncode=0, stdout="ll-id\n"),
+                    mock.MagicMock(
+                        returncode=0,
+                        stdout=json.dumps(
+                            [
+                                {
+                                    "HostConfig": {
+                                        "PortBindings": {
+                                            "5299/tcp": [
+                                                {"HostIp": host_ip, "HostPort": "5299"}
+                                            ]
+                                        }
+                                    }
+                                }
+                            ]
+                        ),
+                    ),
+                ]
+            )
+
+        with mock.patch.object(validate.subprocess, "run", runner_for("127.0.0.1")):
+            self.assertTrue(
+                validate.private_published_port_check("lazylibrarian").ok
+            )
+        with mock.patch.object(validate.subprocess, "run", runner_for("0.0.0.0")):
+            self.assertFalse(
+                validate.private_published_port_check("lazylibrarian").ok
+            )
+
+    def test_lazylibrarian_private_config_accepts_default_elision_and_checks_secrets(self):
+        secret = "b" * 32
+        qbit_secret = "qbit-private-password"
+        environment = {
+            "EBOOK_ACQUISITION_OWNER": "lazylibrarian",
+            "LAZYLIBRARIAN_ENABLED": "true",
+            "LAZYLIBRARIAN_API_KEY": secret,
+            "QBITTORRENT_USERNAME": "qbit-user",
+            "QBITTORRENT_PASSWORD": qbit_secret,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env_path = root / ".env"
+            env_path.write_text(
+                "".join(f"{key}={value}\n" for key, value in environment.items()),
+                encoding="utf-8",
+            )
+            bootstrap_lazylibrarian.prepare_lazylibrarian_config(root)
+            config = root / "config" / "lazylibrarian" / "config.ini"
+
+            checks = validate.lazylibrarian_config_checks(config, environment)
+            self.assertTrue(all(check.ok for check in checks))
+            self.assertNotIn(secret, repr(checks))
+            self.assertNotIn(qbit_secret, repr(checks))
+
+            # The pinned image removes values that equal its defaults, so only
+            # the non-default credentials are guaranteed to remain on disk.
+            config.write_text(
+                "[API]\n"
+                f"api_key = {secret}\n"
+                "[QBITTORRENT]\n"
+                "qbittorrent_user = qbit-user\n"
+                f"qbittorrent_pass = {qbit_secret}\n",
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+            checks = validate.lazylibrarian_config_checks(config, environment)
+            self.assertTrue(all(check.ok for check in checks))
+
+            exact_config = config.read_text(encoding="utf-8")
+            config.write_text(
+                exact_config.replace(qbit_secret, "stale-qbit-password"),
+                encoding="utf-8",
+            )
+            stale_qbit_checks = {
+                check.name: check
+                for check in validate.lazylibrarian_config_checks(
+                    config, environment
+                )
+            }
+            self.assertFalse(
+                stale_qbit_checks["lazylibrarian:config-secrets"].ok
+            )
+            self.assertNotIn(qbit_secret, repr(stale_qbit_checks))
+            self.assertNotIn("stale-qbit-password", repr(stale_qbit_checks))
+            config.write_text(exact_config, encoding="utf-8")
+
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(secret, "e" * 32),
+                encoding="utf-8",
+            )
+            checks = {
+                check.name: check
+                for check in validate.lazylibrarian_config_checks(
+                    config, environment
+                )
+            }
+            self.assertFalse(checks["lazylibrarian:config-secrets"].ok)
+
+            config.chmod(0o640)
+            checks = {
+                check.name: check
+                for check in validate.lazylibrarian_config_checks(
+                    config, environment
+                )
+            }
+            self.assertFalse(checks["lazylibrarian:config-permissions"].ok)
+
+    def test_lazylibrarian_api_probe_is_read_only_bounded_and_secret_safe(self):
+        secret = "c" * 32
+        help_text = "\n".join(validate.LAZYLIBRARIAN_API_COMMANDS)
+
+        class Response:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def getcode(self):
+                return self.status
+
+            def read(self, _limit):
+                return self.payload
+
+            def close(self):
+                return None
+
+        class Opener:
+            def __init__(self, missing_command=None, version=None):
+                self.commands = []
+                self.missing_command = missing_command
+                self.version = (
+                    validate.EXPECTED_LAZYLIBRARIAN_VERSION
+                    if version is None
+                    else version
+                )
+
+            def open(self, request, timeout):
+                self.assert_timeout = timeout
+                query = urllib.parse.parse_qs(
+                    request.data.decode("utf-8")
+                )
+                self.commands.append(query["cmd"][0])
+                if query["cmd"] == ["getVersion"]:
+                    payload = json.dumps(
+                        {
+                            "Success": True,
+                            "current_version": self.version,
+                        }
+                    ).encode()
+                else:
+                    rendered = help_text.replace(self.missing_command or "\0", "")
+                    payload = rendered.encode()
+                return Response(payload)
+
+        opener = Opener()
+        check = validate.lazylibrarian_api_capability_check(
+            "5299", secret, opener=opener
+        )
+        self.assertTrue(check.ok)
+        self.assertEqual(opener.commands, ["getVersion", "help"])
+        self.assertNotIn(secret, repr(check))
+        for forbidden in ("findBook", "addBook", "searchBook", "queueBook"):
+            self.assertNotIn(forbidden, opener.commands)
+
+        check = validate.lazylibrarian_api_capability_check(
+            "5299", secret, opener=Opener(missing_command="searchBook")
+        )
+        self.assertFalse(check.ok)
+        self.assertNotIn(secret, repr(check))
+
+        # The pinned LSIO build may omit source-version metadata. Its exact
+        # image digest is validated independently by the runtime gate.
+        self.assertTrue(
+            validate.lazylibrarian_api_capability_check(
+                "5299", secret, opener=Opener(version="")
+            ).ok
+        )
+        self.assertFalse(
+            validate.lazylibrarian_api_capability_check(
+                "5299", secret, opener=Opener(version="unexpected")
+            ).ok
+        )
+
+    def test_lazylibrarian_effective_config_reads_every_key_with_semantic_values(self):
+        secret = "f" * 32
+
+        class Response:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def getcode(self):
+                return self.status
+
+            def read(self, limit):
+                self.limit = limit
+                return self.payload
+
+            def close(self):
+                return None
+
+        class EffectiveOpener:
+            def __init__(self, overrides=None):
+                self.overrides = dict(overrides or {})
+                self.requests = []
+
+            def open(self, request, timeout):
+                self.requests.append(request)
+                self.timeout = timeout
+                body = urllib.parse.parse_qs(
+                    request.data.decode("utf-8"), keep_blank_values=True
+                )
+                self.asserted_key = body["apikey"][0]
+                self.asserted_command = body["cmd"][0]
+                section = body["group"][0]
+                key = body["name"][0].casefold()
+                expected = validate.LAZYLIBRARIAN_EFFECTIVE_SETTINGS[section][key]
+                value = self.overrides.get((section, key))
+                if value is None:
+                    if expected == "0":
+                        value = ""
+                    elif expected == "1":
+                        value = "True"
+                    elif (section, key) in validate.LAZYLIBRARIAN_CSV_SETTINGS:
+                        value = ",".join(
+                            item.strip() for item in expected.split(",")
+                        )
+                    else:
+                        value = expected
+                payload = value if isinstance(value, bytes) else f"[{value}]".encode()
+                return Response(payload)
+
+        opener = EffectiveOpener()
+        check = validate.lazylibrarian_effective_config_check(
+            "5299", secret, opener=opener
+        )
+        expected_count = sum(
+            len(section_values)
+            for section_values in validate.LAZYLIBRARIAN_EFFECTIVE_SETTINGS.values()
+        )
+        self.assertTrue(check.ok)
+        self.assertEqual(len(opener.requests), expected_count)
+        self.assertIn(f"{expected_count} effective settings", check.detail)
+        self.assertNotIn(secret, repr(check))
+        self.assertTrue(
+            validate._lazylibrarian_setting_matches(
+                "GENERAL", "audio_tab", "False", "0"
+            )
+        )
+        self.assertTrue(
+            validate._lazylibrarian_setting_matches(
+                "GENERAL",
+                "ebook_type",
+                "PDF,EPUB, MOBI, AZW3",
+                "epub, mobi, azw3, pdf",
+            )
+        )
+        for request in opener.requests:
+            self.assertEqual(request.get_method(), "POST")
+            self.assertEqual(urllib.parse.urlsplit(request.full_url).query, "")
+            self.assertNotIn(secret, request.full_url)
+            body = urllib.parse.parse_qs(request.data.decode("utf-8"))
+            self.assertEqual(body["cmd"], ["readCFG"])
+            self.assertEqual(set(body), {"apikey", "cmd", "group", "name"})
+
+        mismatch = EffectiveOpener({("QBITTORRENT", "qbittorrent_label"): "wrong"})
+        check = validate.lazylibrarian_effective_config_check(
+            "5299", secret, opener=mismatch
+        )
+        self.assertFalse(check.ok)
+        self.assertEqual(len(mismatch.requests), expected_count)
+        self.assertNotIn("wrong", repr(check))
+        self.assertNotIn(secret, repr(check))
+
+    def test_lazylibrarian_effective_config_rejects_malformed_and_oversized_responses(self):
+        secret = "1" * 32
+
+        class Response:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def getcode(self):
+                return self.status
+
+            def read(self, limit):
+                self.limit = limit
+                return self.payload
+
+            def close(self):
+                return None
+
+        def opener_for(payload):
+            opener = mock.MagicMock()
+            opener.open.return_value = Response(payload)
+            return opener
+
+        for payload in (
+            b"not-an-envelope",
+            b"[False]\n[injected]",
+            b"[" + b"x" * (validate.MAX_PRIVATE_RESPONSE_BYTES + 1) + b"]",
+        ):
+            with self.subTest(size=len(payload)):
+                opener = opener_for(payload)
+                check = validate.lazylibrarian_effective_config_check(
+                    "5299", secret, opener=opener
+                )
+                self.assertFalse(check.ok)
+                self.assertNotIn(secret, repr(check))
+                request = opener.open.call_args.args[0]
+                self.assertEqual(request.get_method(), "POST")
+                self.assertFalse(urllib.parse.urlsplit(request.full_url).query)
+                response = opener.open.return_value
+                self.assertEqual(
+                    response.limit, validate.MAX_PRIVATE_RESPONSE_BYTES + 1
+                )
+
+        with self.assertRaises(ValueError):
+            validate._lazylibrarian_api_bytes(
+                "5299",
+                secret,
+                "readCFG",
+                {"group": "API", "name": "API_KEY"},
+                opener=mock.MagicMock(),
+            )
+
+    def test_prowlarr_lazylibrarian_topology_and_torznab_providers_are_exact(self):
+        secret = "d" * 32
+        prowlarr_secret = "provider-secret-never-rendered"
+        indexers = [
+            {
+                "id": 1,
+                "name": "Books Torrent",
+                "enable": True,
+                "protocol": "torrent",
+                "tags": [9],
+                "capabilities": {"categories": [{"id": 7020}]},
+            },
+            {
+                "id": 2,
+                "name": "Generic Books Torrent",
+                "enable": True,
+                "protocol": "torrent",
+                "tags": [],
+                # Generic Books (7000) is insufficient; the safe provider set
+                # requires explicit ebook category 7020 support.
+                "capabilities": {"categories": [{"id": 7000}]},
+            },
+            {
+                "id": 3,
+                "name": "Expired Failure Torrent",
+                "enable": True,
+                "protocol": "torrent",
+                "tags": [],
+                "capabilities": {"categories": [{"id": 7020}]},
+            },
+        ]
+        indexer_statuses = [
+            {
+                "indexerId": 3,
+                "initialFailure": "2020-01-01T00:00:00Z",
+                "mostRecentFailure": "2020-01-02T00:00:00Z",
+                "disabledTill": "2020-01-03T00:00:00Z",
+            }
+        ]
+        tags = [{"id": 9, "label": "lazylibrarian-ebooks"}]
+        application = {
+            "id": 4,
+            "name": "LazyLibrarian",
+            "enable": True,
+            "implementation": "LazyLibrarian",
+            "configContract": "LazyLibrarianSettings",
+            "syncLevel": "fullSync",
+            "appProfileId": None,
+            "tags": [9],
+            "fields": [
+                {"name": "prowlarrUrl", "value": "http://prowlarr:9696"},
+                {"name": "baseUrl", "value": "http://lazylibrarian:5299"},
+                {"name": "apiKey", "value": "********"},
+                {"name": "authUsername", "value": ""},
+                {"name": "authPassword", "value": ""},
+                {
+                    "name": "syncCategories",
+                    "value": [7020],
+                },
+            ],
+        }
+        self.assertTrue(
+            validate.prowlarr_lazylibrarian_check(
+                indexers, tags, [application], indexer_statuses
+            ).ok
+        )
+        self.assertEqual(
+            validate._ebook_indexer_contract(indexers, indexer_statuses),
+            {"Books Torrent": 1},
+        )
+        wrong_indexers = json.loads(json.dumps(indexers))
+        wrong_indexers[1]["tags"] = [9]
+        self.assertFalse(
+            validate.prowlarr_lazylibrarian_check(
+                wrong_indexers, tags, [application], indexer_statuses
+            ).ok
+        )
+        # A retained failure remains blocking even after disabledTill elapsed.
+        expired_failure_tagged = json.loads(json.dumps(indexers))
+        expired_failure_tagged[2]["tags"] = [9]
+        self.assertFalse(
+            validate.prowlarr_lazylibrarian_check(
+                expired_failure_tagged,
+                tags,
+                [application],
+                indexer_statuses,
+            ).ok
+        )
+        wrong_application = json.loads(json.dumps(application))
+        next(
+            field
+            for field in wrong_application["fields"]
+            if field["name"] == "syncCategories"
+        )["value"] = [7000, 7020]
+        self.assertFalse(
+            validate.prowlarr_lazylibrarian_check(
+                indexers, tags, [wrong_application], indexer_statuses
+            ).ok
+        )
+        invented_profile = json.loads(json.dumps(application))
+        invented_profile["appProfileId"] = 1
+        self.assertFalse(
+            validate.prowlarr_lazylibrarian_check(
+                indexers, tags, [invented_profile], indexer_statuses
+            ).ok
+        )
+
+        providers = {
+            provider_type: []
+            for provider_type in (
+                "newznab", "torznab", "rss", "irc", "torrent", "direct"
+            )
+        }
+        providers["torznab"] = [
+            {
+                "ENABLED": "1",
+                "DISPNAME": "Books Torrent (Prowlarr)",
+                "HOST": "http://prowlarr:9696/1/api",
+                "BOOKCAT": "7020",
+                "DLTYPES": "E",
+                "MANUAL": "1",
+                "AUDIOCAT": "3000,3010",
+                "MAGCAT": "",
+                "COMICCAT": "7030",
+                "API": prowlarr_secret,
+            }
+        ]
+
+        class Response:
+            status = 200
+
+            def getcode(self):
+                return self.status
+
+            def read(self, _limit):
+                return json.dumps(providers).encode()
+
+            def close(self):
+                return None
+
+        opener = mock.MagicMock()
+        opener.open.return_value = Response()
+        check = validate.lazylibrarian_provider_check(
+            "5299",
+            secret,
+            prowlarr_secret,
+            {"Books Torrent": 1},
+            opener=opener,
+        )
+        self.assertTrue(check.ok)
+        self.assertNotIn(secret, repr(check))
+        self.assertNotIn("provider-secret", repr(check))
+        request = opener.open.call_args.args[0]
+        self.assertEqual(
+            urllib.parse.parse_qs(request.data.decode("utf-8"))["cmd"],
+            ["listProviders"],
+        )
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(urllib.parse.urlsplit(request.full_url).query, "")
+        self.assertNotIn(secret, request.full_url)
+
+        provider_template = json.loads(json.dumps(providers["torznab"][0]))
+        for field, bad_value in (
+            ("HOST", "http://prowlarr:9696/99/api"),
+            ("BOOKCAT", "7020,7030"),
+            ("DLTYPES", "A,E"),
+            ("MANUAL", "0"),
+            ("AUDIOCAT", "3010,3000"),
+            ("API", "stale-provider-key"),
+        ):
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(provider_template))
+                changed[field] = bad_value
+                providers["torznab"] = [changed]
+                changed_check = validate.lazylibrarian_provider_check(
+                    "5299",
+                    secret,
+                    prowlarr_secret,
+                    {"Books Torrent": 1},
+                    opener=opener,
+                )
+                self.assertFalse(changed_check.ok)
+                if field == "API":
+                    self.assertNotIn("stale-provider-key", repr(changed_check))
+                    self.assertNotIn(prowlarr_secret, repr(changed_check))
+        providers["torznab"] = [provider_template]
+
+        providers["newznab"] = [
+            {
+                "ENABLED": "1",
+                "DISPNAME": "Unexpected Usenet",
+                "HOST": "http://prowlarr:9696/2/api",
+                "BOOKCAT": "7020",
+                "DLTYPES": "E",
+                "MANUAL": "1",
+            }
+        ]
+        check = validate.lazylibrarian_provider_check(
+            "5299",
+            secret,
+            prowlarr_secret,
+            {"Books Torrent": 1},
+            opener=opener,
+        )
+        self.assertFalse(check.ok)
+
+    def test_lazylibrarian_retained_expired_indexer_failure_remains_blocking(self):
+        expired = {
+            "indexerId": 7,
+            "initialFailure": "2020-01-01T00:00:00Z",
+            "mostRecentFailure": "2020-01-02T00:00:00+00:00",
+            "disabledTill": "2020-01-03T00:00:00Z",
+        }
+        self.assertEqual(
+            validate._prowlarr_failed_indexer_ids([expired]), {7}
+        )
+        cleared = {
+            "indexerId": 7,
+            "initialFailure": None,
+            "mostRecentFailure": None,
+            "disabledTill": None,
+        }
+        self.assertEqual(
+            validate._prowlarr_failed_indexer_ids([cleared]), set()
+        )
+        malformed = dict(expired)
+        malformed.pop("mostRecentFailure")
+        self.assertIsNone(validate._prowlarr_failed_indexer_ids([malformed]))
+
+    def test_ebook_qbittorrent_categories_share_only_the_managed_path(self):
+        categories = {
+            "ebooks": {"savePath": "/downloads/ebooks"},
+            "ebooks-imported": {"savePath": "/downloads/ebooks"},
+        }
+        self.assertTrue(
+            validate.ebook_category_ownership_check(
+                categories, "lazylibrarian"
+            ).ok
+        )
+        categories["ebooks-imported"]["savePath"] = "/downloads/other"
+        self.assertFalse(
+            validate.ebook_category_ownership_check(
+                categories, "lazylibrarian"
+            ).ok
+        )
+
+    def test_qbittorrent_container_credentials_are_exact_and_secret_free(self):
+        username = "private-qbit-user"
+        password = "private-qbit-password"
+        stale_password = "stale-qbit-password"
+        environment = {
+            "QBITTORRENT_USERNAME": username,
+            "QBITTORRENT_PASSWORD": password,
+        }
+        inspect_payloads = {
+            "huey": {
+                "QBITTORRENT_URL": "http://qbittorrent:8080",
+                "QBITTORRENT_USERNAME": username,
+                "QBITTORRENT_PASSWORD": password,
+            },
+            "bookbot": {
+                "QBITTORRENT_URL": "http://qbittorrent:8080",
+                "QBITTORRENT_USERNAME": username,
+                "QBITTORRENT_PASSWORD": stale_password,
+            },
+            "abba": {
+                "DL_HOST": "qbittorrent",
+                "DL_USERNAME": username,
+                "DL_PASSWORD": password,
+            },
+        }
+        responses = []
+        for service in ("huey", "bookbot", "abba"):
+            responses.extend(
+                [
+                    mock.MagicMock(returncode=0, stdout=f"{service}-id\n"),
+                    mock.MagicMock(
+                        returncode=0,
+                        stdout=json.dumps(
+                            [
+                                {
+                                    "Config": {
+                                        "Env": [
+                                            f"{key}={value}"
+                                            for key, value in inspect_payloads[
+                                                service
+                                            ].items()
+                                        ]
+                                    }
+                                }
+                            ]
+                        ),
+                    ),
+                ]
+            )
+        runner = mock.MagicMock(side_effect=responses)
+        original_compare = validate.secrets.compare_digest
+        with mock.patch.object(
+            validate.secrets,
+            "compare_digest",
+            wraps=original_compare,
+        ) as compare_digest:
+            checks = {
+                check.name: check
+                for check in validate.qbittorrent_container_credentials_checks(
+                    environment,
+                    ("huey", "bookbot", "abba"),
+                    runner=runner,
+                )
+            }
+
+        self.assertTrue(checks["huey:qbittorrent-credentials"].ok)
+        self.assertFalse(checks["bookbot:qbittorrent-credentials"].ok)
+        self.assertTrue(checks["abba:qbittorrent-credentials"].ok)
+        self.assertEqual(compare_digest.call_count, 3)
+        for secret in (username, password, stale_password):
+            self.assertNotIn(secret, repr(checks))
+
+    def test_abba_runtime_contract_is_private_hardened_and_secret_safe(self):
+        environment = {
+            "PUID": "1000",
+            "PGID": "1000",
+            "QBITTORRENT_USERNAME": "qbit-user",
+            "QBITTORRENT_PASSWORD": "qbit-private-password",
+            "ABBA_URL": "http://abba:5078",
+            "ABBA_ABB_HOSTNAME": "audiobookbay.lu",
+            "ABBA_SEARCH_CACHE_SECONDS": "300",
+            "ABBA_SEARCH_MIN_INTERVAL_SECONDS": "2",
+            "ABBA_RESULT_TTL_SECONDS": "86400",
+            "ABBA_HTTP_TIMEOUT_SECONDS": "15",
+        }
+        abba_environment = {
+            "DOWNLOAD_CLIENT": "qbittorrent",
+            "DL_SCHEME": "http",
+            "DL_HOST": "qbittorrent",
+            "DL_PORT": "8080",
+            "DL_USERNAME": "qbit-user",
+            "DL_PASSWORD": "qbit-private-password",
+            "DL_CATEGORY": "audiobooks",
+            "SAVE_PATH_BASE": "/downloads/audiobooks",
+            "DL_VERIFY_TLS": "true",
+            "ABBA_DB_PATH": "/config/abba.db",
+            "ABB_HOSTNAME": "audiobookbay.lu",
+            "PAGE_LIMIT": "1",
+            "PORT": "5078",
+            "ABBA_SEARCH_CACHE_SECONDS": "300",
+            "ABBA_SEARCH_MIN_INTERVAL_SECONDS": "2",
+            "ABBA_RESULT_TTL_SECONDS": "86400",
+            "ABBA_HTTP_TIMEOUT_SECONDS": "15",
+            "ABBA_MAX_RESULTS": "10",
+        }
+        abba_inspect = {
+            "Config": {
+                "User": "1000:1000",
+                "Env": [f"{key}={value}" for key, value in abba_environment.items()],
+            },
+            "HostConfig": {
+                "ReadonlyRootfs": True,
+                "Privileged": False,
+                "CapDrop": ["ALL"],
+                "SecurityOpt": ["no-new-privileges:true"],
+                "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=67108864"},
+                "RestartPolicy": {"Name": "unless-stopped"},
+            },
+            "Mounts": [
+                {
+                    "Destination": "/config",
+                    "Source": str((validate.STACK_ROOT / "config" / "abba").resolve()),
+                    "RW": True,
+                }
+            ],
+        }
+        huey_inspect = {
+            "Config": {
+                "Env": [
+                    "ABBA_ENABLED=true",
+                    "ABBA_URL=http://abba:5078",
+                    "ABBA_TIMEOUT_SECONDS=30",
+                    "ABBA_SEARCH_LIMIT=10",
+                    "HUEY_ABBA_MINIMUM_CONFIDENCE=0.82",
+                    "HUEY_ABBA_RUNNER_UP_GAP=0.08",
+                ]
+            }
+        }
+        runner = mock.MagicMock(
+            side_effect=[
+                mock.MagicMock(returncode=0, stdout="abba-id\n"),
+                mock.MagicMock(returncode=0, stdout=json.dumps([abba_inspect])),
+                mock.MagicMock(returncode=0, stdout="huey-id\n"),
+                mock.MagicMock(returncode=0, stdout=json.dumps([huey_inspect])),
+            ]
+        )
+
+        checks = validate.abba_configuration_checks(environment, runner=runner)
+
+        self.assertTrue(all(check.ok for check in checks))
+        self.assertNotIn(environment["QBITTORRENT_PASSWORD"], repr(checks))
+
+    def test_abba_must_not_publish_a_host_port_or_give_shelfarr_audio_mount(self):
+        unpublished_runner = mock.MagicMock(
+            side_effect=[
+                mock.MagicMock(returncode=0, stdout="abba-id\n"),
+                mock.MagicMock(
+                    returncode=0,
+                    stdout=json.dumps(
+                        [{"HostConfig": {"PortBindings": {"5078/tcp": None}}}]
+                    ),
+                ),
+            ]
+        )
+        self.assertTrue(
+            validate.unpublished_service_check(
+                "abba", runner=unpublished_runner
+            ).ok
+        )
+
+        shelfarr_runner = mock.MagicMock(
+            side_effect=[
+                mock.MagicMock(returncode=0, stdout="shelfarr-id\n"),
+                mock.MagicMock(
+                    returncode=0,
+                    stdout=json.dumps(
+                        [{"Mounts": [{"Destination": "/ebooks", "RW": True}]}]
+                    ),
+                ),
+            ]
+        )
+        self.assertTrue(
+            validate.service_mount_absent_check(
+                "shelfarr", "/audiobooks", runner=shelfarr_runner
+            ).ok
+        )
+
+    def test_abba_database_and_readiness_probe_do_not_search_upstream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "abba.db"
+            self._create_abba_validation_database(database)
+            with closing(sqlite3.connect(database)) as connection, connection:
+                self._insert_abba_validation_acquisition(
+                    connection,
+                    "huey:1",
+                    candidate_id=f"abba:{'1' * 64}",
+                    info_hash="a" * 40,
+                )
+                self._insert_abba_validation_acquisition(
+                    connection,
+                    "huey:2",
+                    candidate_id=f"abba:{'2' * 64}",
+                    info_hash="a" * 40,
+                    state="prepared",
+                    canonical_correlation_id="huey:1",
+                    mutation_started_at=None,
+                )
+                self._insert_abba_validation_acquisition(
+                    connection,
+                    "huey:3",
+                    candidate_id=f"abba:{'1' * 64}",
+                    info_hash="a" * 40,
+                    state="prepared",
+                    canonical_correlation_id="huey:1",
+                    canonical_candidate_correlation_id="huey:1",
+                    mutation_started_at=None,
+                )
+                self._insert_abba_validation_acquisition(
+                    connection,
+                    "huey:4",
+                    candidate_id=f"abba:{'2' * 64}",
+                    info_hash="b" * 40,
+                    state="failed",
+                    canonical_candidate_correlation_id="huey:2",
+                    mutation_started_at=2.0,
+                    error_code="result_changed",
+                    error_retryable=0,
+                    error_http_status=409,
+                )
+                self._insert_abba_validation_acquisition(
+                    connection,
+                    "huey:5",
+                    candidate_id=f"abba:{'2' * 64}",
+                    info_hash="a" * 40,
+                    state="prepared",
+                    canonical_correlation_id="huey:1",
+                    canonical_candidate_correlation_id="huey:2",
+                    mutation_started_at=None,
+                )
+            check = validate.abba_database_check(database)
+            self.assertTrue(check.ok)
+            self.assertEqual(
+                check.detail,
+                "integrity, canonical hash/candidate schema, and alias ownership "
+                "valid; "
+                "violations=0",
+            )
+            self.assertFalse(
+                validate.abba_database_check(Path(directory) / "missing.db").ok
+            )
+
+            legacy_database = Path(directory) / "legacy.db"
+            with closing(sqlite3.connect(legacy_database)) as connection, connection:
+                connection.execute("CREATE TABLE requests (hash TEXT)")
+            self.assertFalse(validate.abba_database_check(legacy_database).ok)
+
+        runner = mock.MagicMock(
+            return_value=mock.MagicMock(returncode=0, stdout="ready\n")
+        )
+        self.assertTrue(validate.abba_api_readiness_check(runner=runner).ok)
+        probe = runner.call_args.args[0][-1]
+        self.assertIn("http://abba:5078/health", probe)
+        self.assertIn("payload.get('service')=='abba'", probe)
+        for key in ("database", "qbittorrent", "category", "save_path"):
+            self.assertIn(repr(key), probe)
+        self.assertNotIn("/api/search", probe)
+        self.assertNotIn("audiobookbay", probe.casefold())
+
+    def test_abba_database_rejects_hash_and_candidate_owner_corruption(self):
+        corruptions = {
+            "duplicate canonical hash owners": """
+                DROP INDEX acquisitions_hash_owner_uq;
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, mutation_started_at,
+                    created_at, updated_at
+                ) VALUES
+                    ('huey:1', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'one',
+                     'audiobooks', '/downloads/audiobooks', 'huey-1',
+                     'queued', 1.0, 1.0, 1.0),
+                    ('huey:2', 'abba:2222222222222222222222222222222222222222222222222222222222222222',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'two',
+                     'audiobooks', '/downloads/audiobooks', 'huey-2',
+                     'queued', 1.0, 1.0, 1.0);
+            """,
+            "missing canonical correlation": """
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, canonical_correlation_id,
+                    created_at, updated_at
+                ) VALUES (
+                    'huey:2', 'abba:2222222222222222222222222222222222222222222222222222222222222222',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'two',
+                    'audiobooks', '/downloads/audiobooks', 'huey-2',
+                    'prepared', 'huey:99', 1.0, 1.0
+                );
+            """,
+            "different canonical hash": """
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, mutation_started_at,
+                    created_at, updated_at
+                ) VALUES (
+                    'huey:1', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'one',
+                    'audiobooks', '/downloads/audiobooks', 'huey-1',
+                    'queued', 1.0, 1.0, 1.0
+                );
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, canonical_correlation_id,
+                    created_at, updated_at
+                ) VALUES (
+                    'huey:2', 'abba:2222222222222222222222222222222222222222222222222222222222222222',
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'two',
+                    'audiobooks', '/downloads/audiobooks', 'huey-2',
+                    'prepared', 'huey:1', 1.0, 1.0
+                );
+            """,
+            "cyclic canonical correlations": """
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, canonical_correlation_id,
+                    created_at, updated_at
+                ) VALUES
+                    ('huey:1', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'one',
+                     'audiobooks', '/downloads/audiobooks', 'huey-1',
+                     'prepared', 'huey:2', 1.0, 1.0),
+                    ('huey:2', 'abba:2222222222222222222222222222222222222222222222222222222222222222',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'two',
+                     'audiobooks', '/downloads/audiobooks', 'huey-2',
+                     'prepared', 'huey:1', 1.0, 1.0);
+            """,
+            "weakened hash-owner predicate": """
+                DROP INDEX acquisitions_hash_owner_uq;
+                CREATE UNIQUE INDEX acquisitions_hash_owner_uq
+                    ON acquisitions(info_hash)
+                    WHERE info_hash IS NOT NULL
+                      AND canonical_correlation_id IS NULL;
+            """,
+            "missing hash-owner index": """
+                DROP INDEX acquisitions_hash_owner_uq;
+            """,
+            "missing hash-canonical index": """
+                DROP INDEX acquisitions_canonical_idx;
+            """,
+            "missing candidate-owner index": """
+                DROP INDEX acquisitions_candidate_owner_uq;
+            """,
+            "missing candidate-canonical index": """
+                DROP INDEX acquisitions_candidate_canonical_idx;
+            """,
+            "weakened candidate-owner predicate": """
+                DROP INDEX acquisitions_candidate_owner_uq;
+                CREATE UNIQUE INDEX acquisitions_candidate_owner_uq
+                    ON acquisitions(candidate_id)
+                    WHERE canonical_candidate_correlation_id IS NULL
+                      AND canonical_correlation_id IS NULL
+                      AND (
+                          state != 'failed'
+                          OR mutation_started_at IS NOT NULL
+                      );
+            """,
+            "duplicate canonical candidate owners": """
+                DROP INDEX acquisitions_candidate_owner_uq;
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, mutation_started_at,
+                    created_at, updated_at
+                ) VALUES
+                    ('huey:1', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'one',
+                     'audiobooks', '/downloads/audiobooks', 'huey-1',
+                     'queued', 1.0, 1.0, 1.0),
+                    ('huey:2', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                     'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'two',
+                     'audiobooks', '/downloads/audiobooks', 'huey-2',
+                     'queued', 1.0, 1.0, 1.0);
+            """,
+            "missing canonical candidate correlation": """
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, error_code, error_retryable,
+                    error_http_status, canonical_candidate_correlation_id,
+                    created_at, updated_at
+                ) VALUES (
+                    'huey:2', 'abba:2222222222222222222222222222222222222222222222222222222222222222',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'two',
+                    'audiobooks', '/downloads/audiobooks', 'huey-2',
+                    'failed', 'result_changed', 0, 409, 'huey:99', 1.0, 1.0
+                );
+            """,
+            "candidate target has different candidate": """
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, mutation_started_at,
+                    created_at, updated_at
+                ) VALUES (
+                    'huey:1', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'one',
+                    'audiobooks', '/downloads/audiobooks', 'huey-1',
+                    'queued', 1.0, 1.0, 1.0
+                );
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, canonical_correlation_id,
+                    canonical_candidate_correlation_id,
+                    created_at, updated_at
+                ) VALUES (
+                    'huey:2', 'abba:2222222222222222222222222222222222222222222222222222222222222222',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'two',
+                    'audiobooks', '/downloads/audiobooks', 'huey-2',
+                    'prepared', 'huey:1', 'huey:1', 1.0, 1.0
+                );
+            """,
+            "candidate link is not direct": """
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, mutation_started_at,
+                    created_at, updated_at
+                ) VALUES (
+                    'huey:1', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'one',
+                    'audiobooks', '/downloads/audiobooks', 'huey-1',
+                    'queued', 1.0, 1.0, 1.0
+                );
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, canonical_correlation_id,
+                    canonical_candidate_correlation_id,
+                    created_at, updated_at
+                ) VALUES
+                    ('huey:2', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'two',
+                     'audiobooks', '/downloads/audiobooks', 'huey-2',
+                     'prepared', 'huey:1', 'huey:1', 1.0, 1.0),
+                    ('huey:3', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'three',
+                     'audiobooks', '/downloads/audiobooks', 'huey-3',
+                     'prepared', 'huey:1', 'huey:2', 1.0, 1.0);
+            """,
+            "same candidate and hash lacks hash link": """
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, mutation_started_at,
+                    created_at, updated_at
+                ) VALUES (
+                    'huey:1', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'one',
+                    'audiobooks', '/downloads/audiobooks', 'huey-1',
+                    'queued', 1.0, 1.0, 1.0
+                );
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state,
+                    canonical_candidate_correlation_id,
+                    created_at, updated_at
+                ) VALUES (
+                    'huey:2', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'two',
+                    'audiobooks', '/downloads/audiobooks', 'huey-2',
+                    'failed', 'huey:1', 1.0, 1.0
+                );
+            """,
+            "prepared hash root has no mutation marker": """
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, created_at, updated_at
+                ) VALUES (
+                    'huey:1', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'one',
+                    'audiobooks', '/downloads/audiobooks', 'huey-1',
+                    'prepared', 1.0, 1.0
+                );
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, canonical_correlation_id,
+                    created_at, updated_at
+                ) VALUES (
+                    'huey:2', 'abba:2222222222222222222222222222222222222222222222222222222222222222',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'two',
+                    'audiobooks', '/downloads/audiobooks', 'huey-2',
+                    'prepared', 'huey:1', 1.0, 1.0
+                );
+            """,
+            "prepared candidate root has no mutation marker": """
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, created_at, updated_at
+                ) VALUES (
+                    'huey:1', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'one',
+                    'audiobooks', '/downloads/audiobooks', 'huey-1',
+                    'prepared', 1.0, 1.0
+                );
+                INSERT INTO acquisitions(
+                    correlation_id, candidate_id, info_hash, title, category,
+                    save_path, tag, state, error_code, error_retryable,
+                    error_http_status, canonical_candidate_correlation_id,
+                    created_at, updated_at
+                ) VALUES (
+                    'huey:2', 'abba:1111111111111111111111111111111111111111111111111111111111111111',
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'two',
+                    'audiobooks', '/downloads/audiobooks', 'huey-2',
+                    'failed', 'result_changed', 0, 409, 'huey:1', 1.0, 1.0
+                );
+            """,
+        }
+        for name, corruption in corruptions.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "abba.db"
+                self._create_abba_validation_database(database)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    connection.executescript(corruption)
+
+                check = validate.abba_database_check(database)
+
+                self.assertFalse(check.ok)
+                self.assertRegex(check.detail, r"violations=\d+$")
+                self.assertNotIn("huey:", check.detail)
+                self.assertNotIn("abba:", check.detail)
+
+    def test_abba_database_requires_exact_candidate_conflict_quarantine(self):
+        corruptions = {
+            "nonterminal state": "state = 'queued'",
+            "wrong error": "error_code = 'request_conflict'",
+            "retryable": "error_retryable = 1",
+            "wrong status": "error_http_status = 500",
+        }
+        for name, assignment in corruptions.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "abba.db"
+                self._create_abba_validation_database(database)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    self._insert_abba_validation_acquisition(
+                        connection,
+                        "huey:1",
+                        candidate_id=f"abba:{'1' * 64}",
+                        info_hash="a" * 40,
+                    )
+                    self._insert_abba_validation_acquisition(
+                        connection,
+                        "huey:2",
+                        candidate_id=f"abba:{'1' * 64}",
+                        info_hash="b" * 40,
+                        state="failed",
+                        canonical_candidate_correlation_id="huey:1",
+                        mutation_started_at=2.0,
+                        error_code="result_changed",
+                        error_retryable=0,
+                        error_http_status=409,
+                    )
+                    connection.execute(
+                        f"UPDATE acquisitions SET {assignment} "
+                        "WHERE correlation_id = 'huey:2'"
+                    )
+
+                check = validate.abba_database_check(database)
+
+                self.assertFalse(check.ok)
+                self.assertRegex(check.detail, r"violations=\d+$")
+                self.assertNotIn("huey:", check.detail)
+                self.assertNotIn("abba:", check.detail)
 
     def test_writable_check_uses_and_removes_probe(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -663,30 +2720,192 @@ class ValidationTests(unittest.TestCase):
                     ).ok
                 )
 
-    def test_huey_database_requires_candidate_confirmation_schema(self):
+    def test_huey_database_requires_confirmation_and_ebook_cascade_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "huey.db"
-            schema = (SCRIPTS / "huey" / "schema.sql").read_text(encoding="utf-8")
-            with closing(sqlite3.connect(database)) as connection, connection:
-                connection.executescript(schema)
-                connection.executescript(
-                    """
-                    CREATE UNIQUE INDEX requests_message_id_uq
-                        ON requests(message_id);
-                    CREATE UNIQUE INDEX requests_active_target_uq
-                        ON requests(target_key)
-                        WHERE target_key IS NOT NULL
-                          AND status IN (
-                              'new', 'processing', 'awaiting_selection',
-                              'queued', 'complete', 'completed'
-                          );
-                    """
-                )
+            self._create_huey_validation_database(database)
 
+            self.assertTrue(validate.huey_database_check(database).ok)
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute("DROP INDEX ebook_backend_attempts_state_idx")
+            self.assertFalse(validate.huey_database_check(database).ok)
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    "CREATE INDEX ebook_backend_attempts_state_idx "
+                    "ON ebook_backend_attempts(status, request_id, ordinal)"
+                )
             self.assertTrue(validate.huey_database_check(database).ok)
             with closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute("DROP INDEX candidate_confirmations_expiry_idx")
             self.assertFalse(validate.huey_database_check(database).ok)
+
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    "CREATE INDEX candidate_confirmations_expiry_idx "
+                    "ON candidate_confirmations(status, expires_at, id)"
+                )
+                connection.execute("DROP TRIGGER ebook_request_terminal_sync")
+            self.assertFalse(validate.huey_database_check(database).ok)
+
+    def test_huey_database_accepts_inert_abba_canonical_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "huey.db"
+            self._create_huey_validation_database(database)
+            with closing(sqlite3.connect(database)) as connection, connection:
+                self._insert_huey_validation_request(
+                    connection,
+                    1,
+                    status="queued",
+                    candidate_id=f"abba:{'1' * 64}",
+                    info_hash="a" * 40,
+                )
+                self._insert_huey_validation_request(
+                    connection,
+                    2,
+                    status="failed",
+                    candidate_id=f"abba:{'2' * 64}",
+                    info_hash="a" * 40,
+                    canonical_request_id=1,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO notification_deliveries(
+                        request_id, event_key, route, message, delivered_at
+                    ) VALUES (2, 'request_failed', 'request-status',
+                              'delivered', CURRENT_TIMESTAMP)
+                    """
+                )
+
+            check = validate.huey_database_check(database)
+
+            self.assertTrue(check.ok)
+            self.assertIn("violations=0", check.detail)
+
+    def test_huey_database_rejects_abba_canonical_ownership_corruption(self):
+        candidate_one = f"abba:{'1' * 64}"
+        candidate_two = f"abba:{'2' * 64}"
+        hash_one = "a" * 40
+        hash_two = "b" * 40
+
+        def duplicate_candidate(connection: sqlite3.Connection) -> None:
+            connection.execute("DROP INDEX requests_active_abba_candidate_uq")
+            self._insert_huey_validation_request(
+                connection,
+                1,
+                status="queued",
+                candidate_id=candidate_one,
+                info_hash=hash_one,
+            )
+            self._insert_huey_validation_request(
+                connection,
+                2,
+                status="queued",
+                candidate_id=candidate_one,
+                info_hash=hash_two,
+            )
+
+        def duplicate_hash(connection: sqlite3.Connection) -> None:
+            connection.execute("DROP INDEX requests_active_abba_hash_uq")
+            self._insert_huey_validation_request(
+                connection,
+                1,
+                status="queued",
+                candidate_id=candidate_one,
+                info_hash=hash_one,
+            )
+            self._insert_huey_validation_request(
+                connection,
+                2,
+                status="queued",
+                candidate_id=candidate_two,
+                info_hash=hash_one,
+            )
+
+        def missing_alias(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_request(
+                connection,
+                1,
+                status="failed",
+                candidate_id=candidate_one,
+                info_hash=hash_one,
+                canonical_request_id=99,
+            )
+
+        def self_alias(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_request(
+                connection,
+                1,
+                status="failed",
+                candidate_id=candidate_one,
+                info_hash=hash_one,
+                canonical_request_id=1,
+            )
+
+        def cyclic_alias(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_request(
+                connection,
+                1,
+                status="failed",
+                candidate_id=candidate_one,
+                info_hash=hash_one,
+                canonical_request_id=2,
+            )
+            self._insert_huey_validation_request(
+                connection,
+                2,
+                status="failed",
+                candidate_id=candidate_two,
+                info_hash=hash_one,
+                canonical_request_id=1,
+            )
+
+        def pending_alias_delivery(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_request(
+                connection,
+                1,
+                status="queued",
+                candidate_id=candidate_one,
+                info_hash=hash_one,
+            )
+            self._insert_huey_validation_request(
+                connection,
+                2,
+                status="failed",
+                candidate_id=candidate_two,
+                info_hash=hash_one,
+                canonical_request_id=1,
+            )
+            connection.execute(
+                """
+                INSERT INTO notification_deliveries(
+                    request_id, event_key, route, message
+                ) VALUES (2, 'request_failed', 'request-status', 'pending')
+                """
+            )
+
+        corruptions = {
+            "duplicate candidate": duplicate_candidate,
+            "duplicate hash": duplicate_hash,
+            "missing alias": missing_alias,
+            "self alias": self_alias,
+            "cyclic alias": cyclic_alias,
+            "pending alias delivery": pending_alias_delivery,
+        }
+        for name, corrupt in corruptions.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "huey.db"
+                self._create_huey_validation_database(database)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    corrupt(connection)
+
+                check = validate.huey_database_check(database)
+
+                self.assertFalse(check.ok)
+                self.assertRegex(check.detail, r"violations=\d+$")
+                self.assertNotIn(candidate_one, check.detail)
+                self.assertNotIn(candidate_two, check.detail)
+                self.assertNotIn(hash_one, check.detail)
+                self.assertNotIn(hash_two, check.detail)
 
     def test_shelfarr_storage_requires_all_databases_private_keys_and_no_discord(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -740,6 +2959,7 @@ class ValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             storage = Path(directory)
             token = "shf_test_token"
+            prowlarr_key = "private-prowlarr-key"
             with closing(
                 sqlite3.connect(storage / "production.sqlite3")
             ) as connection, connection:
@@ -749,11 +2969,13 @@ class ValidationTests(unittest.TestCase):
                     (
                         ("indexer_provider", "prowlarr"),
                         ("prowlarr_url", "http://prowlarr:9696"),
-                        ("prowlarr_api_key", "configured"),
+                        ("prowlarr_api_key", prowlarr_key),
                         ("preferred_download_types", '["direct","usenet","torrent"]'),
                         ("prowlarr_tags", ""),
                         ("ebook_output_path", "/ebooks"),
-                        ("audiobook_output_path", "/audiobooks"),
+                        # Legacy Shelfarr state is intentionally inert: the
+                        # container no longer has an audiobook library mount.
+                        ("audiobook_output_path", "/retired-and-unmounted"),
                         ("download_local_path", "/downloads"),
                         ("immediate_search_enabled", "true"),
                         ("auto_approve_requests", "true"),
@@ -823,10 +3045,28 @@ class ValidationTests(unittest.TestCase):
                 storage,
                 {
                     "SHELFARR_API_TOKEN": token,
+                    "PROWLARR_API_KEY": prowlarr_key,
                     "WYSEARR_USENET_ENABLED": "true",
                 },
             )
             self.assertTrue(all(check.ok for check in checks))
+
+            mismatched_key_checks = {
+                check.name: check
+                for check in validate.shelfarr_configuration_checks(
+                    storage,
+                    {
+                        "SHELFARR_API_TOKEN": token,
+                        "PROWLARR_API_KEY": "rotated-but-not-propagated",
+                        "WYSEARR_USENET_ENABLED": "true",
+                    },
+                )
+            }
+            self.assertFalse(mismatched_key_checks["shelfarr:prowlarr"].ok)
+            self.assertNotIn(prowlarr_key, repr(mismatched_key_checks))
+            self.assertNotIn(
+                "rotated-but-not-propagated", repr(mismatched_key_checks)
+            )
 
             with closing(
                 sqlite3.connect(storage / "production.sqlite3")
@@ -844,6 +3084,7 @@ class ValidationTests(unittest.TestCase):
                 storage,
                 {
                     "SHELFARR_API_TOKEN": token,
+                    "PROWLARR_API_KEY": prowlarr_key,
                     "WYSEARR_USENET_ENABLED": "false",
                 },
             )
@@ -862,6 +3103,7 @@ class ValidationTests(unittest.TestCase):
                     storage,
                     {
                         "SHELFARR_API_TOKEN": token,
+                        "PROWLARR_API_KEY": prowlarr_key,
                         "WYSEARR_USENET_ENABLED": "false",
                     },
                 )
@@ -1376,18 +3618,28 @@ class ValidationTests(unittest.TestCase):
                 "[info] qBittorrent connection successful\n"
                 "[info] SABnzbd connection successful\n"
                 "WYSEARR_CLIENT_RESULTS="
-                '[["qbittorrent","shelfarr",true],'
-                '["sabnzbd","shelfarr",true]]\n'
+                '[["qbittorrent","shelfarr",true,true],'
+                '["sabnzbd","shelfarr",true,true]]\n'
             ),
         )
         checks = validate.shelfarr_runtime_checks(
             "5056",
             "shf_token",
             True,
+            qbit_username="qbit-user",
+            qbit_password="qbit-private-password",
             runner=runner,
             requester=lambda *_args, **_kwargs: {"requests": []},
         )
         self.assertTrue(all(check.ok for check in checks))
+        self.assertNotIn("qbit-private-password", repr(checks))
+        self.assertEqual(
+            json.loads(runner.call_args.kwargs["input"]),
+            {
+                "username": "qbit-user",
+                "password": "qbit-private-password",
+            },
+        )
 
     def test_shelfarr_runtime_rejects_enabled_sab_when_usenet_is_disabled(self):
         runner = mock.MagicMock()
@@ -1395,19 +3647,28 @@ class ValidationTests(unittest.TestCase):
             returncode=0,
             stdout=(
                 "WYSEARR_CLIENT_RESULTS="
-                '[["qbittorrent","shelfarr",true],'
-                '["sabnzbd","shelfarr",true]]\n'
+                '[["qbittorrent","shelfarr",true,false],'
+                '["sabnzbd","shelfarr",true,true]]\n'
             ),
         )
         checks = validate.shelfarr_runtime_checks(
             "5056",
             "shf_token",
             False,
+            qbit_username="qbit-user",
+            qbit_password="qbit-private-password",
             runner=runner,
             requester=lambda *_args, **_kwargs: {"requests": []},
         )
         self.assertFalse(
             next(check for check in checks if check.name == "shelfarr:client-connectivity").ok
+        )
+        self.assertFalse(
+            next(
+                check
+                for check in checks
+                if check.name == "shelfarr:qbittorrent-credentials"
+            ).ok
         )
 
     def test_arr_native_discord_check_reads_notification_database(self):
@@ -1560,6 +3821,308 @@ class ValidationTests(unittest.TestCase):
             self.assertFalse(validate.arr_download_client_accepted(changed, **arguments))
         changed = dict(resource, removeCompletedDownloads=True)
         self.assertFalse(validate.arr_download_client_accepted(changed, **arguments))
+
+    def test_arr_prowlarr_credentials_reject_one_stale_row_among_many(self):
+        current_key = "current-private-prowlarr-key"
+        stale_key = "stale-private-prowlarr-key"
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "arr.db"
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    """
+                    CREATE TABLE Indexers (
+                        Id INTEGER PRIMARY KEY,
+                        Name TEXT NOT NULL,
+                        Settings TEXT NOT NULL,
+                        EnableRss INTEGER NOT NULL,
+                        EnableAutomaticSearch INTEGER NOT NULL,
+                        EnableInteractiveSearch INTEGER NOT NULL
+                    )
+                    """
+                )
+                rows = []
+                for indexer_id, key in (
+                    (1, current_key),
+                    (2, stale_key),
+                    (3, current_key),
+                ):
+                    rows.append(
+                        (
+                            indexer_id,
+                            f"Indexer {indexer_id} (Prowlarr)",
+                            json.dumps(
+                                {
+                                    "baseUrl": (
+                                        f"http://prowlarr:9696/{indexer_id}/"
+                                    ),
+                                    "apiKey": key,
+                                }
+                            ),
+                            1,
+                            1,
+                            1,
+                        )
+                    )
+                rows.extend(
+                    [
+                        (
+                            4,
+                            "Disabled (Prowlarr)",
+                            json.dumps(
+                                {
+                                    "baseUrl": "http://prowlarr:9696/4/",
+                                    "apiKey": stale_key,
+                                }
+                            ),
+                            0,
+                            0,
+                            0,
+                        ),
+                        (
+                            5,
+                            "Independent indexer",
+                            json.dumps(
+                                {
+                                    "baseUrl": "https://indexer.invalid/",
+                                    "apiKey": stale_key,
+                                }
+                            ),
+                            1,
+                            1,
+                            1,
+                        ),
+                    ]
+                )
+                connection.executemany(
+                    "INSERT INTO Indexers VALUES (?, ?, ?, ?, ?, ?)", rows
+                )
+
+            original_compare = validate.secrets.compare_digest
+            with mock.patch.object(
+                validate.secrets,
+                "compare_digest",
+                wraps=original_compare,
+            ) as compare_digest:
+                check = validate.arr_prowlarr_indexer_credentials_check(
+                    "sonarr", database, current_key
+                )
+
+            self.assertFalse(check.ok)
+            self.assertEqual(compare_digest.call_count, 3)
+            self.assertEqual(
+                check.detail,
+                "enabled_prowlarr=3 exact_credentials=2 "
+                "mismatched_or_malformed=1",
+            )
+            self.assertNotIn(current_key, repr(check))
+            self.assertNotIn(stale_key, repr(check))
+
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    "UPDATE Indexers SET Settings = ? WHERE Id = 2",
+                    (
+                        json.dumps(
+                            {
+                                "baseUrl": "http://prowlarr:9696/2/",
+                                "apiKey": current_key,
+                            }
+                        ),
+                    ),
+                )
+            repaired = validate.arr_prowlarr_indexer_credentials_check(
+                "sonarr", database, current_key
+            )
+            self.assertTrue(repaired.ok)
+            self.assertEqual(
+                repaired.detail,
+                "enabled_prowlarr=3 exact_credentials=3",
+            )
+
+    def test_arr_qbittorrent_credentials_reject_one_stale_row_among_many(self):
+        username = "private-qbit-user"
+        current_password = "current-private-qbit-password"
+        stale_password = "stale-private-qbit-password"
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "arr.db"
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    """
+                    CREATE TABLE DownloadClients (
+                        Id INTEGER PRIMARY KEY,
+                        Enable INTEGER NOT NULL,
+                        Implementation TEXT NOT NULL,
+                        Settings TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO DownloadClients VALUES (?, ?, ?, ?)",
+                    (
+                        (
+                            1,
+                            1,
+                            "QBittorrent",
+                            json.dumps(
+                                {
+                                    "username": username,
+                                    "password": current_password,
+                                }
+                            ),
+                        ),
+                        (
+                            2,
+                            1,
+                            "QBittorrent",
+                            json.dumps(
+                                {
+                                    "username": username,
+                                    "password": stale_password,
+                                }
+                            ),
+                        ),
+                        (
+                            3,
+                            0,
+                            "QBittorrent",
+                            json.dumps(
+                                {
+                                    "username": username,
+                                    "password": stale_password,
+                                }
+                            ),
+                        ),
+                        (
+                            4,
+                            1,
+                            "Transmission",
+                            json.dumps(
+                                {
+                                    "username": username,
+                                    "password": stale_password,
+                                }
+                            ),
+                        ),
+                    ),
+                )
+
+            check = validate.arr_qbittorrent_download_client_credentials_check(
+                "sonarr", database, username, current_password
+            )
+            self.assertFalse(check.ok)
+            self.assertEqual(
+                check.detail,
+                "enabled_qbittorrent=2 exact_credentials=1 "
+                "mismatched_or_malformed=1",
+            )
+            for secret in (username, current_password, stale_password):
+                self.assertNotIn(secret, repr(check))
+
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    "UPDATE DownloadClients SET Settings = ? WHERE Id = 2",
+                    (
+                        json.dumps(
+                            {
+                                "username": username,
+                                "password": current_password,
+                            }
+                        ),
+                    ),
+                )
+            repaired = (
+                validate.arr_qbittorrent_download_client_credentials_check(
+                    "sonarr", database, username, current_password
+                )
+            )
+            self.assertTrue(repaired.ok)
+            self.assertEqual(
+                repaired.detail,
+                "enabled_qbittorrent=2 exact_credentials=2",
+            )
+
+    def test_indexer_live_tests_are_exhaustive_and_upstream_failure_is_nonblocking(self):
+        indexers = [
+            {"id": 1, "enable": True, "protocol": "torrent"},
+            {"id": 2, "enable": True, "protocol": "torrent"},
+            {"id": 3, "enable": True, "protocol": "usenet"},
+            {
+                "id": 4,
+                "enableRss": False,
+                "enableAutomaticSearch": False,
+                "enableInteractiveSearch": False,
+                "protocol": "torrent",
+            },
+        ]
+        tested: list[int] = []
+
+        def tester(indexer: dict[str, object]) -> None:
+            indexer_id = int(indexer["id"])
+            tested.append(indexer_id)
+            if indexer_id == 3:
+                raise RuntimeError("private failure detail")
+
+        check, live_ids, live_protocols = validate.exhaustive_indexer_live_check(
+            "sonarr", indexers, tester, enabled_default=True
+        )
+
+        self.assertEqual(tested, [1, 2, 3])
+        self.assertFalse(check.ok)
+        self.assertFalse(check.blocking)
+        self.assertEqual(check.detail, "enabled=3 live=2 failed=1")
+        self.assertEqual(live_ids, {1, 2})
+        self.assertEqual(live_protocols, {"torrent"})
+        self.assertNotIn("private failure detail", repr(check))
+
+    def test_indexer_live_check_blocks_an_empty_enabled_inventory(self):
+        check, live_ids, live_protocols = validate.exhaustive_indexer_live_check(
+            "sonarr",
+            [{"id": 1, "enable": False, "protocol": "torrent"}],
+            lambda _indexer: self.fail("disabled indexer was tested"),
+            enabled_default=True,
+        )
+
+        self.assertFalse(check.ok)
+        self.assertTrue(check.blocking)
+        self.assertEqual(check.detail, "enabled=0 live=0 failed=0")
+        self.assertEqual(live_ids, set())
+        self.assertEqual(live_protocols, set())
+
+    def test_validator_exit_ignores_only_explicit_nonblocking_warnings(self):
+        with (
+            mock.patch.object(sys, "argv", ["validate.py"]),
+            mock.patch.object(
+                validate,
+                "validate",
+                return_value=[
+                    validate.Check("local:contract", True, "ready"),
+                    validate.Check(
+                        "upstream:indexer",
+                        False,
+                        "enabled=2 live=1 failed=1",
+                        blocking=False,
+                    ),
+                ],
+            ),
+            mock.patch("builtins.print") as printer,
+        ):
+            self.assertEqual(validate.main(), 0)
+        self.assertTrue(
+            any(
+                str(call.args[0]).startswith("WARN: upstream:indexer")
+                for call in printer.call_args_list
+            )
+        )
+
+        with (
+            mock.patch.object(sys, "argv", ["validate.py"]),
+            mock.patch.object(
+                validate,
+                "validate",
+                return_value=[validate.Check("local:contract", False, "broken")],
+            ),
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(validate.main(), 1)
 
     def test_post_json_ok_uses_api_key_and_json_body(self):
         response = mock.MagicMock()

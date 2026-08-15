@@ -270,6 +270,8 @@ def select_shelfarr_candidate(
     if not 0 <= runner_up_gap <= 1:
         raise ValueError("runner_up_gap must be between 0 and 1")
 
+    wanted_author = normalize_text(author)
+    wanted_author_tokens = set(wanted_author.split())
     unique: dict[str, Mapping[str, Any]] = {}
     for item in items:
         if not isinstance(item, Mapping):
@@ -286,10 +288,20 @@ def select_shelfarr_candidate(
             str(value).casefold() for value in available
         }:
             continue
+        if author:
+            candidate_author_tokens = set(
+                normalize_text(item.get("author")).split()
+            )
+            if (
+                not wanted_author_tokens
+                or not wanted_author_tokens.issubset(candidate_author_tokens)
+            ):
+                continue
+        # Apply every identity gate before deduplication so an invalid first
+        # copy cannot shadow a later valid alias for the same work ID.
         unique.setdefault(work_id, item)
 
     ranked: list[RankedCandidate] = []
-    wanted_author = normalize_text(author)
     for work_id, item in unique.items():
         title_score = title_similarity(title, str(item.get("title") or ""))
         if author:

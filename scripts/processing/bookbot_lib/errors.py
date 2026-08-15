@@ -33,5 +33,9 @@ class UnsupportedMediaError(ImportErrorBase):
     """The torrent contains no supported media or includes unsafe content."""
 
 
+class MetadataCorrelationError(ImportErrorBase):
+    """Trusted request metadata cannot be bound unambiguously to a torrent."""
+
+
 class SourceChangedError(ImportErrorBase):
     """A supposedly completed payload changed while it was being copied."""

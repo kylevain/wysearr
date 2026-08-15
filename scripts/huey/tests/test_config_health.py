@@ -257,8 +257,13 @@ class ServiceRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be positive"):
             services.direct()
 
-    def test_shelfarr_disabled_preserves_existing_direct_book_path(self):
-        services = ServiceRegistry({"SHELFARR_ENABLED": "false"})
+    def test_explicit_legacy_direct_owner_preserves_direct_book_path(self):
+        services = ServiceRegistry(
+            {
+                "SHELFARR_ENABLED": "false",
+                "EBOOK_ACQUISITION_OWNER": "direct",
+            }
+        )
         direct = Mock()
         direct.submit.return_value = result(
             "queued", "Queued in qBittorrent", service="qbittorrent"
@@ -296,7 +301,7 @@ class ServiceRegistryTests(unittest.TestCase):
         book = services.book(
             {
                 "id": 42,
-                "media_type": "audiobooks",
+                "media_type": "ebooks",
                 "title": "Dune",
                 "author": "Frank Herbert",
                 "discord_user_id": "1001",
@@ -310,7 +315,7 @@ class ServiceRegistryTests(unittest.TestCase):
         self.assertEqual(book["service"], "shelfarr")
         self.assertEqual(movie["service"], "radarr")
         shelfarr.submit.assert_called_once_with(
-            "audiobooks",
+            "ebooks",
             "Dune",
             "Frank Herbert",
             42,
@@ -706,7 +711,9 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(status_channel.sent), 1)
         self.assertEqual(len(error_channel.sent), 1)
         self.assertNotEqual(status_channel.sent[0], error_channel.sent[0])
-        self.assertIn("Retry limit reached", " ".join(status_channel.sent + error_channel.sent))
+        combined = " ".join(status_channel.sent + error_channel.sent)
+        self.assertIn("saved Huey workflow", combined)
+        self.assertNotIn("BookBot", combined)
 
     async def test_no_delivery_route_leaves_notification_pending(self):
         self.store.transition(
@@ -790,10 +797,9 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(original_message.replies, [])
         self.assertEqual(len(status_channel.sent), 1)
         self.assertEqual(len(addition_channel.sent), 1)
-        self.assertIn(
-            "imported to its DAS library path by Radarr",
-            " ".join(status_channel.sent + addition_channel.sent),
-        )
+        combined = " ".join(status_channel.sent + addition_channel.sent)
+        self.assertIn("ebook DAS library path", combined)
+        self.assertNotIn("Radarr", combined)
 
     async def test_arr_without_files_remains_queued(self):
         self.store.transition(
@@ -1208,7 +1214,9 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(status_channel.sent), 1)
         self.assertEqual(len(addition_channel.sent), 1)
-        self.assertIn("by Shelfarr", " ".join(status_channel.sent + addition_channel.sent))
+        combined = " ".join(status_channel.sent + addition_channel.sent)
+        self.assertIn("ebook DAS library path", combined)
+        self.assertNotIn("Shelfarr", combined)
 
     async def test_shelfarr_attention_failure_routes_status_and_import_error(self):
         self.queue_shelfarr("searching")
@@ -1239,7 +1247,8 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(status_channel.sent), 1)
         self.assertEqual(len(error_channel.sent), 1)
-        self.assertIn("All automatic candidates were exhausted", error_channel.sent[0])
+        self.assertIn("saved Huey workflow", error_channel.sent[0])
+        self.assertNotIn("Shelfarr", error_channel.sent[0])
 
     async def test_shelfarr_plain_acquisition_failure_is_request_status_only(self):
         self.queue_shelfarr("searching")
@@ -1323,7 +1332,8 @@ class CompletionReconciliationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(status_channel.sent), 1)
         self.assertEqual(len(error_channel.sent), 1)
-        self.assertIn("Final import validation failed", error_channel.sent[0])
+        self.assertIn("saved Huey workflow", error_channel.sent[0])
+        self.assertNotIn("Shelfarr", error_channel.sent[0])
 
     async def test_shelfarr_retryable_not_found_remains_queued(self):
         self.queue_shelfarr("searching")
@@ -1839,7 +1849,7 @@ class DiscordAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
                 await client.on_message(request_message)
                 self.assertEqual(status_channel.sent, [])
                 self.assertEqual(queue_channel.sent, [])
-                self.assertIn("Reply directly", request_message.replies[0])
+                self.assertIn("Discord's Reply action", request_message.replies[0])
                 self.assertEqual(store.get_request(1)["status"], "awaiting_selection")
 
                 await client.on_message(selection_message)
@@ -2203,6 +2213,8 @@ class DiscordAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
 
                     dispatcher.assert_not_called()
                     self.assertEqual(len(message.replies), 1)
+                    self.assertIn("Discord's Reply action", message.replies[0])
+                    self.assertIn("did not apply", message.replies[0])
                     with store.connect() as connection:
                         self.assertEqual(
                             connection.execute(
@@ -2210,6 +2222,155 @@ class DiscordAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
                             ).fetchone()[0],
                             0,
                         )
+
+    async def test_bare_active_choice_is_rejected_then_exact_prompt_reply_claims_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RequestStore(Path(directory) / "huey.db")
+            store.initialize()
+
+            class SelectionServices:
+                abba_enabled = True
+
+                def __init__(self):
+                    self.dispatch_callbacks = 0
+
+                    def selected(_request, _candidate, *, before_create):
+                        before_create(_candidate["work_id"])
+                        self.dispatch_callbacks += 1
+                        return result(
+                            "queued",
+                            "ABBA accepted The Yellow Wallpaper.",
+                            service="abba",
+                            external_id="c" * 40,
+                            external_title="The Yellow Wallpaper",
+                            external_status="queued",
+                        )
+
+                    self.selection_selected = Mock(side_effect=selected)
+
+            services = SelectionServices()
+            candidate_ids = ("abba:" + ("a" * 64), "abba:" + ("b" * 64))
+            candidates = tuple(
+                {
+                    "fingerprint": character * 64,
+                    "label": (
+                        "The Yellow Wallpaper by Charlotte Perkins Gilman "
+                        f"({media_format})"
+                    ),
+                    "work_id": candidate_id,
+                    "source_work_ids": (candidate_id,),
+                    "title": "The Yellow Wallpaper",
+                    "author": "Charlotte Perkins Gilman",
+                    "year": 1892,
+                    "content_kind": "book",
+                    "media_type": "audiobooks",
+                    "book_type": "audiobook",
+                }
+                for character, media_format, candidate_id in (
+                    ("a", "MP3", candidate_ids[0]),
+                    ("b", "M4B", candidate_ids[1]),
+                )
+            )
+            dispatcher = Mock(
+                return_value=result(
+                    "awaiting_selection",
+                    "Choose one candidate.",
+                    service="abba",
+                    selection_proposal=candidates,
+                )
+            )
+            processor = RequestProcessor(store, services=services, dispatcher=dispatcher)
+            config = validate_channel_config(channel_mapping())
+            discord_module = types.SimpleNamespace(
+                Intents=FakeIntents,
+                Client=FakeDiscordClient,
+            )
+            with patch.dict(sys.modules, {"discord": discord_module}):
+                client = build_client(config, processor, Path(directory) / "ready")
+
+            intake_channel = FakeChannel()
+            intake_channel.id = REQUESTS["audiobooks"]
+            queue_channel = FakeChannel()
+            status_channel = FakeChannel()
+            client.channels = {
+                intake_channel.id: intake_channel,
+                ACTIVITY["download-queue"]: queue_channel,
+                ACTIVITY["request-status"]: status_channel,
+            }
+            request_message = FakeIncomingMessage(
+                message_id=770,
+                channel=intake_channel,
+                content="The Yellow Wallpaper by Charlotte Perkins Gilman",
+                reply_message_id=970,
+            )
+            bare_choice = FakeIncomingMessage(
+                message_id=771,
+                channel=intake_channel,
+                content="2",
+            )
+            referenced_choice = FakeIncomingMessage(
+                message_id=772,
+                channel=intake_channel,
+                content="2",
+                reference_id=970,
+            )
+
+            async def direct_call(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            with patch("huey.asyncio.to_thread", new=direct_call):
+                await client.on_message(request_message)
+                await client.on_message(bare_choice)
+
+                request = store.get_request(1)
+                confirmation = store.get_candidate_confirmation(1)
+                self.assertEqual(request["status"], "awaiting_selection")
+                self.assertEqual(confirmation["status"], "pending")
+                self.assertIsNone(confirmation["selected_ordinal"])
+                self.assertEqual(confirmation["prompt_message_id"], "970")
+                self.assertIn("Discord's Reply action", bare_choice.replies[0])
+                self.assertIn("did not apply", bare_choice.replies[0])
+                services.selection_selected.assert_not_called()
+                self.assertEqual(services.dispatch_callbacks, 0)
+                with store.connect() as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM candidate_confirmation_replies"
+                        ).fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM requests").fetchone()[0],
+                        1,
+                    )
+
+                await client.on_message(referenced_choice)
+                await client.on_message(referenced_choice)
+
+            dispatcher.assert_called_once()
+            services.selection_selected.assert_called_once()
+            self.assertEqual(services.dispatch_callbacks, 1)
+            selected_candidate = services.selection_selected.call_args.args[1]
+            self.assertEqual(selected_candidate["work_id"], candidate_ids[1])
+            self.assertIn("M4B", selected_candidate["label"])
+            self.assertEqual(len(referenced_choice.replies), 1)
+            self.assertIn("Confirmed. Continuing request.", referenced_choice.replies[0])
+            self.assertEqual(store.get_request(1)["status"], "queued")
+            confirmation = store.get_candidate_confirmation(1)
+            self.assertEqual(confirmation["status"], "claimed")
+            self.assertEqual(confirmation["selected_ordinal"], 2)
+            with store.connect() as connection:
+                replies = connection.execute(
+                    "SELECT ordinal, outcome FROM candidate_confirmation_replies"
+                ).fetchall()
+                self.assertEqual(
+                    [(row["ordinal"], row["outcome"]) for row in replies],
+                    [(2, "claimed")],
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM requests").fetchone()[0],
+                    1,
+                )
 
     async def test_numeric_ebook_title_uses_ordinary_intake(self):
         with tempfile.TemporaryDirectory() as directory:

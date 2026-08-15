@@ -75,12 +75,24 @@ def _service_name(request: Mapping[str, Any]) -> str:
 
 
 def _safe_failure_detail(request: Mapping[str, Any]) -> str:
+    media_type = str(request.get("media_type") or "").casefold()
+    if media_type in {"ebooks", "audiobooks"}:
+        return (
+            f"The {'ebook' if media_type == 'ebooks' else 'audiobook'} acquisition "
+            "or import failed. An administrator should "
+            "review the saved Huey workflow."
+        )
     raw = request.get("error")
     detail = sanitize_display_text(raw, limit=500)
     if not detail or _SENSITIVE_DETAIL.search(str(raw or "")):
+        service = str(request.get("service") or "").casefold()
         services = (
             "Huey and Shelfarr"
-            if str(request.get("service") or "").casefold() == "shelfarr"
+            if service == "shelfarr"
+            else "Huey, LazyLibrarian, and BookBot"
+            if service == "lazylibrarian"
+            else "Huey, ABBA, and BookBot"
+            if service == "abba"
             else "Huey and BookBot"
         )
         return (
@@ -104,22 +116,118 @@ def shelfarr_state_notifications(
     request_id = _request_id(request)
     title = safe_display_title(request.get("external_title"), request.get("title"))
     status = external_status.strip().casefold()
+    ebook = str(request.get("media_type") or "").casefold() == "ebooks"
     if status == "downloading":
         return (
             _plan(
                 "download_active",
-                f"⬇️ Request #{request_id} is actively downloading through Shelfarr: {title}.",
+                f"⬇️ Request #{request_id} is actively downloading"
+                f"{' through Shelfarr' if not ebook else ''}: {title}.",
             ),
         )
     if status == "processing":
         return (
             _plan(
                 "download_completed",
-                f"📥 Request #{request_id} finished downloading; Shelfarr is validating "
-                f"and importing {title}.",
+                f"📥 Request #{request_id} finished downloading; "
+                f"{'Huey' if ebook else 'Shelfarr'} is validating and importing "
+                f"{title}.",
             ),
         )
     return ()
+
+
+def abba_state_notifications(
+    request: Mapping[str, Any], external_status: str
+) -> tuple[RoutedNotification, ...]:
+    """Plan backend-neutral audiobook download lifecycle notifications."""
+
+    request_id = _request_id(request)
+    title = safe_display_title(request.get("external_title"), request.get("title"))
+    status = external_status.strip().casefold()
+    if status == "downloading":
+        return (
+            _plan(
+                "download_active",
+                f"⬇️ Request #{request_id} is actively downloading: {title}.",
+            ),
+        )
+    if status in {"downloaded", "processing"}:
+        return (
+            _plan(
+                "download_completed",
+                f"📥 Request #{request_id} finished downloading; the audiobook is "
+                f"being validated and imported: {title}.",
+            ),
+        )
+    return ()
+
+
+def lazylibrarian_state_notifications(
+    request: Mapping[str, Any], external_status: str
+) -> tuple[RoutedNotification, ...]:
+    """Plan deduplicated LL/qBittorrent progress while BookBot owns success."""
+
+    request_id = _request_id(request)
+    title = safe_display_title(request.get("external_title"), request.get("title"))
+    status = external_status.strip().casefold()
+    if status == "downloading":
+        return (
+            _plan(
+                "download_active",
+                f"⬇️ Request #{request_id} is actively downloading: {title}.",
+            ),
+        )
+    if status == "processing":
+        return (
+            _plan(
+                "download_completed",
+                f"📥 Request #{request_id} finished downloading; the ebook is "
+                f"being validated and imported: {title}.",
+            ),
+        )
+    return ()
+
+
+def service_correlation_attention_notification(
+    request: Mapping[str, Any],
+    *,
+    service: str,
+    startup: bool,
+    identity_mismatch: bool = False,
+) -> RoutedNotification:
+    """Plan a fail-closed correlation alert for a named acquisition owner."""
+
+    request_id = _request_id(request)
+    title = safe_display_title(request.get("external_title"), request.get("title"))
+    display_service = sanitize_display_text(service, limit=40) or "Acquisition service"
+    media_type = str(request.get("media_type") or "").casefold()
+    if media_type == "ebooks":
+        display_service = "the ebook acquisition workflow"
+    elif media_type == "audiobooks":
+        display_service = "the audiobook acquisition workflow"
+    if startup:
+        sentence_service = display_service[:1].upper() + display_service[1:]
+        problem = (
+            f"{sentence_service} restored a correlation with an unexpected candidate"
+            if identity_mismatch
+            else f"Huey could not yet restore {display_service} correlation"
+        )
+        return _plan(
+            "recovery_uncertain",
+            f"⚠️ {problem} for request #{request_id} after a restart: {title}. "
+            "Automatic retry remains blocked; an administrator should review service health.",
+        )
+    problem = (
+        f"{display_service} returned a correlation with an unexpected candidate for"
+        if identity_mismatch
+        else f"Huey cannot yet confirm whether {display_service} received"
+    )
+    return _plan(
+        "submission_uncertain",
+        f"🛠️ Manual review required for request #{request_id}: {problem} {title}. "
+        "Automatic retry remains blocked to prevent duplicate acquisition.",
+    )
 
 
 def shelfarr_attention_notification(
@@ -134,7 +242,7 @@ def shelfarr_attention_notification(
         return _plan(
             "import_failed",
             f"🛠️ Import failure for request #{request_id}: {title}. "
-            f"Shelfarr retained the request for recovery. {detail}",
+            f"The request was retained for safe recovery. {detail}",
         )
     return _plan(
         "manual_intervention",
@@ -155,24 +263,44 @@ def shelfarr_correlation_attention_notification(
 
     request_id = _request_id(request)
     title = safe_display_title(request.get("external_title"), request.get("title"))
+    ebook = str(request.get("media_type") or "").casefold() == "ebooks"
     if startup:
         problem = (
-            "Shelfarr restored a correlation with an unexpected book format or "
-            "confirmed identity"
+            (
+                "The ebook workflow restored a correlation with an unexpected book "
+                "format or confirmed identity"
+                if ebook
+                else "Shelfarr restored a correlation with an unexpected book format "
+                "or confirmed identity"
+            )
             if format_mismatch
-            else "Huey could not yet restore Shelfarr correlation"
+            else (
+                "Huey could not yet restore ebook acquisition correlation"
+                if ebook
+                else "Huey could not yet restore Shelfarr correlation"
+            )
         )
         return _plan(
             "recovery_uncertain",
             f"⚠️ {problem} for request #{request_id} after a restart: "
             f"{title}. Automatic retry remains "
-            "blocked; an administrator should review Shelfarr and Huey health.",
+            "blocked; an administrator should review "
+            f"{'the saved Huey workflow' if ebook else 'Shelfarr and Huey health'}.",
         )
     problem = (
-        "Shelfarr returned a correlation with an unexpected book format or "
-        "confirmed identity for"
+        (
+            "The ebook workflow returned a correlation with an unexpected book format "
+            "or confirmed identity for"
+            if ebook
+            else "Shelfarr returned a correlation with an unexpected book format or "
+            "confirmed identity for"
+        )
         if format_mismatch
-        else "Huey cannot yet confirm whether Shelfarr created a request for"
+        else (
+            "Huey cannot yet confirm whether the ebook workflow received"
+            if ebook
+            else "Huey cannot yet confirm whether Shelfarr created a request for"
+        )
     )
     return _plan(
         "submission_uncertain",
@@ -206,6 +334,30 @@ def response_notifications(
     status = str(response.get("status") or "").casefold()
     service = _service_name({**dict(request), **dict(response)})
     response_detail = sanitize_display_text(response.get("message"), limit=500)
+    if media_type == "ebooks":
+        response_detail = {
+            "queued": "Huey found a usable ebook release and queued it safely.",
+            "needs_selection": (
+                "Huey could not prove one exact ebook identity; add an author, "
+                "year, or edition."
+            ),
+            "failed": (
+                "Huey could not complete the ebook acquisition; an administrator "
+                "can review the saved workflow."
+            ),
+        }.get(status, response_detail)
+    elif media_type == "audiobooks":
+        response_detail = {
+            "queued": "Huey found a usable audiobook release and queued it safely.",
+            "needs_selection": (
+                "Huey could not prove one exact audiobook identity; add an author, "
+                "narrator, year, or edition."
+            ),
+            "failed": (
+                "Huey could not complete the audiobook acquisition; an "
+                "administrator can review the saved workflow."
+            ),
+        }.get(status, response_detail)
 
     if status == "awaiting_selection":
         # This is an intake conversation, not an accepted, rejected, or queued
@@ -219,11 +371,24 @@ def response_notifications(
         and str(response.get("external_status") or "").casefold()
         == "submission_uncertain"
     ):
-        # Huey owns and deduplicates the request, but Shelfarr acceptance is
+        # Huey owns and deduplicates the request, but service acceptance is
         # not yet known.  Do not claim an accepted/queued acquisition.
+        combined = {**dict(request), **dict(response)}
+        if str(combined.get("service") or "").casefold() == "abba":
+            return (
+                service_correlation_attention_notification(
+                    combined, service="ABBA", startup=False
+                ),
+            )
+        if str(combined.get("service") or "").casefold() == "lazylibrarian":
+            return (
+                service_correlation_attention_notification(
+                    combined, service="LazyLibrarian", startup=False
+                ),
+            )
         return (
             shelfarr_correlation_attention_notification(
-                {**dict(request), **dict(response)}, startup=False
+                combined, startup=False
             ),
         )
 
@@ -238,6 +403,17 @@ def response_notifications(
             f"⬇️ Request #{request_id} queued for acquisition: {queue_detail}",
         )
         plans = [accepted, queued]
+        if (
+            str(response.get("service") or request.get("service") or "").casefold()
+            == "lazylibrarian"
+            and str(response.get("external_status") or "").casefold()
+            == "processing"
+        ):
+            plans.extend(
+                lazylibrarian_state_notifications(
+                    {**dict(request), **dict(response)}, "processing"
+                )
+            )
         if response.get("manual_intervention") is True:
             plans.append(
                 _plan(
@@ -265,6 +441,15 @@ def response_notifications(
             )
         return tuple(plans)
     if status in {"complete", "completed"}:
+        if media_type in {"ebooks", "audiobooks"}:
+            library_kind = "ebook" if media_type == "ebooks" else "audiobook"
+            return (
+                _plan(
+                    "request_completed",
+                    f"✅ Request #{request_id} complete: {title} is available in "
+                    f"the {library_kind} library workflow.",
+                ),
+            )
         return (
             _plan(
                 "request_completed",
@@ -311,7 +496,13 @@ def terminal_notifications(
     terminal_event = str(request.get("terminal_event_type") or "").casefold()
 
     if status in {"complete", "completed"}:
-        if service_key in {"sonarr", "radarr", "lidarr"}:
+        ebook = str(request.get("media_type") or "").casefold() == "ebooks"
+        if ebook:
+            completed_message = (
+                f"✅ Request #{request_id} complete: {title} was imported to its "
+                "ebook DAS library path."
+            )
+        elif service_key in {"sonarr", "radarr", "lidarr"}:
             completed_message = (
                 f"✅ Request #{request_id} complete: {title} was imported to its "
                 f"DAS library path by {service}."
@@ -328,7 +519,12 @@ def terminal_notifications(
             )
         plans = [_plan("request_completed", completed_message)]
         if terminal_event != "handler_completed":
-            if service_key in {"sonarr", "radarr", "lidarr"}:
+            if ebook:
+                addition_message = (
+                    f"📚 New library item from request #{request_id}: {title} was "
+                    "imported to its ebook DAS library path."
+                )
+            elif service_key in {"sonarr", "radarr", "lidarr"}:
                 addition_message = (
                     f"📚 New library item from request #{request_id}: {title} was "
                     f"imported to its DAS library path by {service}."

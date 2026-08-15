@@ -11,6 +11,7 @@ import stat
 import tempfile
 import unicodedata
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,8 +25,60 @@ LEGACY_MARKER = re.compile(
     r"\s*\(\s*z-library\.sk\s*,\s*1lib\.sk\s*,\s*z-lib\.sk\s*\)\s*",
     flags=re.IGNORECASE,
 )
-INVALID_CHARACTERS = re.compile(r"[<>:\"\\|?*\x00-\x1f\x7f]")
+INVALID_CHARACTERS = re.compile(r"[<>:\"/\\|?*\x00-\x1f\x7f]")
 WHITESPACE = re.compile(r"\s+")
+METADATA_SIDECAR_EXTENSIONS = frozenset({".nfo", ".opf"})
+OPF_NAMESPACE = "http://www.idpf.org/2007/opf"
+DC_NAMESPACE = "http://purl.org/dc/elements/1.1/"
+MAX_METADATA_TEXT = 512
+
+
+def _validated_metadata_text(
+    value: str | None, label: str, *, required: bool
+) -> str | None:
+    if value is None:
+        if required:
+            raise ValueError(f"audiobook {label} is missing")
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"audiobook {label} is not text")
+    normalized = value.strip()
+    if not normalized:
+        if required:
+            raise ValueError(f"audiobook {label} is empty")
+        return None
+    if len(normalized) > MAX_METADATA_TEXT:
+        raise ValueError(f"audiobook {label} is too long")
+    for character in normalized:
+        codepoint = ord(character)
+        if not (
+            codepoint in {0x09, 0x0A, 0x0D}
+            or 0x20 <= codepoint <= 0xD7FF
+            or 0xE000 <= codepoint <= 0xFFFD
+            or 0x10000 <= codepoint <= 0x10FFFF
+        ):
+            raise ValueError(f"audiobook {label} contains invalid XML text")
+    return normalized
+
+
+@dataclass(frozen=True)
+class AudiobookMetadata:
+    """Trusted request metadata suitable for an Audiobookshelf OPF sidecar."""
+
+    title: str
+    author: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "title",
+            _validated_metadata_text(self.title, "title", required=True),
+        )
+        object.__setattr__(
+            self,
+            "author",
+            _validated_metadata_text(self.author, "author", required=False),
+        )
 
 
 @dataclass(frozen=True)
@@ -103,13 +156,19 @@ class LibraryImporter:
         self.torrent_root = torrent_root
         self.media_root = media_root
 
-    def plan(self, content_path: str, spec: CategorySpec) -> ImportPlan:
+    def plan(
+        self,
+        content_path: str,
+        spec: CategorySpec,
+        *,
+        destination_title: str | None = None,
+    ) -> ImportPlan:
         source = self._validate_source_path(Path(content_path))
         destination_root = self.media_root.joinpath(*spec.destination)
         self._validate_destination_root(destination_root)
 
         if source.is_file():
-            title = sanitize_component(source.stem)
+            source_title = source.stem
             relative_file = Path(sanitize_filename(source.name))
             source_stat = source.stat(follow_symlinks=False)
             self._validate_extension(source, spec)
@@ -127,7 +186,7 @@ class LibraryImporter:
             )
             directories: tuple[Path, ...] = ()
         elif source.is_dir():
-            title = sanitize_component(source.name)
+            source_title = source.name
             directories, files = self._walk_directory(source, spec)
         else:
             raise UnsafeSourceError("content path is not a regular file or directory")
@@ -144,6 +203,9 @@ class LibraryImporter:
                 f"payload contains no supported primary {spec.name} file"
             )
 
+        title = sanitize_component(
+            destination_title if destination_title is not None else source_title
+        )
         destination = destination_root / title
         self._ensure_relative(destination, self.media_root, "library destination")
         total_bytes = sum(entry.size for entry in files)
@@ -163,8 +225,22 @@ class LibraryImporter:
         spec: CategorySpec,
         torrent_hash: str,
         dry_run: bool = False,
+        *,
+        audiobook_metadata: AudiobookMetadata | None = None,
     ) -> ImportResult:
-        plan = self.plan(content_path, spec)
+        if audiobook_metadata is not None and spec.name != "audiobooks":
+            raise UnsafeSourceError(
+                "audiobook metadata cannot be applied to another category"
+            )
+        plan = self.plan(
+            content_path,
+            spec,
+            destination_title=(
+                audiobook_metadata.title
+                if audiobook_metadata is not None
+                else None
+            ),
+        )
         if dry_run:
             return ImportResult(
                 destination=plan.destination,
@@ -173,16 +249,39 @@ class LibraryImporter:
                 copied_bytes=plan.total_bytes,
             )
 
-        adopted = self._adopt_interrupted_import(plan, torrent_hash)
+        metadata_payload: bytes | None = None
+        source_has_metadata = False
+        if audiobook_metadata is not None:
+            metadata_payload = self._metadata_opf_bytes(
+                audiobook_metadata, torrent_hash
+            )
+            source_has_metadata = self._plan_has_metadata_sidecar(plan)
+
+        adopted = self._adopt_interrupted_import(
+            plan,
+            torrent_hash,
+            expected_metadata=(
+                metadata_payload
+                if metadata_payload is not None and not source_has_metadata
+                else None
+            ),
+        )
         if adopted is not None:
             return adopted
+        if audiobook_metadata is not None:
+            self._reject_conflicting_interrupted_import(plan, torrent_hash)
 
         plan.destination_root.mkdir(parents=True, exist_ok=True)
         self._validate_destination_root(plan.destination_root)
         free_bytes = shutil.disk_usage(plan.destination_root).free
-        if free_bytes < plan.total_bytes:
+        required_bytes = plan.total_bytes + (
+            len(metadata_payload)
+            if metadata_payload is not None and not source_has_metadata
+            else 0
+        )
+        if free_bytes < required_bytes:
             raise OSError(
-                f"insufficient destination space: need {plan.total_bytes}, have {free_bytes}"
+                f"insufficient destination space: need {required_bytes}, have {free_bytes}"
             )
 
         temporary = Path(
@@ -203,6 +302,8 @@ class LibraryImporter:
                     raise SourceChangedError(f"copied size changed for {entry.source}")
                 self._fsync_file(target)
 
+            if metadata_payload is not None:
+                self._ensure_metadata_sidecar(temporary, metadata_payload)
             self._verify_sources_unchanged(plan.files)
             self._write_import_marker(temporary, torrent_hash)
             self._fsync_tree(temporary)
@@ -252,7 +353,11 @@ class LibraryImporter:
             raise UnsafeSourceError("ledger destination name is not normalized")
 
     def _adopt_interrupted_import(
-        self, plan: ImportPlan, torrent_hash: str
+        self,
+        plan: ImportPlan,
+        torrent_hash: str,
+        *,
+        expected_metadata: bytes | None = None,
     ) -> ImportResult | None:
         if not os.path.lexists(plan.destination):
             return None
@@ -263,6 +368,17 @@ class LibraryImporter:
             return None
         if self._read_import_marker(marker) != torrent_hash:
             return None
+        if expected_metadata is not None:
+            metadata_path = plan.destination / "metadata.opf"
+            if metadata_path.is_symlink() or not metadata_path.is_file():
+                return None
+            try:
+                if metadata_path.stat().st_size != len(expected_metadata):
+                    return None
+                if metadata_path.read_bytes() != expected_metadata:
+                    return None
+            except OSError:
+                return None
         return ImportResult(
             destination=plan.destination,
             title=plan.title,
@@ -270,6 +386,42 @@ class LibraryImporter:
             copied_bytes=plan.total_bytes,
             adopted=True,
         )
+
+    def _reject_conflicting_interrupted_import(
+        self, plan: ImportPlan, torrent_hash: str
+    ) -> None:
+        if not plan.destination_root.exists():
+            return
+        try:
+            entries = tuple(plan.destination_root.iterdir())
+        except OSError as exc:
+            raise UnsafeSourceError(
+                "cannot inspect the destination root for interrupted imports"
+            ) from exc
+        for entry in entries:
+            if entry == plan.destination or entry.name.startswith(".bookbot-"):
+                continue
+            try:
+                metadata = entry.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(metadata.st_mode):
+                continue
+            marker = entry / ".bookbot-import.json"
+            if not os.path.lexists(marker):
+                continue
+            try:
+                marker_metadata = marker.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(marker_metadata.st_mode):
+                raise UnsafeSourceError(
+                    "another destination has an unsafe BookBot import marker"
+                )
+            if self._read_import_marker(marker) == torrent_hash:
+                raise UnsafeSourceError(
+                    "torrent has an interrupted import at a different destination"
+                )
 
     @staticmethod
     def _read_import_marker(marker: Path) -> str:
@@ -291,6 +443,103 @@ class LibraryImporter:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+
+    @staticmethod
+    def _plan_has_metadata_sidecar(plan: ImportPlan) -> bool:
+        return any(
+            entry.relative_destination.suffix.casefold()
+            in METADATA_SIDECAR_EXTENSIONS
+            for entry in plan.files
+        )
+
+    @staticmethod
+    def _has_metadata_sidecar(directory: Path) -> bool:
+        def raise_walk_error(error: OSError) -> None:
+            raise error
+
+        for _current, directory_names, file_names in os.walk(
+            directory,
+            topdown=True,
+            onerror=raise_walk_error,
+            followlinks=False,
+        ):
+            for name in (*directory_names, *file_names):
+                if Path(name).suffix.casefold() in METADATA_SIDECAR_EXTENSIONS:
+                    return True
+        return False
+
+    @staticmethod
+    def _metadata_opf_bytes(
+        metadata: AudiobookMetadata, torrent_hash: str
+    ) -> bytes:
+        title = _validated_metadata_text(metadata.title, "title", required=True)
+        author = _validated_metadata_text(metadata.author, "author", required=False)
+        assert title is not None
+        package = ET.Element(
+            "package",
+            {
+                "xmlns": OPF_NAMESPACE,
+                "version": "2.0",
+                "unique-identifier": "bookbot-id",
+            },
+        )
+        metadata_element = ET.SubElement(
+            package,
+            "metadata",
+            {
+                "xmlns:dc": DC_NAMESPACE,
+                "xmlns:opf": OPF_NAMESPACE,
+            },
+        )
+        identifier = ET.SubElement(
+            metadata_element, "dc:identifier", {"id": "bookbot-id"}
+        )
+        identifier.text = f"urn:btih:{torrent_hash}"
+        title_element = ET.SubElement(metadata_element, "dc:title")
+        title_element.text = title
+        if author is not None:
+            author_element = ET.SubElement(
+                metadata_element, "dc:creator", {"opf:role": "aut"}
+            )
+            author_element.text = author
+        return ET.tostring(
+            package,
+            encoding="utf-8",
+            xml_declaration=True,
+            short_empty_elements=True,
+        ) + b"\n"
+
+    def _ensure_metadata_sidecar(self, directory: Path, payload: bytes) -> bool:
+        if self._has_metadata_sidecar(directory):
+            return False
+
+        descriptor, temporary_raw = tempfile.mkstemp(
+            prefix=".bookbot-metadata-", suffix=".tmp", dir=directory
+        )
+        temporary = Path(temporary_raw)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(payload)
+                handle.flush()
+                os.fchmod(handle.fileno(), 0o644)
+                os.fsync(handle.fileno())
+            if self._has_metadata_sidecar(directory):
+                return False
+            target = directory / "metadata.opf"
+            try:
+                os.link(temporary, target, follow_symlinks=False)
+            except FileExistsError:
+                return False
+            self._fsync_directory(directory)
+            return True
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
     def _validate_source_path(self, candidate: Path) -> Path:
         if not candidate.is_absolute():

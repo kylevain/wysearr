@@ -1,15 +1,29 @@
-# Shelfarr production evaluation
+# Shelfarr ebook production evaluation
 
-This is a reversible ebook/audiobook acquisition evaluation. Discord and Huey
-remain the only family-facing request interface. Shelfarr owns final ebook and
-audiobook placement while the evaluation flag is enabled; BookBot remains
-deployed and unchanged so the previous path can be restored without rebuilding
-it.
+This records the reversible ebook acquisition evaluation and its retained role
+as the secondary production backend. Discord and Huey remain the only
+family-facing request interface. `SHELFARR_ENABLED=true` keeps Shelfarr healthy
+and available behind the LazyLibrarian primary. Huey may dispatch it only after
+a metadata miss, a bounded read-only Prowlarr `7020` preflight finds no
+plausible ebook torrent, an administratively disabled primary, or another
+primary failure still proven to be before the durable mutation marker; it never
+races LazyLibrarian. After that marker, a timeout, transport failure, or
+LazyLibrarian raw `OK` with no exact history is uncertainty, not a fallback
+signal. Shelfarr no longer receives audiobook requests and has no audiobook
+library mount. Audiobook ownership is documented in
+[architecture.md](architecture.md): ABBA performs
+discovery/submission while `ABBA_ENABLED=true`, and BookBot performs import and
+retention; disabling ABBA restores the direct Prowlarr/qBittorrent/BookBot path.
 
 ## Deployed boundary
 
 ```text
-Discord -> Huey -> Shelfarr API
+Discord -> Huey -> LazyLibrarian primary
+                       |
+             safe pre-mutation miss only
+                       |
+                       v
+                  Shelfarr API
                        |
              +---------+---------+
              |         |         |
@@ -17,13 +31,11 @@ Discord -> Huey -> Shelfarr API
              |         |         |
              +---------+---------+
                        |
-                 Shelfarr import
+                 Shelfarr ebook import
                        |
-          +------------+-------------+
-          |                          |
- /mnt/media/ebooks/Books   /mnt/media/audiobooks
-          |                          |
-        Kavita                Audiobookshelf
+             /mnt/media/ebooks/Books
+                       |
+                     Kavita
 ```
 
 Shelfarr is pinned to `2026.08.09.1` and its multi-platform OCI digest. SABnzbd
@@ -47,12 +59,16 @@ WyseARR checkpoints. This includes all four SQLite databases, generated secret
 and encryption keys, queue state, and Active Storage. Copying only
 `production.sqlite3` is not a valid backup.
 
-## Ownership controls
+## Cascade and ownership controls
 
+- `EBOOK_ACQUISITION_BACKENDS=lazylibrarian,shelfarr` is authoritative.
+  `EBOOK_ACQUISITION_OWNER=lazylibrarian` is only the matching compatibility
+  primary assertion. Never infer active request ownership merely from Shelfarr
+  being enabled or running.
 - Shelfarr outputs ebooks at `/ebooks`, mounted from
   `/mnt/media/ebooks/Books`.
-- Shelfarr outputs audiobooks at `/audiobooks`, mounted from
-  `/mnt/media/audiobooks`.
+- Shelfarr has no `/audiobooks` mount. A legacy `audiobook_output_path` value in
+  its database is inert and is not an ownership grant.
 - Project Gutenberg ebook downloads stage privately at
   `state/shelfarr-staging/ebooks`, mounted over `/ebooks/.shelfarr-staging`,
   before Shelfarr publishes them to the DAS. This is required because CIFS
@@ -67,21 +83,25 @@ and encryption keys, queue state, and Active Storage. Copying only
   below `/downloads/usenet` and temporary path below
   `/downloads/incomplete/usenet`.
 - Do not configure Shelfarr to use qBittorrent categories `ebooks` or
-  `audiobooks`; those belong to the preserved BookBot path.
+  `audiobooks`; those belong to BookBot import ownership. ABBA may submit only
+  the `audiobooks` category through qBittorrent's API.
 - Do not enable Shelfarr's native Discord integration. Huey is the only Discord
   notification producer.
-- Do not configure a BookBot handoff. Shelfarr is the exclusive ebook and
-  audiobook finalizer while `SHELFARR_ENABLED=true`.
-- Before enabling Shelfarr, all BookBot book categories (`ebooks`,
-  `ebooks-imported`, `audiobooks`, and `audiobooks-imported`) must contain zero
-  torrents. The bootstrap enforces this drain gate so Shelfarr cannot adopt the
-  same infohash while BookBot still owns or retains it.
+- Do not configure a BookBot handoff for Shelfarr jobs. Shelfarr is the
+  exclusive finalizer for every fallback job it accepts.
+- Before enabling Shelfarr, the BookBot ebook categories (`ebooks` and
+  `ebooks-imported`) must contain zero torrents. The bootstrap intentionally
+  ignores `audiobooks` and `audiobooks-imported`; those remain BookBot-owned and
+  must not be paused by an ebook ownership change.
 
 ## Automated production convergence
 
-`SHELFARR_ENABLED` defaults to `false`. When it is `true`, `deploy.sh` starts
+The Compose fallback for `SHELFARR_ENABLED` is `false`, while the production
+`.env` policy requires literal `true`. When enabled, `deploy.sh` starts
 Shelfarr and SABnzbd, runs `scripts/bootstrap_shelfarr.py`, validates the
-result, and then recreates Huey. The bootstrap is idempotent and performs these
+result, and then recreates Huey. New requests follow the ordered backend policy;
+Shelfarr remains idle unless the same durable request safely advances past
+LazyLibrarian. The bootstrap is idempotent and performs these
 operations without printing secrets:
 
 - configures SABnzbd's isolated incomplete, complete, and `shelfarr` category
@@ -92,7 +112,7 @@ operations without printing secrets:
 - creates the private Shelfarr operator account and a dedicated non-admin Huey
   API user with exactly `search:read`, `requests:read`, and `requests:write`;
 - configures Prowlarr, the isolated qBittorrent and SABnzbd clients, output
-  paths, copy import, and English matching. When Usenet is enabled, the source
+  paths, copy import, and English ebook matching. When Usenet is enabled, the source
   order is direct -> Usenet -> torrent; otherwise Shelfarr disables its SAB
   client and uses direct -> torrent;
 - enables only Project Gutenberg direct acquisition; and
@@ -102,7 +122,7 @@ operations without printing secrets:
 ## Discord metadata confirmation
 
 Shelfarr metadata selection remains inside Discord; its UI is not exposed as a
-family request interface. For a newly submitted ebook or audiobook, Huey still
+family request interface. For a newly submitted ebook, Huey still
 automatically uses one unambiguous high-confidence work. If two or three safe
 metadata works fall inside the configured ambiguity band, Huey instead:
 
@@ -127,7 +147,11 @@ out-of-range, wrong-user, or wrong-channel reply is corrective only: it cannot
 dispatch acquisition or emit lifecycle events. If Discord cannot return and
 persist the prompt message ID, Huey releases the target without acquisition.
 
-This flow is enabled only for Shelfarr-owned ebooks/audiobooks. Existing
+The Shelfarr fallback reuses the ebook's one authoritative selection.
+LazyLibrarian uses the same strict Discord Reply binding and fresh work-level
+fingerprint check and persists an exact LazyLibrarian/OpenLibrary BookID before
+dispatch. A safe miss advances that identity without a second prompt. ABBA
+audiobook confirmation uses its separate search/grab/status contract. Existing
 `needs_selection` rows from parse failures, no metadata results, low-confidence
 matches, and non-Shelfarr handlers cannot be resumed. Candidate confirmation is
 metadata-work selection; Huey does not call Shelfarr's `/grab` endpoint, which
@@ -138,8 +162,9 @@ or application-command permission is introduced.
 
 ## Deployment procedure
 
-Use the repository deployment as the only enable procedure. It quiesces Huey
-and both evaluation services, checkpoints state, quarantines any persisted NNTP
+Use the repository deployment as the only enable procedure. It quiesces Huey,
+BookBot, LazyLibrarian, ABBA, and both evaluation services, checkpoints state,
+quarantines any persisted NNTP
 server before SAB can start, handles first-run INI creation, converges Prowlarr
 and Shelfarr, validates while intake is closed, and restores Huey only after all
 checks pass:
@@ -149,7 +174,7 @@ checks pass:
 ```
 
 If deployment fails after replacing runtime state, it deliberately leaves Huey,
-Shelfarr, and SABnzbd stopped. Inspect the reported drain or configuration
+BookBot, LazyLibrarian, ABBA, Shelfarr, and SABnzbd stopped. Inspect the reported drain or configuration
 error, repair it through the repository/private `.env`, and rerun `./deploy.sh`;
 do not start Huey manually into a partially converged ownership state.
 
@@ -177,8 +202,10 @@ only in the ignored, mode-0600 `.env` file. The required private inputs are:
 Set the feature flag to `true` only when every required value is available.
 The bootstrap connection-tests the NNTP provider before enabling the managed
 `WyseARR Primary` SABnzbd server and live-tests the Generic Newznab resource in
-Prowlarr. The persisted indexer must advertise audiobook category `3030` and
-ebook category `7000` or `7020`; reachability alone is insufficient.
+Prowlarr. The retained managed-indexer contract advertises audiobook category
+`3030` for full rollback compatibility and ebook category `7000` or `7020`, but
+current Shelfarr intake uses only the ebook capability; reachability alone is
+insufficient.
 Validation repeats both live tests and category checks. A partial or unreachable
 configuration fails deployment with Huey intake closed.
 
@@ -214,14 +241,15 @@ Shelfarr rather than reacquired, but Huey cannot turn that rejection into an
 "already available" response. Treat 100 requests as the pilot scale ceiling
 until Shelfarr exposes a filtered lookup API.
 
-## Success-rate record
+## Historical success-rate record
 
 Record one row per previously unsuccessful request. The acquisition comparison counts
 a request as successful only after a readable, nonempty file of the expected
 type is present in its final DAS path. Catalog visibility is a separate result:
 until Kavita or Audiobookshelf confirms the item, do not describe it as
-family-visible. A search result or Shelfarr completion flag by itself is not
-success.
+family-visible. A search result or backend completion flag by itself is not
+success. The audiobook row below records the superseded 2026-08-12 Shelfarr
+experiment; it is not a current routing instruction.
 
 | Huey request | Title | Format | Shelfarr result | Source | Download | Final DAS path | Library visible | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -244,11 +272,13 @@ success.
   correct and Audiobookshelf's public health endpoint is ready, but WyseARR has
   no Kavita endpoint/auth key or library IDs and no Audiobookshelf API key.
 
-The pilot therefore demonstrates a material acquisition/finalization
-improvement at the DAS boundary for one previously unsuccessful ebook. It does not
-yet prove improved family-visible catalog availability. Keep Shelfarr as a
-controlled pilot, retain BookBot for rollback, and do not claim catalog
-visibility until read-only library credentials are added.
+The historical pilot demonstrates one improved DAS finalization among seven
+previously unsuccessful requests. It does not establish a general success rate,
+current cascade acceptance, or family-visible catalog availability. Shelfarr is
+now the enabled serial production fallback after a safe LazyLibrarian
+pre-mutation miss; it retains its isolated finalizer, while BookBot remains the
+importer for LazyLibrarian/direct jobs. Do not claim catalog visibility until
+read-only library credentials are added.
 
 Compare successful final DAS outcomes against those requests' recorded
 qBittorrent-only failures. Track catalog visibility separately; do not infer it
@@ -260,14 +290,15 @@ source, acquisition outcome, import outcome, and final DAS verification. These
 fields are measurement only and do not weaken Huey's matcher or select a
 release.
 
-The six-request Usenet retry cohort is #9, #10, #11, #13, #18, and #19. Run it
-only after the validator proves an enabled NNTP provider and a live managed
-Newznab indexer. Do not count a retry as successful unless Shelfarr completes
-the import and a readable, nonempty expected-format artifact exists in the
-confined final DAS path.
+The historical Shelfarr Usenet retry cohort contains ebooks #9, #10, #11, #13,
+and #19. Run it only after the validator proves an enabled NNTP provider and a live
+managed Newznab indexer. Historical audiobook #18 belongs to the ABBA/BookBot
+route instead. Do not count an ebook retry as successful unless Shelfarr
+completes the import and a readable, nonempty EPUB exists in the confined final
+DAS path.
 
-Huey now fails closed into its interactive Discord confirmation state only when
-Shelfarr returns two or three safe work-level metadata candidates. The selected
+For this ebook path, Huey fails closed into its interactive Discord confirmation
+state only when Shelfarr returns two or three safe work-level metadata candidates. The selected
 work is freshly fingerprint-verified against the original Huey request before
 request creation. Shelfarr also exposes release-level selection APIs, but those
 APIs do not independently enforce the requested author or format and are not
@@ -279,40 +310,34 @@ the actual Kavita URL, a least-privilege Kavita auth key, and ebook library ID
 and root mapping. Audiobook validation needs an Audiobookshelf API key,
 audiobook library ID, and root mapping. Those values are not currently
 configured; without them, report catalog state as `unverified`, never visible.
+The authenticated, token-without-persistence verification command is documented
+in [wysearr-architecture.md](wysearr-architecture.md).
 
 ## Rollback
 
-The rollback does not delete Shelfarr state or acquired library files:
+Ordinary LazyLibrarian unavailability already falls through to Shelfarr before
+mutation, so it does not require an ownership switch. For an exceptional
+Shelfarr-only degraded mode, first stop Discord intake and fully drain or
+reconcile every ebook attempt and the `ebooks`, `ebooks-imported`, and
+`shelfarr` categories. Then set `EBOOK_ACQUISITION_BACKENDS=shelfarr` and the
+compatibility owner to `shelfarr`. This deterministic singleton mode is not the
+validated production policy and must remain visibly degraded until the exact
+`lazylibrarian,shelfarr` order is restored. Never move an uncertain or accepted
+LazyLibrarian request into Shelfarr to manufacture a fallback.
 
-1. Stop Discord intake explicitly, then inspect Shelfarr and wait for every
-   request/download to become terminal. Do not switch ownership mid-import:
-
-   ```bash
-   docker compose stop huey
-   ```
-
-2. Set `WYSEARR_USENET_ENABLED=false` and `SHELFARR_ENABLED=false` in `.env`.
-3. Stop the evaluation services before restarting BookBot-owned intake:
-
-   ```bash
-   docker compose stop shelfarr sabnzbd
-   python3 scripts/bootstrap_shelfarr.py --prepare-sab-config
-   ```
-
-4. Recreate Huey without starting dependencies:
-
-   ```bash
-   docker compose up -d --no-deps --force-recreate huey
-   ```
-
-5. Confirm new ebook/audiobook requests use the preserved qBittorrent/BookBot
-   route and that BookBot is healthy before accepting requests again.
-6. Revert the evaluation git commit only after the runtime owner has been
-   switched back. Run the normal deployment validation afterward.
+Restoring production requires both services enabled and credentialed, the
+compatibility owner set to `lazylibrarian`, and `./deploy.sh` passing its exact
+order and availability gates. Confirm Shelfarr jobs remain on its isolated
+`shelfarr` category/finalizer and never enter BookBot's `ebooks` intake.
 
 `config/shelfarr`, `config/sabnzbd`, and downloaded files are intentionally
 left in place. Remove them only through a separately reviewed cleanup after a
 verified checkpoint; deleting them is not part of rollback.
+
+The preserved direct ebook route is available only as a non-production legacy
+singleton when `EBOOK_ACQUISITION_BACKENDS` is absent and
+`EBOOK_ACQUISITION_OWNER=direct`; it is not a cascade member and cannot satisfy
+the production validator.
 
 With `SHELFARR_ENABLED=false`, later normal deployments first disable the exact
 WyseARR-managed NNTP server in the private INI while SABnzbd is stopped. They

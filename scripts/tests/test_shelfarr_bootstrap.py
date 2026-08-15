@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bootstrap_shelfarr.py"
@@ -521,8 +521,8 @@ class ShelfarrBootstrapTests(unittest.TestCase):
         ), patch.object(
             bootstrap_shelfarr, "configure_sabnzbd", side_effect=configure_base
         ), patch.object(
-            bootstrap_shelfarr, "require_drained_bookbot_book_categories"
-        ), patch.object(
+            bootstrap_shelfarr, "require_drained_bookbot_ebook_categories"
+        ) as drain_check, patch.object(
             bootstrap_shelfarr,
             "configure_managed_usenet_provider",
             side_effect=configure_provider,
@@ -536,6 +536,7 @@ class ShelfarrBootstrapTests(unittest.TestCase):
             bootstrap_shelfarr.bootstrap_shelfarr(Path(directory))
 
         self.assertEqual(order, ["base", "provider", "shelfarr"])
+        drain_check.assert_not_called()
 
     def test_malformed_provider_contract_fails_before_sab_mutation(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
@@ -739,7 +740,7 @@ class ShelfarrBootstrapTests(unittest.TestCase):
             self.assertLess(content.index("api_logging = 0"), content.index("[servers]"))
             self.assertEqual(content.count("api_logging = 0"), 1)
 
-    def test_enable_blocks_every_base_and_imported_bookbot_category(self):
+    def test_explicit_drain_check_blocks_bookbot_ebook_categories(self):
         environment = {
             "QBITTORRENT_PORT": "8080",
             "WYSEARR_BIND_ADDRESS": "192.0.2.10",
@@ -747,7 +748,7 @@ class ShelfarrBootstrapTests(unittest.TestCase):
             "QBITTORRENT_PASSWORD": "secret",
         }
 
-        for blocking_category in bootstrap_shelfarr.BOOKBOT_BOOK_CATEGORIES:
+        for blocking_category in bootstrap_shelfarr.BOOKBOT_EBOOK_CATEGORIES:
             with self.subTest(category=blocking_category):
                 urls = []
                 categories = []
@@ -770,16 +771,16 @@ class ShelfarrBootstrapTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     bootstrap_shelfarr.BootstrapError, blocking_category
                 ):
-                    bootstrap_shelfarr.require_drained_bookbot_book_categories(
+                    bootstrap_shelfarr.require_drained_bookbot_ebook_categories(
                         environment,
                         client_factory=FakeClient,
                     )
                 self.assertEqual(urls, ["http://192.0.2.10:8080"])
                 self.assertEqual(
-                    categories, list(bootstrap_shelfarr.BOOKBOT_BOOK_CATEGORIES)
+                    categories, list(bootstrap_shelfarr.BOOKBOT_EBOOK_CATEGORIES)
                 )
 
-    def test_enable_accepts_only_fully_drained_bookbot_categories(self):
+    def test_explicit_drain_check_ignores_audiobook_categories(self):
         categories = []
 
         class EmptyClient:
@@ -793,7 +794,7 @@ class ShelfarrBootstrapTests(unittest.TestCase):
                 categories.append(category)
                 return []
 
-        bootstrap_shelfarr.require_drained_bookbot_book_categories(
+        bootstrap_shelfarr.require_drained_bookbot_ebook_categories(
             {
                 "QBITTORRENT_PORT": "8080",
                 "WYSEARR_BIND_ADDRESS": "192.0.2.10",
@@ -803,8 +804,29 @@ class ShelfarrBootstrapTests(unittest.TestCase):
             client_factory=EmptyClient,
         )
         self.assertEqual(
-            categories, list(bootstrap_shelfarr.BOOKBOT_BOOK_CATEGORIES)
+            categories, list(bootstrap_shelfarr.BOOKBOT_EBOOK_CATEGORIES)
         )
+        self.assertNotIn("audiobooks", categories)
+        self.assertNotIn("audiobooks-imported", categories)
+
+    def test_explicit_drain_check_never_repairs_qbittorrent_credentials(self):
+        client = Mock()
+        client.login.return_value = False
+
+        with self.assertRaisesRegex(
+            bootstrap_shelfarr.BootstrapError,
+            "rejected the drain-check credentials",
+        ):
+            bootstrap_shelfarr.require_drained_bookbot_ebook_categories(
+                {
+                    "QBITTORRENT_USERNAME": "admin",
+                    "QBITTORRENT_PASSWORD": "secret",
+                },
+                client_factory=lambda *_args, **_kwargs: client,
+            )
+
+        client.login.assert_called_once_with("admin", "secret")
+        client.torrents.assert_not_called()
 
     def test_active_record_convergence_uses_private_exec_streams(self):
         environment = {

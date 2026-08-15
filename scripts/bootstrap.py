@@ -200,6 +200,14 @@ class ApiResponse:
             raise BootstrapError("API returned malformed JSON") from exc
 
 
+@dataclass(frozen=True)
+class QbittorrentAuthentication:
+    """An authenticated session plus whether bootstrap changed its credentials."""
+
+    client: Any
+    credentials_repaired: bool
+
+
 class ApiClient:
     """Small JSON/form HTTP client with bounded retries and safe errors."""
 
@@ -367,11 +375,11 @@ class QbittorrentClient:
             raise BootstrapError("qBittorrent returned invalid categories")
         return result
 
-    def torrents(self, category: str) -> list[dict[str, Any]]:
-        result = self.api.get_json(
-            "/api/v2/torrents/info?"
-            + urllib.parse.urlencode({"category": category})
-        )
+    def torrents(self, category: str | None = None) -> list[dict[str, Any]]:
+        path = "/api/v2/torrents/info"
+        if category is not None:
+            path += "?" + urllib.parse.urlencode({"category": category})
+        result = self.api.get_json(path)
         if not isinstance(result, list) or any(
             not isinstance(item, dict) for item in result
         ):
@@ -612,7 +620,7 @@ def read_qbittorrent_logs() -> str:
     return result.stdout
 
 
-def authenticate_qbittorrent(
+def authenticate_qbittorrent_with_state(
     base_url: str,
     username: str,
     password: str,
@@ -621,11 +629,12 @@ def authenticate_qbittorrent(
     retries: int = 3,
     client_factory: Callable[..., Any] = QbittorrentClient,
     logs_reader: Callable[[], str] = read_qbittorrent_logs,
+    repair_guard: Callable[[Any], None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
-) -> Any:
+) -> QbittorrentAuthentication:
     client = client_factory(base_url, timeout=timeout, retries=retries)
     if client.login(username, password):
-        return client
+        return QbittorrentAuthentication(client, False)
 
     temporary_password = extract_temporary_password(logs_reader())
     if not temporary_password:
@@ -635,8 +644,41 @@ def authenticate_qbittorrent(
         )
     if not client.login("admin", temporary_password):
         raise BootstrapError("qBittorrent rejected its current temporary password")
+    (repair_guard or assert_qbittorrent_restart_safe)(client)
     client.set_web_credentials(username, password)
+    # Credential repair is the sole reason bootstrap may restart qBittorrent.
+    # The guarded restart below performs the new-session verification after it
+    # has cleared any IP bans caused by clients still holding the old password.
+    return QbittorrentAuthentication(client, True)
 
+
+def authenticate_qbittorrent(
+    base_url: str,
+    username: str,
+    password: str,
+    *,
+    timeout: float = 10.0,
+    retries: int = 3,
+    client_factory: Callable[..., Any] = QbittorrentClient,
+    logs_reader: Callable[[], str] = read_qbittorrent_logs,
+    repair_guard: Callable[[Any], None] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """Authenticate while preserving the historical client-only API."""
+
+    authentication = authenticate_qbittorrent_with_state(
+        base_url,
+        username,
+        password,
+        timeout=timeout,
+        retries=retries,
+        client_factory=client_factory,
+        logs_reader=logs_reader,
+        repair_guard=repair_guard,
+        sleep=sleep,
+    )
+    if not authentication.credentials_repaired:
+        return authentication.client
     for attempt in range(retries):
         verifier = client_factory(base_url, timeout=timeout, retries=retries)
         if verifier.login(username, password):
@@ -644,6 +686,25 @@ def authenticate_qbittorrent(
         if attempt + 1 < retries:
             sleep(min(2**attempt, 4))
     raise BootstrapError("qBittorrent did not accept the persisted WebUI credentials")
+
+
+def assert_qbittorrent_restart_safe(client: Any) -> None:
+    """Refuse credential rotation while incomplete transfers would be interrupted."""
+
+    incomplete = 0
+    for torrent in client.torrents():
+        progress = torrent.get("progress")
+        if isinstance(progress, bool) or not isinstance(progress, (int, float)):
+            raise BootstrapError(
+                "qBittorrent returned invalid progress while checking restart safety"
+            )
+        if float(progress) < 1.0:
+            incomplete += 1
+    if incomplete:
+        raise BootstrapError(
+            "qBittorrent credential repair requires a restart but incomplete "
+            f"transfers are present ({incomplete}); drain them before retrying"
+        )
 
 
 def restart_qbittorrent_with_rotation_guard(
@@ -657,8 +718,32 @@ def restart_qbittorrent_with_rotation_guard(
     runner: Callable[..., Any] = subprocess.run,
     client_factory: Callable[..., Any] = QbittorrentClient,
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
 ) -> Any:
     """Clear stale-client IP bans while a new shared password is propagated."""
+
+    def restore_normal_guard(*candidates: Any) -> bool:
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                candidate.set_preferences(
+                    {"web_ui_max_auth_fail_count": QBITTORRENT_AUTH_FAILURE_LIMIT}
+                )
+                return True
+            except Exception:
+                continue
+        return False
+
+    def restart_failure(message: str, *candidates: Any) -> BootstrapError:
+        if restore_normal_guard(*candidates):
+            return BootstrapError(message)
+        return BootstrapError(
+            "SECURITY CRITICAL: qBittorrent credential repair failed and the "
+            "normal WebUI authentication-failure limit could not be restored; "
+            "keep intake stopped and restore the limit through an authenticated "
+            "local WebUI session before recovery"
+        )
 
     client.set_preferences(
         {"web_ui_max_auth_fail_count": QBITTORRENT_ROTATION_GUARD_LIMIT}
@@ -672,32 +757,30 @@ def restart_qbittorrent_with_rotation_guard(
             timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        try:
-            client.set_preferences(
-                {"web_ui_max_auth_fail_count": QBITTORRENT_AUTH_FAILURE_LIMIT}
-            )
-        except Exception:
-            pass
-        raise BootstrapError("Unable to restart qBittorrent for credential repair") from exc
+        raise restart_failure(
+            "Unable to restart qBittorrent for credential repair", client
+        ) from exc
     if result.returncode != 0:
-        try:
-            client.set_preferences(
-                {"web_ui_max_auth_fail_count": QBITTORRENT_AUTH_FAILURE_LIMIT}
-            )
-        except Exception:
-            pass
-        raise BootstrapError("Unable to restart qBittorrent for credential repair")
+        raise restart_failure(
+            "Unable to restart qBittorrent for credential repair", client
+        )
 
-    deadline = time.monotonic() + max(60.0, timeout * retries)
-    while time.monotonic() < deadline:
+    deadline = clock() + max(60.0, timeout * retries)
+    last_candidate = None
+    while clock() < deadline:
         candidate = client_factory(base_url, timeout=timeout, retries=retries)
+        last_candidate = candidate
         try:
             if candidate.login(username, password):
                 return candidate
         except BootstrapError:
             pass
         sleep(2)
-    raise BootstrapError("qBittorrent did not recover after credential repair restart")
+    raise restart_failure(
+        "qBittorrent did not recover after credential repair restart",
+        last_candidate,
+        client,
+    )
 
 
 def configure_qbittorrent(client: Any) -> tuple[int, int]:
@@ -796,7 +879,10 @@ def _arr_payload_needs_update(
     desired: Mapping[str, Any],
     *,
     current_test_ok: bool,
+    force_update: bool = False,
 ) -> bool:
+    if force_update:
+        return True
     if not current_test_ok:
         return True
     managed_fields = (
@@ -853,6 +939,7 @@ def configure_arr_service(
     password: str,
     *,
     prefix: str | None = None,
+    force_credentials: bool = False,
 ) -> int:
     prefix = prefix or discover_arr_api_prefix(client, service)
     resources = client.get_json(f"{prefix}/downloadclient")
@@ -871,19 +958,28 @@ def configure_arr_service(
 
     updates = 0
     for current in qbit_resources:
-        try:
-            client.post_json(
-                f"{prefix}/downloadclient/test", current, retry=True
-            )
-            current_test_ok = True
-        except (ApiError, ApiTransportError):
+        if force_credentials:
+            # A masked definition may test successfully through a surviving
+            # qBittorrent SID after credential rotation.  Do not trust or even
+            # probe that stale definition when the caller requires persistence.
             current_test_ok = False
+        else:
+            try:
+                client.post_json(
+                    f"{prefix}/downloadclient/test", current, retry=True
+                )
+                current_test_ok = True
+            except (ApiError, ApiTransportError):
+                current_test_ok = False
 
         desired = build_arr_download_client_payload(
             current, service, username, password
         )
         if not _arr_payload_needs_update(
-            current, desired, current_test_ok=current_test_ok
+            current,
+            desired,
+            current_test_ok=current_test_ok,
+            force_update=force_credentials,
         ):
             continue
         try:
@@ -919,6 +1015,7 @@ def configure_arr_services(
     *,
     timeout: float,
     retries: int,
+    force_credentials: bool = False,
     client_factory: Callable[..., Any] = ApiClient,
 ) -> int:
     updates = 0
@@ -935,7 +1032,11 @@ def configure_arr_services(
             retries=retries,
         )
         updates += configure_arr_service(
-            client, service, qbit_username, qbit_password
+            client,
+            service,
+            qbit_username,
+            qbit_password,
+            force_credentials=force_credentials,
         )
     return updates
 
@@ -2059,28 +2160,31 @@ def bootstrap(
     qbit_password = environment["QBITTORRENT_PASSWORD"]
     bind_address = environment.get("WYSEARR_BIND_ADDRESS", "192.168.4.86")
     qbit_base_url = f"http://{bind_address}:{qbit_port}"
-    qbit = authenticate_qbittorrent(
+    authentication = authenticate_qbittorrent_with_state(
         qbit_base_url,
         qbit_username,
         qbit_password,
         timeout=timeout,
         retries=retries,
     )
-    preference_changes, category_changes = configure_qbittorrent(qbit)
-    reporter.info(
-        "qBittorrent verified "
-        f"({preference_changes} preference and {category_changes} category updates)."
-    )
-
-    qbit = restart_qbittorrent_with_rotation_guard(
-        qbit,
-        qbit_base_url,
-        qbit_username,
-        qbit_password,
-        timeout=timeout,
-        retries=retries,
-    )
+    qbit = authentication.client
+    rotation_guard_enabled = False
+    if authentication.credentials_repaired:
+        qbit = restart_qbittorrent_with_rotation_guard(
+            qbit,
+            qbit_base_url,
+            qbit_username,
+            qbit_password,
+            timeout=timeout,
+            retries=retries,
+        )
+        rotation_guard_enabled = True
     try:
+        preference_changes, category_changes = configure_qbittorrent(qbit)
+        reporter.info(
+            "qBittorrent verified "
+            f"({preference_changes} preference and {category_changes} category updates)."
+        )
         arr_updates = configure_arr_services(
             environment,
             api_keys,
@@ -2088,11 +2192,13 @@ def bootstrap(
             qbit_password,
             timeout=timeout,
             retries=retries,
+            force_credentials=authentication.credentials_repaired,
         )
     finally:
-        qbit.set_preferences(
-            {"web_ui_max_auth_fail_count": QBITTORRENT_AUTH_FAILURE_LIMIT}
-        )
+        if rotation_guard_enabled:
+            qbit.set_preferences(
+                {"web_ui_max_auth_fail_count": QBITTORRENT_AUTH_FAILURE_LIMIT}
+            )
     reporter.info(
         f"ARR qBittorrent integrations verified ({arr_updates} repaired)."
     )
