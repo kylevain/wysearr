@@ -241,9 +241,11 @@ docker compose logs --tail=100 huey abba bookbot
 
 LazyLibrarian deliberately has no Docker stdout log stream because its early
 configuration loader can emit downloader settings before upstream redaction is
-active. Inspect its private, access-controlled `config/lazylibrarian/Logs`
-files only through a secret-safe diagnostic; do not add it to `docker compose
-logs` commands.
+active. Whisparr's Docker stdout retention is also disabled because its deployed
+console target can retain a failed Prowlarr URL whose query value was not
+redacted. Inspect their private, access-controlled application logs only through
+a secret-safe diagnostic; do not add either service to `docker compose logs`
+commands.
 
 Some Servarr releases can persist a failed Prowlarr request as an escaped URL
 whose query value bypasses their normal display redaction. Repeated live indexer

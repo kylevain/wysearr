@@ -93,9 +93,11 @@ one-shot hook and repairs client-preference drift after a Gluetun, qBittorrent,
 or host restart.
 
 LazyLibrarian's early config loader can echo downloader settings before its own
-redaction policy initializes, so its Docker logging driver is `none` and it must
-not be included in Docker-log collection commands. Its private `/config/Logs`
-tree remains access-controlled; inspect it only with secret-safe, count-only
+redaction policy initializes. The deployed Whisparr release can likewise send a
+failed Prowlarr URL to its console target with a query value that its redactor
+misses. Both services therefore use Docker logging driver `none` and must not be
+included in Docker-log collection commands. Their private application-log trees
+remain access-controlled; inspect them only with secret-safe, count-only
 diagnostics unless upstream redaction has been independently verified.
 
 Check the live, non-secret forwarding state with:

@@ -366,6 +366,11 @@ services:
     <<: *common
     image: ghcr.io/hotio/whisparr@sha256:13f14e5cd86012f775cc07fe672cd279a295ef41605b8fc3ebfb47583bf50eac
     container_name: whisparr
+    # This release's console target can retain a Prowlarr Torznab URL when an
+    # upstream test fails, including query values missed by its redactor. Keep
+    # the private application logs on /config, but do not retain Docker stdout.
+    logging:
+      driver: none
     volumes:
       - ./config/whisparr:/config
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads

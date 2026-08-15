@@ -71,6 +71,10 @@ class QbittorrentVpnInfrastructureTests(unittest.TestCase):
         lazylibrarian = self.service_block("lazylibrarian", "sabnzbd")
         self.assertIn("logging:\n      driver: none", lazylibrarian)
 
+    def test_whisparr_does_not_retain_unredacted_prowlarr_urls(self) -> None:
+        whisparr = self.service_block("whisparr", "bookbot")
+        self.assertIn("logging:\n      driver: none", whisparr)
+
     def test_deploy_migrates_legacy_qbittorrent_then_preserves_good_namespace(self) -> None:
         stop = self.deploy.index("docker compose stop qbittorrent")
         start_gluetun = self.deploy.index("docker compose up -d --no-deps gluetun", stop)

@@ -385,8 +385,8 @@ with independent backups.
 ## Failure locations
 
 - Container state: `docker compose ps`
-- Service logs: `docker compose logs --tail=200 SERVICE` except LazyLibrarian,
-  whose Docker stdout logging is intentionally disabled
+- Service logs: `docker compose logs --tail=200 SERVICE` except LazyLibrarian
+  and Whisparr, whose Docker stdout logging is intentionally disabled
 - Aggregate checks: `python3 scripts/validate.py`
 - Huey request/events DB: `state/huey/huey.db`
 - ABBA correlation DB/logs: `config/abba/abba.db` and `docker compose logs abba`
