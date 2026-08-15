@@ -25,6 +25,12 @@ REQUEST_STATUSES = frozenset(
     }
 )
 CANDIDATE_CONFIRMATION_TTL_SECONDS = 15 * 60
+UNAVAILABLE_FIRST_RETRY_DELAY = timedelta(days=7)
+UNAVAILABLE_RETRY_INTERVAL = timedelta(days=30)
+UNAVAILABLE_RETRY_LIMIT = 7
+UNAVAILABLE_RETRY_ACTIVE_STATES = frozenset(
+    {"queued", "retrying", "awaiting_import", "blocked"}
+)
 _SELECTION_FINGERPRINT = re.compile(r"\A[0-9a-f]{64}\Z")
 _ABBA_CANDIDATE_ID = re.compile(r"\Aabba:[0-9a-f]{64}\Z")
 _ABBA_INFO_HASH = re.compile(r"\A[0-9a-f]{40}\Z")
@@ -76,6 +82,9 @@ _REQUEST_COLUMNS = {
 _CANDIDATE_CONFIRMATION_COLUMNS = {
     "dispatch_started_at": "TEXT",
 }
+_UNAVAILABLE_RETRY_COLUMNS = {
+    "last_proof_check_at": "TEXT",
+}
 
 SHELFARR_STATUSES = frozenset(
     {
@@ -98,7 +107,7 @@ LAZYLIBRARIAN_STATUSES = frozenset(
 
 
 class LazyLibrarianHashCollision(sqlite3.IntegrityError):
-    """Two active LazyLibrarian requests resolved to one qBit identity."""
+    """A LazyLibrarian request resolved to an already-reserved qBit identity."""
 
 
 class EbookIdentityCollision(sqlite3.IntegrityError):
@@ -285,62 +294,232 @@ class RequestStore:
             self._mark_interrupted_abba_requests(connection)
             self._mark_interrupted_lazylibrarian_requests(connection)
             self._fail_interrupted_requests(connection)
+            self._recover_interrupted_unavailable_retries(connection)
             self._backfill_target_keys(connection)
-            connection.executescript(
-                """
-                DROP INDEX IF EXISTS requests_active_abba_hash_uq;
-                DROP INDEX IF EXISTS requests_active_abba_candidate_uq;
-                """
-            )
-            self._migrate_abba_collisions(connection)
-            connection.executescript(
-                """
-                DROP INDEX IF EXISTS requests_active_target_uq;
-                CREATE UNIQUE INDEX IF NOT EXISTS requests_active_target_uq
-                    ON requests(target_key)
-                    WHERE target_key IS NOT NULL
-                      AND status IN (
-                          'new', 'processing', 'awaiting_selection',
-                          'queued', 'complete', 'completed'
-                      );
-                CREATE UNIQUE INDEX IF NOT EXISTS requests_active_ll_book_uq
-                    ON requests(lazylibrarian_book_id)
-                    WHERE service = 'lazylibrarian'
-                      AND lazylibrarian_book_id IS NOT NULL
-                      AND status IN (
-                          'processing', 'queued', 'complete', 'completed'
-                      );
-                CREATE UNIQUE INDEX IF NOT EXISTS requests_active_ll_hash_uq
-                    ON requests(lower(external_id))
-                    WHERE service = 'lazylibrarian'
-                      AND external_id IS NOT NULL
-                      AND status IN ('processing', 'queued');
-                CREATE UNIQUE INDEX requests_active_abba_hash_uq
-                    ON requests(lower(external_id))
-                    WHERE service = 'abba'
-                      AND external_id IS NOT NULL
-                      AND canonical_request_id IS NULL
-                      AND status IN (
-                          'processing', 'queued', 'complete', 'completed'
-                      );
-                CREATE UNIQUE INDEX requests_active_abba_candidate_uq
-                    ON requests(abba_candidate_id)
-                    WHERE service = 'abba'
-                      AND abba_candidate_id IS NOT NULL
-                      AND canonical_request_id IS NULL
-                      AND status IN (
-                          'processing', 'queued', 'complete', 'completed'
-                      );
-                CREATE INDEX IF NOT EXISTS requests_canonical_request_idx
-                    ON requests(canonical_request_id);
-                CREATE INDEX IF NOT EXISTS requests_status_idx
-                    ON requests(status, updated_at);
-                CREATE INDEX IF NOT EXISTS requests_media_created_idx
-                    ON requests(media_type, created_at);
-                CREATE INDEX IF NOT EXISTS events_request_created_idx
-                    ON events(request_id, created_at);
-                """
-            )
+            # Keep legacy-collision repair and every stricter replacement index
+            # in one SQLite savepoint.  ``executescript`` commits pending work
+            # before it runs, which could otherwise persist a partial quarantine
+            # if a later uniqueness check failed.
+            connection.execute("SAVEPOINT huey_identity_index_migration")
+            try:
+                for index_name in (
+                    "requests_active_abba_hash_uq",
+                    "requests_active_abba_candidate_uq",
+                    "requests_active_ll_hash_uq",
+                    "requests_active_target_uq",
+                ):
+                    connection.execute(f"DROP INDEX IF EXISTS {index_name}")
+                self._migrate_abba_collisions(connection)
+                self._migrate_lazylibrarian_hash_collisions(connection)
+                index_statements = (
+                    """
+                    CREATE UNIQUE INDEX requests_active_target_uq
+                        ON requests(target_key)
+                        WHERE target_key IS NOT NULL
+                          AND status IN (
+                              'new', 'processing', 'awaiting_selection',
+                              'queued', 'complete', 'completed'
+                          )
+                    """,
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS requests_active_ll_book_uq
+                        ON requests(lazylibrarian_book_id)
+                        WHERE service = 'lazylibrarian'
+                          AND lazylibrarian_book_id IS NOT NULL
+                          AND status IN (
+                              'processing', 'queued', 'complete', 'completed'
+                          )
+                    """,
+                    """
+                    CREATE UNIQUE INDEX requests_active_ll_hash_uq
+                        ON requests(lower(external_id))
+                        WHERE service = 'lazylibrarian'
+                          AND external_id IS NOT NULL
+                          AND status IN (
+                              'processing', 'queued', 'complete', 'completed'
+                          )
+                    """,
+                    """
+                    CREATE UNIQUE INDEX requests_active_abba_hash_uq
+                        ON requests(lower(external_id))
+                        WHERE service = 'abba'
+                          AND external_id IS NOT NULL
+                          AND canonical_request_id IS NULL
+                          AND status IN (
+                              'processing', 'queued', 'complete', 'completed'
+                          )
+                    """,
+                    """
+                    CREATE UNIQUE INDEX requests_active_abba_candidate_uq
+                        ON requests(abba_candidate_id)
+                        WHERE service = 'abba'
+                          AND abba_candidate_id IS NOT NULL
+                          AND canonical_request_id IS NULL
+                          AND status IN (
+                              'processing', 'queued', 'complete', 'completed'
+                          )
+                    """,
+                    """
+                    CREATE INDEX IF NOT EXISTS requests_canonical_request_idx
+                        ON requests(canonical_request_id)
+                    """,
+                    """
+                    CREATE INDEX IF NOT EXISTS requests_status_idx
+                        ON requests(status, updated_at)
+                    """,
+                    """
+                    CREATE INDEX IF NOT EXISTS requests_media_created_idx
+                        ON requests(media_type, created_at)
+                    """,
+                    """
+                    CREATE INDEX IF NOT EXISTS events_request_created_idx
+                        ON events(request_id, created_at)
+                    """,
+                )
+                for statement in index_statements:
+                    connection.execute(statement)
+            except Exception:
+                connection.execute("ROLLBACK TO huey_identity_index_migration")
+                connection.execute("RELEASE huey_identity_index_migration")
+                raise
+            else:
+                connection.execute("RELEASE huey_identity_index_migration")
+
+    @staticmethod
+    def _release_unowned_ebook_backend_reservations(
+        connection: sqlite3.Connection, request_id: int
+    ) -> None:
+        """Release provider IDs only after durable retry ownership has ended."""
+
+        connection.execute(
+            """
+            DELETE FROM ebook_backend_reservations
+            WHERE request_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM unavailable_retries
+                  WHERE request_id = ?
+                    AND state IN (
+                        'queued', 'retrying', 'awaiting_import', 'blocked',
+                        'fulfilled'
+                    )
+              )
+            """,
+            (int(request_id), int(request_id)),
+        )
+
+    @staticmethod
+    def _recover_interrupted_unavailable_retries(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Repair retry ownership after a restart without repeating mutations."""
+
+        rows = connection.execute(
+            """
+            SELECT unavailable_retries.request_id,
+                   unavailable_retries.retry_count,
+                   unavailable_retries.last_retry_at,
+                   unavailable_retries.state,
+                   requests.status
+            FROM unavailable_retries
+            JOIN requests ON requests.id = unavailable_retries.request_id
+            WHERE unavailable_retries.state IN ('retrying', 'awaiting_import')
+            """
+        ).fetchall()
+        for row in rows:
+            status = str(row["status"] or "")
+            retry_state = str(row["state"] or "")
+            if retry_state == "awaiting_import" and status == "failed":
+                connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET state = 'blocked', next_retry_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'awaiting_import'
+                    """,
+                    (int(row["request_id"]),),
+                )
+                continue
+            if retry_state == "awaiting_import" and status not in {
+                "complete",
+                "completed",
+            }:
+                continue
+            if retry_state == "retrying" and status == "needs_selection":
+                # A crash can land after the search-safe cascade transaction
+                # rejects stale metadata but before the scheduler's cleanup.
+                # Preserve the no-prompt retry contract and restore the exact
+                # failed shape required by a later atomic claim.
+                connection.execute(
+                    """
+                    UPDATE requests
+                    SET status = 'failed',
+                        error = 'Stored ebook identity could not be resolved exactly during silent retry',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = 'needs_selection'
+                    """,
+                    (int(row["request_id"]),),
+                )
+                status = "failed"
+            if status in {"processing", "new"}:
+                # Search-only ebook cascades are resumed by RequestProcessor;
+                # crossed mutation boundaries are handled by the established
+                # backend reconciliation paths.
+                continue
+            if status == "queued":
+                connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET state = 'awaiting_import', next_retry_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'retrying'
+                    """,
+                    (int(row["request_id"]),),
+                )
+                continue
+            if status in {"complete", "completed"}:
+                connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET state = 'fulfilled', final_import_state = 'verified',
+                        fulfilled_at = COALESCE(fulfilled_at, CURRENT_TIMESTAMP),
+                        next_retry_at = NULL, expired_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ?
+                      AND state IN ('retrying', 'awaiting_import')
+                    """,
+                    (int(row["request_id"]),),
+                )
+                connection.execute(
+                    "UPDATE requests SET notified_at = NULL WHERE id = ?",
+                    (int(row["request_id"]),),
+                )
+                continue
+            last_retry = str(row["last_retry_at"] or "")
+            if int(row["retry_count"]) >= UNAVAILABLE_RETRY_LIMIT:
+                connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET state = 'expired', next_retry_at = NULL,
+                        expired_at = COALESCE(expired_at, CURRENT_TIMESTAMP),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'retrying'
+                    """,
+                    (int(row["request_id"]),),
+                )
+                RequestStore._release_unowned_ebook_backend_reservations(
+                    connection, int(row["request_id"])
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET state = 'queued',
+                        next_retry_at = datetime(?, '+30 days'),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'retrying'
+                    """,
+                    (last_retry, int(row["request_id"])),
+                )
 
     @staticmethod
     def _close_released_ebook_cascade(
@@ -381,9 +560,8 @@ class RequestStore:
             """,
             (int(request_id),),
         )
-        connection.execute(
-            "DELETE FROM ebook_backend_reservations WHERE request_id = ?",
-            (int(request_id),),
+        RequestStore._release_unowned_ebook_backend_reservations(
+            connection, int(request_id)
         )
 
     @staticmethod
@@ -762,6 +940,23 @@ class RequestStore:
                         f"ALTER TABLE candidate_confirmations "
                         f"ADD COLUMN {name} {definition}"
                     )
+        retry_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'unavailable_retries'"
+        ).fetchone()
+        if retry_table is not None:
+            retry_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(unavailable_retries)"
+                ).fetchall()
+            }
+            for name, definition in _UNAVAILABLE_RETRY_COLUMNS.items():
+                if name not in retry_columns:
+                    connection.execute(
+                        f"ALTER TABLE unavailable_retries "
+                        f"ADD COLUMN {name} {definition}"
+                    )
 
     @staticmethod
     def _backfill_target_keys(connection: sqlite3.Connection) -> None:
@@ -1078,6 +1273,171 @@ class RequestStore:
                 )
 
     @staticmethod
+    def _migrate_lazylibrarian_hash_collisions(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Quarantine LL hash collisions permitted by the former active-only index.
+
+        A shared qBittorrent hash does not prove that two LazyLibrarian BookIDs
+        represent the same work, so these rows must never be coalesced as
+        aliases.  Preserve one already completed owner when final-import proof
+        exists, quarantine every nonterminal competitor, and detach only extra
+        terminal rows from the hash reservation while retaining their completed
+        state.  If no completed owner exists, every ambiguous active row is
+        quarantined rather than authorizing an arbitrary download owner.
+        """
+
+        tracked = "'processing', 'queued', 'complete', 'completed'"
+        duplicate_hashes = connection.execute(
+            f"""
+            SELECT lower(external_id) AS download_id
+            FROM requests
+            WHERE service = 'lazylibrarian' AND external_id IS NOT NULL
+              AND status IN ({tracked})
+            GROUP BY lower(external_id)
+            HAVING COUNT(*) > 1
+            ORDER BY lower(external_id)
+            """
+        ).fetchall()
+        for duplicate in duplicate_hashes:
+            rows = connection.execute(
+                f"""
+                SELECT id, status FROM requests
+                WHERE service = 'lazylibrarian'
+                  AND lower(external_id) = ?
+                  AND status IN ({tracked})
+                ORDER BY
+                    CASE WHEN status IN ('complete', 'completed') THEN 0 ELSE 1 END,
+                    id
+                """,
+                (duplicate["download_id"],),
+            ).fetchall()
+            terminal = [
+                row for row in rows if row["status"] in {"complete", "completed"}
+            ]
+            owner_id = int(terminal[0]["id"]) if terminal else None
+
+            for row in rows:
+                request_id = int(row["id"])
+                if owner_id is not None and request_id == owner_id:
+                    continue
+                if row["status"] in {"complete", "completed"}:
+                    # The final-library result remains authoritative, but only
+                    # one terminal request may retain the downloader identity.
+                    connection.execute(
+                        """
+                        UPDATE requests
+                        SET external_id = NULL,
+                            external_status =
+                                'lazylibrarian_hash_identity_conflict',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND service = 'lazylibrarian'
+                          AND status IN ('complete', 'completed')
+                        """,
+                        (request_id,),
+                    )
+                    message = (
+                        "Detached a duplicate terminal LazyLibrarian hash from "
+                        f"canonical completed request #{owner_id}"
+                    )
+                else:
+                    message = (
+                        "Quarantined an ambiguous LazyLibrarian hash owned by "
+                        f"completed request #{owner_id}"
+                        if owner_id is not None
+                        else "Quarantined an ambiguous LazyLibrarian hash with no "
+                        "completed owner"
+                    )
+                    # Promote retry ownership before the request failure trigger
+                    # runs, so its backend reservation remains durable for
+                    # exact final-proof recovery.
+                    connection.execute(
+                        """
+                        UPDATE unavailable_retries
+                        SET state = 'blocked', next_retry_at = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE request_id = ?
+                          AND state IN (
+                              'queued', 'retrying', 'awaiting_import', 'blocked'
+                          )
+                        """,
+                        (request_id,),
+                    )
+                    cursor = connection.execute(
+                        """
+                        UPDATE requests
+                        SET status = 'failed',
+                            external_status =
+                                'lazylibrarian_hash_identity_conflict',
+                            error =
+                                'LazyLibrarian download identity conflict requires operator review',
+                            notified_at = COALESCE(
+                                notified_at, CURRENT_TIMESTAMP
+                            ),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND service = 'lazylibrarian'
+                          AND status IN ('processing', 'queued')
+                        """,
+                        (request_id,),
+                    )
+                    if cursor.rowcount != 1:
+                        raise sqlite3.IntegrityError(
+                            "LazyLibrarian hash conflict could not be quarantined"
+                        )
+                    connection.execute(
+                        """
+                        UPDATE candidate_confirmations
+                        SET status = 'failed', updated_at = CURRENT_TIMESTAMP,
+                            failure_message =
+                                'LazyLibrarian download identity conflict requires review'
+                        WHERE request_id = ? AND status IN ('pending', 'claimed')
+                        """,
+                        (request_id,),
+                    )
+                    connection.execute(
+                        """
+                        DELETE FROM notification_deliveries
+                        WHERE request_id = ? AND delivered_at IS NULL
+                        """,
+                        (request_id,),
+                    )
+
+                connection.execute(
+                    """
+                    INSERT INTO events (request_id, event_type, message)
+                    VALUES (?, 'lazylibrarian_hash_collision_migrated', ?)
+                    """,
+                    (request_id, message),
+                )
+                if owner_id is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO events (request_id, event_type, message)
+                        VALUES (?, 'lazylibrarian_hash_owner_preserved', ?)
+                        """,
+                        (
+                            owner_id,
+                            f"Preserved completed owner over legacy request #{request_id}",
+                        ),
+                    )
+
+        remaining = connection.execute(
+            f"""
+            SELECT lower(external_id) AS download_id
+            FROM requests
+            WHERE service = 'lazylibrarian' AND external_id IS NOT NULL
+              AND status IN ({tracked})
+            GROUP BY lower(external_id)
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if remaining is not None:
+            raise sqlite3.IntegrityError(
+                "LazyLibrarian hash collision migration left ambiguous ownership"
+            )
+
+    @staticmethod
     def _merge_duplicate_messages(connection: sqlite3.Connection) -> None:
         duplicates = connection.execute(
             """
@@ -1174,6 +1534,349 @@ class RequestStore:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
         return dict(row) if row else None
+
+    @staticmethod
+    def _unavailable_retry_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        value = dict(row)
+        try:
+            metadata = json.loads(str(value["metadata_json"]))
+            value["metadata"] = _normalize_candidate_snapshot(
+                metadata, request_media_type=str(value["media_type"])
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise sqlite3.DatabaseError("Unavailable retry metadata is invalid") from error
+        return value
+
+    def get_unavailable_retry(self, request_id: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM unavailable_retries WHERE request_id = ?",
+                (int(request_id),),
+            ).fetchone()
+        return self._unavailable_retry_row(row)
+
+    def list_unavailable_retries(
+        self, *, state: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return retry records for operator inspection in stable due order."""
+
+        if state is not None and state not in {
+            "queued",
+            "retrying",
+            "awaiting_import",
+            "blocked",
+            "fulfilled",
+            "expired",
+        }:
+            raise ValueError("Unknown unavailable retry state")
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM unavailable_retries
+                WHERE (? IS NULL OR state = ?)
+                ORDER BY COALESCE(next_retry_at, updated_at), request_id
+                LIMIT ?
+                """,
+                (state, state, max(1, min(int(limit), 1000))),
+            ).fetchall()
+        return [
+            value
+            for row in rows
+            if (value := self._unavailable_retry_row(row)) is not None
+        ]
+
+    def unavailable_retry_is_silent(self, request_id: int) -> bool:
+        """Return whether routine lifecycle Discord traffic must be suppressed."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM unavailable_retries
+                WHERE request_id = ?
+                  AND state IN ('retrying', 'awaiting_import', 'blocked')
+                """,
+                (int(request_id),),
+            ).fetchone()
+        return row is not None
+
+    def force_unavailable_retry(
+        self, request_id: int, *, now: datetime | None = None
+    ) -> bool:
+        """Make a queued, pre-mutation retry immediately eligible."""
+
+        timestamp = _selection_timestamp(now)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE unavailable_retries
+                SET next_retry_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE request_id = ? AND state = 'queued'
+                """,
+                (timestamp, int(request_id)),
+            )
+            if cursor.rowcount == 1:
+                connection.execute(
+                    """
+                    INSERT INTO events (request_id, event_type, message)
+                    VALUES (?, 'unavailable_retry_forced',
+                            'Operator made the queued unavailable retry immediately eligible')
+                    """,
+                    (int(request_id),),
+                )
+            return cursor.rowcount == 1
+
+    def claim_due_unavailable_retries(
+        self, *, now: datetime | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Atomically rearm due ebook cascades while preserving canonical identity."""
+
+        timestamp = _selection_timestamp(now)
+        claimed: list[dict[str, Any]] = []
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT unavailable_retries.request_id
+                FROM unavailable_retries
+                JOIN requests ON requests.id = unavailable_retries.request_id
+                JOIN ebook_cascades
+                  ON ebook_cascades.request_id = unavailable_retries.request_id
+                WHERE unavailable_retries.state = 'queued'
+                  AND unavailable_retries.next_retry_at <= ?
+                  AND unavailable_retries.retry_count < ?
+                  AND requests.status = 'failed'
+                  AND ebook_cascades.state = 'failed'
+                  AND ebook_cascades.mutation_backend IS NULL
+                  AND ebook_cascades.identity_key = unavailable_retries.identity_key
+                ORDER BY unavailable_retries.next_retry_at,
+                         unavailable_retries.request_id
+                LIMIT ?
+                """,
+                (
+                    timestamp,
+                    UNAVAILABLE_RETRY_LIMIT,
+                    max(1, min(int(limit), 1000)),
+                ),
+            ).fetchall()
+            for selected in rows:
+                request_id = int(selected["request_id"])
+                cascade = self._ebook_cascade_row(connection, request_id)
+                if cascade is None or not cascade["policy"]:
+                    continue
+                first_backend = str(cascade["policy"][0])
+                attempts = connection.execute(
+                    """
+                    UPDATE ebook_backend_attempts
+                    SET status = 'pending', started_at = NULL,
+                        finished_at = NULL, mutation_started_at = NULL,
+                        mutation_resolved_at = NULL,
+                        external_id = NULL, external_status = NULL,
+                        outcome_message = NULL
+                    WHERE request_id = ?
+                    """,
+                    (request_id,),
+                )
+                cascade_cursor = connection.execute(
+                    """
+                    UPDATE ebook_cascades
+                    SET current_ordinal = 0, state = 'searching',
+                        mutation_backend = NULL, mutation_started_at = NULL,
+                        final_backend = NULL, finalizer = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'failed'
+                      AND mutation_backend IS NULL
+                    """,
+                    (request_id,),
+                )
+                request_cursor = connection.execute(
+                    """
+                    UPDATE requests
+                    SET status = 'processing', service = ?, external_id = NULL,
+                        external_status = NULL, external_title = NULL,
+                        dispatch_started_at = NULL, lazylibrarian_book_id = NULL,
+                        error = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = 'failed'
+                    """,
+                    (first_backend, request_id),
+                )
+                retry_cursor = connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET state = 'retrying', retry_count = retry_count + 1,
+                        last_retry_at = ?, next_retry_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'queued'
+                    """,
+                    (timestamp, request_id),
+                )
+                if (
+                    attempts.rowcount != len(cascade["policy"])
+                    or cascade_cursor.rowcount != 1
+                    or request_cursor.rowcount != 1
+                    or retry_cursor.rowcount != 1
+                ):
+                    raise EbookCascadeStateError(
+                        "Unavailable retry could not be claimed atomically"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO events (request_id, event_type, message)
+                    VALUES (?, 'unavailable_retry_started',
+                            'Started one due silent unavailable retry')
+                    """,
+                    (request_id,),
+                )
+                request = connection.execute(
+                    "SELECT * FROM requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                if request is None:  # pragma: no cover - transaction invariant
+                    raise sqlite3.DatabaseError("Unavailable retry request disappeared")
+                claimed.append(dict(request))
+        return claimed
+
+    @staticmethod
+    def _finish_retry_miss(
+        connection: sqlite3.Connection,
+        request_id: int,
+        *,
+        now: datetime | None = None,
+        event_type: str = "unavailable_retry_deferred",
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT retry_count, last_retry_at FROM unavailable_retries
+            WHERE request_id = ? AND state = 'retrying'
+            """,
+            (int(request_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        moment = now or datetime.now(timezone.utc)
+        timestamp = _selection_timestamp(moment)
+        if int(row["retry_count"]) >= UNAVAILABLE_RETRY_LIMIT:
+            connection.execute(
+                """
+                UPDATE unavailable_retries
+                SET state = 'expired', next_retry_at = NULL,
+                    expired_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE request_id = ? AND state = 'retrying'
+                """,
+                (timestamp, int(request_id)),
+            )
+            RequestStore._release_unowned_ebook_backend_reservations(
+                connection, int(request_id)
+            )
+            event_type = "unavailable_retry_expired"
+            message = "Unavailable retry reached its bounded retry ceiling"
+        else:
+            try:
+                retry_started = datetime.fromisoformat(str(row["last_retry_at"]))
+            except (TypeError, ValueError) as error:
+                raise sqlite3.DatabaseError(
+                    "Unavailable retry has an invalid last-retry timestamp"
+                ) from error
+            if retry_started.tzinfo is None or retry_started.utcoffset() is None:
+                retry_started = retry_started.replace(tzinfo=timezone.utc)
+            next_retry = _selection_timestamp(
+                retry_started.astimezone(timezone.utc) + UNAVAILABLE_RETRY_INTERVAL
+            )
+            connection.execute(
+                """
+                UPDATE unavailable_retries
+                SET state = 'queued', next_retry_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE request_id = ? AND state = 'retrying'
+                """,
+                (next_retry, int(request_id)),
+            )
+            message = "Silent unavailable retry ended before a safe handoff"
+        connection.execute(
+            "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+            (int(request_id), event_type, message),
+        )
+        return True
+
+    def finish_unavailable_retry_attempt(
+        self, request_id: int, *, now: datetime | None = None
+    ) -> bool:
+        """Close a retry left terminal by an operational pre-mutation failure."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            retry = connection.execute(
+                """
+                SELECT state FROM unavailable_retries
+                WHERE request_id = ?
+                """,
+                (int(request_id),),
+            ).fetchone()
+            if retry is None or retry["state"] != "retrying":
+                return False
+            request = connection.execute(
+                "SELECT status FROM requests WHERE id = ?", (int(request_id),)
+            ).fetchone()
+            if request is None:
+                raise KeyError(f"Unknown request ID: {request_id}")
+            status = str(request["status"] or "")
+            if status == "queued":
+                cursor = connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET state = 'awaiting_import', next_retry_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'retrying'
+                    """,
+                    (int(request_id),),
+                )
+                return cursor.rowcount == 1
+            if status in {"complete", "completed"}:
+                # The schema trigger normally owns this edge; this branch is a
+                # restart/migration repair and preserves the same semantics.
+                cursor = connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET state = 'fulfilled', final_import_state = 'verified',
+                        fulfilled_at = COALESCE(fulfilled_at, CURRENT_TIMESTAMP),
+                        next_retry_at = NULL, expired_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'retrying'
+                    """,
+                    (int(request_id),),
+                )
+                connection.execute(
+                    "UPDATE requests SET notified_at = NULL WHERE id = ?",
+                    (int(request_id),),
+                )
+                return cursor.rowcount == 1
+            if status == "needs_selection":
+                # A background retry must never ask the requester to resolve
+                # the same metadata again.  Normalize the pre-mutation stale
+                # mapping back to the failed/search-safe shape required by the
+                # next deterministic claim while retaining the canonical retry
+                # identity and its silent ownership.
+                cursor = connection.execute(
+                    """
+                    UPDATE requests
+                    SET status = 'failed',
+                        error = 'Stored ebook identity could not be resolved exactly during silent retry',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = 'needs_selection'
+                    """,
+                    (int(request_id),),
+                )
+                if cursor.rowcount != 1:
+                    raise EbookCascadeStateError(
+                        "Stale unavailable retry could not be normalized"
+                    )
+                status = "failed"
+            if status == "failed":
+                return self._finish_retry_miss(
+                    connection, int(request_id), now=now
+                )
+            return False
 
     @staticmethod
     def _ebook_cascade_row(
@@ -1418,6 +2121,17 @@ class RequestStore:
             raise ValueError("Primary ebook backend identity is not reserved")
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            retry_owner = connection.execute(
+                """
+                SELECT request_id FROM unavailable_retries
+                WHERE identity_key = ? AND request_id != ?
+                  AND state IN ('queued', 'retrying', 'awaiting_import', 'blocked')
+                ORDER BY request_id LIMIT 1
+                """,
+                (identity_key, int(request_id)),
+            ).fetchone()
+            if retry_owner is not None:
+                raise EbookIdentityCollision(int(retry_owner["request_id"]))
             cascade = self._ebook_cascade_row(connection, int(request_id))
             if cascade is None:
                 raise EbookCascadeStateError("Request has no ebook cascade")
@@ -1695,6 +2409,7 @@ class RequestStore:
         *,
         final_message: str,
         notifications: Sequence[tuple[str, str, str]] = (),
+        now: datetime | None = None,
     ) -> str | None:
         """CAS-advance after a safe miss/unavailable outcome, or exhaust once."""
 
@@ -1705,6 +2420,8 @@ class RequestStore:
         if not final_message or not final_message.strip():
             raise ValueError("Ebook exhaustion requires a user-safe message")
         deliveries = self._normalized_deliveries(notifications)
+        moment = now or datetime.now(timezone.utc)
+        timestamp = _selection_timestamp(moment)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             cascade = self._ebook_cascade_row(connection, int(request_id))
@@ -1733,11 +2450,13 @@ class RequestStore:
                         WHEN mutation_started_at IS NOT NULL THEN CURRENT_TIMESTAMP
                         ELSE mutation_resolved_at
                     END,
+                    external_status = ?,
                     outcome_message = ?
                 WHERE request_id = ? AND ordinal = ?
                 """,
                 (
                     finished_status,
+                    handler_result.get("external_status"),
                     str(handler_result.get("message") or "")[:1000],
                     int(request_id),
                     ordinal,
@@ -1745,6 +2464,15 @@ class RequestStore:
             )
             if attempt_cursor.rowcount != 1:
                 raise EbookCascadeStateError("Ebook attempt could not be advanced")
+            retry = connection.execute(
+                """
+                SELECT state FROM unavailable_retries WHERE request_id = ?
+                """,
+                (int(request_id),),
+            ).fetchone()
+            silent_retry = retry is not None and retry["state"] == "retrying"
+            if silent_retry:
+                deliveries = []
             next_ordinal = ordinal + 1
             if next_ordinal < len(cascade["policy"]):
                 next_backend = cascade["policy"][next_ordinal]
@@ -1792,10 +2520,6 @@ class RequestStore:
                 """,
                 (int(request_id), ordinal),
             )
-            connection.execute(
-                "DELETE FROM ebook_backend_reservations WHERE request_id = ?",
-                (int(request_id),),
-            )
             request_cursor = connection.execute(
                 """
                 UPDATE requests
@@ -1818,6 +2542,91 @@ class RequestStore:
                     "ebook_cascade_exhausted",
                     "Every configured ebook backend ended without a safe acquisition",
                 ),
+            )
+            if silent_retry:
+                self._finish_retry_miss(
+                    connection,
+                    int(request_id),
+                    now=moment,
+                    event_type="unavailable_retry_miss",
+                )
+            elif cascade.get("identity_key") is not None:
+                attempt_summary = connection.execute(
+                    """
+                    SELECT COUNT(*) AS attempt_count,
+                           SUM(CASE WHEN status = 'miss' THEN 1 ELSE 0 END) AS miss_count,
+                           SUM(CASE WHEN external_status = 'not_found' THEN 1 ELSE 0 END)
+                               AS release_miss_count
+                    FROM ebook_backend_attempts WHERE request_id = ?
+                    """,
+                    (int(request_id),),
+                ).fetchone()
+                conclusively_unavailable = bool(
+                    attempt_summary is not None
+                    and int(attempt_summary["attempt_count"] or 0)
+                    == len(cascade["policy"])
+                    and int(attempt_summary["miss_count"] or 0)
+                    == len(cascade["policy"])
+                    and int(attempt_summary["release_miss_count"] or 0) >= 1
+                )
+                if conclusively_unavailable:
+                    request = connection.execute(
+                        "SELECT * FROM requests WHERE id = ?", (int(request_id),)
+                    ).fetchone()
+                    identity = cascade.get("identity")
+                    if request is None or not isinstance(identity, Mapping):
+                        raise EbookCascadeStateError(
+                            "Unavailable retry has no canonical request identity"
+                        )
+                    active_owner = connection.execute(
+                        """
+                        SELECT request_id FROM unavailable_retries
+                        WHERE identity_key = ? AND request_id != ?
+                          AND state IN (
+                              'queued', 'retrying', 'awaiting_import', 'blocked'
+                          )
+                        ORDER BY request_id LIMIT 1
+                        """,
+                        (cascade["identity_key"], int(request_id)),
+                    ).fetchone()
+                    if active_owner is None:
+                        next_retry = _selection_timestamp(
+                            moment + UNAVAILABLE_FIRST_RETRY_DELAY
+                        )
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO unavailable_retries (
+                                request_id, media_type, identity_key, metadata_json,
+                                canonical_title, canonical_creator, canonical_year,
+                                discord_user_id, discord_username, channel_id,
+                                message_id, first_unavailable_at, next_retry_at
+                            ) VALUES (?, 'ebooks', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                int(request_id),
+                                cascade["identity_key"],
+                                str(cascade["identity_json"]),
+                                identity["title"],
+                                identity.get("author"),
+                                identity.get("year"),
+                                request["discord_user_id"],
+                                request["discord_username"],
+                                request["channel_id"],
+                                request["message_id"],
+                                timestamp,
+                                next_retry,
+                            ),
+                        )
+                        connection.execute(
+                            """
+                            INSERT INTO events (request_id, event_type, message)
+                            VALUES (?, 'unavailable_retry_queued',
+                                    'Queued canonical ebook identity for silent retry')
+                            """,
+                            (int(request_id),),
+                        )
+            self._release_unowned_ebook_backend_reservations(
+                connection, int(request_id)
             )
             for event_key, route, message in deliveries:
                 connection.execute(
@@ -1863,6 +2672,42 @@ class RequestStore:
             raise ValueError("Invalid Shelfarr request ID")
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            retry_attempt = connection.execute(
+                """
+                SELECT 1 FROM unavailable_retries
+                WHERE request_id = ? AND state = 'retrying'
+                """,
+                (int(request_id),),
+            ).fetchone() is not None
+            if retry_attempt:
+                deliveries = []
+            if backend == "lazylibrarian" and external_id is not None:
+                duplicate = connection.execute(
+                    """
+                    SELECT requests.id FROM requests
+                    WHERE requests.id != ?
+                      AND requests.service = 'lazylibrarian'
+                      AND lower(requests.external_id) = ?
+                      AND (
+                          requests.status IN (
+                              'processing', 'queued', 'complete', 'completed'
+                          )
+                          OR requests.external_status =
+                              'lazylibrarian_hash_identity_conflict'
+                          OR EXISTS (
+                              SELECT 1 FROM unavailable_retries
+                              WHERE unavailable_retries.request_id = requests.id
+                                AND unavailable_retries.state = 'blocked'
+                          )
+                      )
+                    LIMIT 1
+                    """,
+                    (int(request_id), external_id),
+                ).fetchone()
+                if duplicate is not None:
+                    raise LazyLibrarianHashCollision(
+                        "Reserved LazyLibrarian download identity collision"
+                    )
             cascade = self._ebook_cascade_row(connection, int(request_id))
             if cascade is None:
                 raise EbookCascadeStateError("Request has no ebook cascade")
@@ -1956,9 +2801,8 @@ class RequestStore:
                 ),
             )
             if status == "failed":
-                connection.execute(
-                    "DELETE FROM ebook_backend_reservations WHERE request_id = ?",
-                    (int(request_id),),
+                self._release_unowned_ebook_backend_reservations(
+                    connection, int(request_id)
                 )
             attempt_cursor = connection.execute(
                 """
@@ -2020,6 +2864,26 @@ class RequestStore:
                 raise
             if cursor.rowcount != 1:
                 raise EbookCascadeStateError("Ebook request is no longer processing")
+            if retry_attempt and status == "queued":
+                connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET state = 'awaiting_import', next_retry_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'retrying'
+                    """,
+                    (int(request_id),),
+                )
+            elif retry_attempt and status == "failed":
+                connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET state = 'blocked', next_retry_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'retrying'
+                    """,
+                    (int(request_id),),
+                )
             event_type = (
                 f"{backend}_submission_uncertain"
                 if uncertain
@@ -2074,6 +2938,15 @@ class RequestStore:
         deliveries = self._normalized_deliveries(notifications)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            retry_attempt = connection.execute(
+                """
+                SELECT 1 FROM unavailable_retries
+                WHERE request_id = ? AND state = 'retrying'
+                """,
+                (int(request_id),),
+            ).fetchone() is not None
+            if retry_attempt:
+                deliveries = []
             cascade = self._ebook_cascade_row(connection, int(request_id))
             if cascade is None:
                 raise EbookCascadeStateError("Request has no ebook cascade")
@@ -2103,9 +2976,8 @@ class RequestStore:
                 """,
                 (int(request_id), ordinal),
             )
-            connection.execute(
-                "DELETE FROM ebook_backend_reservations WHERE request_id = ?",
-                (int(request_id),),
+            self._release_unowned_ebook_backend_reservations(
+                connection, int(request_id)
             )
             cursor = connection.execute(
                 """
@@ -2211,6 +3083,15 @@ class RequestStore:
         deliveries = self._normalized_deliveries(notifications)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            retry_attempt = connection.execute(
+                """
+                SELECT 1 FROM unavailable_retries
+                WHERE request_id = ? AND state = 'retrying'
+                """,
+                (int(request_id),),
+            ).fetchone() is not None
+            if retry_attempt:
+                deliveries = []
             cascade = self._ebook_cascade_row(connection, int(request_id))
             if cascade is None:
                 raise EbookCascadeStateError("Request has no ebook cascade")
@@ -2247,10 +3128,22 @@ class RequestStore:
             if backend == "lazylibrarian":
                 duplicate = connection.execute(
                     """
-                    SELECT id FROM requests
-                    WHERE id != ? AND service = 'lazylibrarian'
-                      AND lower(external_id) = ?
-                      AND status IN ('processing', 'queued')
+                    SELECT requests.id FROM requests
+                    WHERE requests.id != ?
+                      AND requests.service = 'lazylibrarian'
+                      AND lower(requests.external_id) = ?
+                      AND (
+                          requests.status IN (
+                              'processing', 'queued', 'complete', 'completed'
+                          )
+                          OR requests.external_status =
+                              'lazylibrarian_hash_identity_conflict'
+                          OR EXISTS (
+                              SELECT 1 FROM unavailable_retries
+                              WHERE unavailable_retries.request_id = requests.id
+                                AND unavailable_retries.state = 'blocked'
+                          )
+                      )
                     LIMIT 1
                     """,
                     (int(request_id), normalized_external_id),
@@ -2316,6 +3209,20 @@ class RequestStore:
                 raise EbookCascadeStateError(
                     "Recovered ebook handoff ledger could not be persisted"
                 )
+            if retry_attempt:
+                retry_cursor = connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET state = 'awaiting_import', next_retry_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'retrying'
+                    """,
+                    (int(request_id),),
+                )
+                if retry_cursor.rowcount != 1:
+                    raise EbookCascadeStateError(
+                        "Recovered retry handoff ownership could not be promoted"
+                    )
             connection.execute(
                 "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
                 (int(request_id), event_type, message.strip()[:2000]),
@@ -2370,7 +3277,21 @@ class RequestStore:
                     """,
                     (str(message_id),),
                 ).fetchone()
-        return dict(row) if row else None
+            value = dict(row) if row else None
+            if value is not None:
+                retry = connection.execute(
+                    """
+                    SELECT state FROM unavailable_retries
+                    WHERE request_id = ?
+                      AND state IN (
+                          'queued', 'retrying', 'awaiting_import', 'blocked'
+                      )
+                    """,
+                    (int(value["id"]),),
+                ).fetchone()
+                if retry is not None:
+                    value["_unavailable_retry_state"] = str(retry["state"])
+        return value
 
     def create_request(
         self,
@@ -2442,6 +3363,53 @@ class RequestStore:
                     "SELECT * FROM requests WHERE id = ?", (request_id,)
                 ).fetchone()
                 return dict(row), False
+
+            retry_owner = None
+            if target_key:
+                retry_owner = connection.execute(
+                    """
+                    SELECT requests.*, unavailable_retries.state AS retry_state
+                    FROM unavailable_retries
+                    JOIN requests ON requests.id = unavailable_retries.request_id
+                    WHERE requests.target_key = ?
+                      AND unavailable_retries.state IN (
+                          'queued', 'retrying', 'awaiting_import', 'blocked'
+                      )
+                    ORDER BY requests.id
+                    LIMIT 1
+                    """,
+                    (target_key,),
+                ).fetchone()
+            if retry_owner is not None:
+                request_id = int(retry_owner["id"])
+                connection.execute(
+                    "INSERT INTO delivery_aliases (message_id, request_id) VALUES (?, ?)",
+                    (str(message_id), request_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET next_retry_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ? AND state = 'queued'
+                    """,
+                    (request_id,),
+                )
+                connection.execute(
+                    "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                    (
+                        request_id,
+                        "unavailable_retry_reused",
+                        "A new live request reused the existing unavailable retry owner",
+                    ),
+                )
+                value = {
+                    key: retry_owner[key]
+                    for key in retry_owner.keys()
+                    if key != "retry_state"
+                }
+                value["_unavailable_retry_state"] = str(retry_owner["retry_state"])
+                return value, False
 
             canonical = None
             if target_key:
@@ -3686,10 +4654,22 @@ class RequestStore:
             ):
                 duplicate = connection.execute(
                     """
-                    SELECT id FROM requests
-                    WHERE id != ? AND service = 'lazylibrarian'
-                      AND lower(external_id) = ?
-                      AND status IN ('processing', 'queued')
+                    SELECT requests.id FROM requests
+                    WHERE requests.id != ?
+                      AND requests.service = 'lazylibrarian'
+                      AND lower(requests.external_id) = ?
+                      AND (
+                          requests.status IN (
+                              'processing', 'queued', 'complete', 'completed'
+                          )
+                          OR requests.external_status =
+                              'lazylibrarian_hash_identity_conflict'
+                          OR EXISTS (
+                              SELECT 1 FROM unavailable_retries
+                              WHERE unavailable_retries.request_id = requests.id
+                                AND unavailable_retries.state = 'blocked'
+                          )
+                      )
                     LIMIT 1
                     """,
                     (int(request_id), normalized_external_id),
@@ -3846,7 +4826,14 @@ class RequestStore:
         return row is not None and row["delivered_at"] is not None
 
     def mark_notified_if_delivered(self, request_id: int, message: str) -> bool:
-        """Finalize a terminal request after every staged route has succeeded."""
+        """Finalize the request only from its current terminal generation.
+
+        Request completion may race a reconciliation pass which staged and
+        delivered the row's earlier failure notification.  Keep the status and
+        its required terminal event in this one atomic predicate so that stale
+        failure delivery can never mark a now-completed row as notified (or the
+        inverse).
+        """
 
         with self.connect() as connection:
             cursor = connection.execute(
@@ -3855,12 +4842,25 @@ class RequestStore:
                 SET notified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND notified_at IS NULL
                   AND status IN ('complete', 'completed', 'failed')
-                  AND EXISTS (
-                      SELECT 1 FROM notification_deliveries
-                      WHERE request_id = requests.id
-                        AND event_key IN (
-                            'request_completed', 'request_failed'
-                        )
+                  AND (
+                      (
+                          status IN ('complete', 'completed')
+                          AND EXISTS (
+                              SELECT 1 FROM notification_deliveries
+                              WHERE request_id = requests.id
+                                AND event_key = 'request_completed'
+                                AND delivered_at IS NOT NULL
+                          )
+                      )
+                      OR (
+                          status = 'failed'
+                          AND EXISTS (
+                              SELECT 1 FROM notification_deliveries
+                              WHERE request_id = requests.id
+                                AND event_key = 'request_failed'
+                                AND delivered_at IS NOT NULL
+                          )
+                      )
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM notification_deliveries
@@ -3931,6 +4931,100 @@ class RequestStore:
                 """,
                 (max(1, min(int(limit), 1000)),),
             ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_blocked_shelfarr_proof_checks(
+        self,
+        limit: int = 100,
+        *,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Atomically claim a fair batch of blocked Shelfarr proof checks.
+
+        These rows are terminal for acquisition.  They are exposed solely so
+        reconciliation can observe a late ``completed`` result for the same
+        already-persisted Shelfarr request ID.  ``last_proof_check_at`` is a
+        durable least-recently-checked cursor; advancing it before any remote
+        read prevents a permanently non-completing leading batch from starving
+        later owners across process restarts or concurrent reconciliation.
+        """
+
+        moment = now or datetime.now(timezone.utc)
+        if not isinstance(moment, datetime):
+            raise TypeError("Shelfarr proof-check timestamps must be datetime values")
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ValueError("Shelfarr proof-check timestamps must include a timezone")
+        claimed_at = moment.astimezone(timezone.utc).replace(tzinfo=None)
+        bounded_limit = max(1, min(int(limit), 1000))
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            last_claim = connection.execute(
+                """
+                SELECT MAX(last_proof_check_at) AS value
+                FROM unavailable_retries
+                WHERE state = 'blocked' AND last_proof_check_at IS NOT NULL
+                """
+            ).fetchone()["value"]
+            if last_claim is not None:
+                try:
+                    previous = datetime.fromisoformat(str(last_claim))
+                except ValueError as error:
+                    raise sqlite3.DatabaseError(
+                        "Blocked Shelfarr proof-check cursor is invalid"
+                    ) from error
+                if previous.tzinfo is not None and previous.utcoffset() is not None:
+                    previous = previous.astimezone(timezone.utc).replace(tzinfo=None)
+                if claimed_at <= previous:
+                    claimed_at = previous + timedelta(microseconds=1)
+            timestamp = claimed_at.isoformat(sep=" ", timespec="microseconds")
+            rows = connection.execute(
+                """
+                SELECT request.*
+                FROM requests AS request
+                JOIN unavailable_retries AS retry
+                  ON retry.request_id = request.id
+                JOIN ebook_cascades AS cascade
+                  ON cascade.request_id = request.id
+                JOIN ebook_backend_attempts AS attempt
+                  ON attempt.request_id = cascade.request_id
+                 AND attempt.ordinal = cascade.current_ordinal
+                WHERE retry.state = 'blocked'
+                  AND request.status = 'failed'
+                  AND request.service = 'shelfarr'
+                  AND request.media_type = 'ebooks'
+                  AND request.external_id IS NOT NULL
+                  AND cascade.state = 'failed'
+                  AND cascade.identity_key IS NOT NULL
+                  AND (
+                      cascade.final_backend = 'shelfarr'
+                      OR (
+                          cascade.final_backend IS NULL
+                          AND cascade.mutation_backend = 'shelfarr'
+                      )
+                  )
+                  AND attempt.backend = 'shelfarr'
+                  AND attempt.external_id IS NOT NULL
+                  AND attempt.external_id = request.external_id
+                ORDER BY retry.last_proof_check_at IS NOT NULL,
+                         retry.last_proof_check_at,
+                         request.id
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+            for row in rows:
+                cursor = connection.execute(
+                    """
+                    UPDATE unavailable_retries
+                    SET last_proof_check_at = ?
+                    WHERE request_id = ? AND state = 'blocked'
+                    """,
+                    (timestamp, int(row["id"])),
+                )
+                if cursor.rowcount != 1:  # pragma: no cover - write lock invariant
+                    raise sqlite3.DatabaseError(
+                        "Blocked Shelfarr proof-check claim was not atomic"
+                    )
         return [dict(row) for row in rows]
 
     def uncertain_shelfarr_requests(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -4119,10 +5213,22 @@ class RequestStore:
                 return False
             duplicate = connection.execute(
                 """
-                SELECT id FROM requests
-                WHERE id != ? AND service = 'lazylibrarian'
-                  AND lower(external_id) = ?
-                  AND status IN ('processing', 'queued')
+                SELECT requests.id FROM requests
+                WHERE requests.id != ?
+                  AND requests.service = 'lazylibrarian'
+                  AND lower(requests.external_id) = ?
+                  AND (
+                      requests.status IN (
+                          'processing', 'queued', 'complete', 'completed'
+                      )
+                      OR requests.external_status =
+                          'lazylibrarian_hash_identity_conflict'
+                      OR EXISTS (
+                          SELECT 1 FROM unavailable_retries
+                          WHERE unavailable_retries.request_id = requests.id
+                            AND unavailable_retries.state = 'blocked'
+                      )
+                  )
                 LIMIT 1
                 """,
                 (int(request_id), normalized_download_id),
@@ -4413,6 +5519,116 @@ class RequestStore:
             connection.execute(
                 "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
                 (request_id, event_type, message.strip()[:2000]),
+            )
+            return True
+
+    def record_blocked_shelfarr_completion(
+        self,
+        request_id: int,
+        remote_request_id: object,
+        message: str = "Shelfarr completed its exact retained final library import",
+    ) -> bool:
+        """Fulfil one blocked retry from an exact late Shelfarr completion.
+
+        This method cannot submit, cancel, or otherwise mutate Shelfarr.  It
+        accepts only the persisted remote request ID on the failed current
+        attempt and relies on the schema trigger to repair the cascade and
+        retry ownership in the same transaction.
+        """
+
+        normalized_remote_id = str(remote_request_id or "").strip()
+        if (
+            not normalized_remote_id.isdigit()
+            or int(normalized_remote_id) <= 0
+        ):
+            raise ValueError("Invalid Shelfarr request ID")
+        if not message or not message.strip():
+            raise ValueError("Shelfarr completion requires an event message")
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exact_owner = connection.execute(
+                """
+                SELECT 1
+                FROM requests AS request
+                JOIN unavailable_retries AS retry
+                  ON retry.request_id = request.id
+                JOIN ebook_cascades AS cascade
+                  ON cascade.request_id = request.id
+                JOIN ebook_backend_attempts AS attempt
+                  ON attempt.request_id = cascade.request_id
+                 AND attempt.ordinal = cascade.current_ordinal
+                WHERE request.id = ?
+                  AND retry.state = 'blocked'
+                  AND request.status = 'failed'
+                  AND request.service = 'shelfarr'
+                  AND request.media_type = 'ebooks'
+                  AND request.external_id = ?
+                  AND cascade.state = 'failed'
+                  AND cascade.identity_key IS NOT NULL
+                  AND (
+                      cascade.final_backend = 'shelfarr'
+                      OR (
+                          cascade.final_backend IS NULL
+                          AND cascade.mutation_backend = 'shelfarr'
+                      )
+                  )
+                  AND attempt.backend = 'shelfarr'
+                  AND attempt.external_id = ?
+                """,
+                (
+                    int(request_id),
+                    normalized_remote_id,
+                    normalized_remote_id,
+                ),
+            ).fetchone()
+            if exact_owner is None:
+                return False
+
+            cursor = connection.execute(
+                """
+                UPDATE requests
+                SET status = 'completed', external_status = 'completed',
+                    error = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'failed'
+                  AND service = 'shelfarr' AND external_id = ?
+                """,
+                (int(request_id), normalized_remote_id),
+            )
+            if cursor.rowcount != 1:
+                return False
+            proof = connection.execute(
+                """
+                SELECT 1
+                FROM unavailable_retries AS retry
+                JOIN ebook_cascades AS cascade
+                  ON cascade.request_id = retry.request_id
+                JOIN ebook_backend_attempts AS attempt
+                  ON attempt.request_id = cascade.request_id
+                 AND attempt.ordinal = cascade.current_ordinal
+                WHERE retry.request_id = ?
+                  AND retry.state = 'fulfilled'
+                  AND retry.final_import_state = 'verified'
+                  AND cascade.state = 'completed'
+                  AND cascade.final_backend = 'shelfarr'
+                  AND cascade.finalizer = 'shelfarr'
+                  AND attempt.status = 'completed'
+                  AND attempt.backend = 'shelfarr'
+                  AND attempt.external_id = ?
+                """,
+                (int(request_id), normalized_remote_id),
+            ).fetchone()
+            if proof is None:
+                raise EbookCascadeStateError(
+                    "Blocked Shelfarr completion did not preserve exact proof"
+                )
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (
+                    int(request_id),
+                    "shelfarr_completed",
+                    message.strip()[:2000],
+                ),
             )
             return True
 

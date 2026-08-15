@@ -18,7 +18,7 @@ from typing import Any
 try:
     from .clients import CanonicalAcquisition, ServiceError, ServiceRejected
     from .config import ChannelConfig, load_channel_config
-    from .database import RequestStore
+    from .database import EbookCascadeStateError, RequestStore
     from .notifications import (
         abba_state_notifications,
         lazylibrarian_state_notifications,
@@ -35,7 +35,7 @@ try:
 except ImportError:  # Direct execution from /app/scripts/huey/huey.py.
     from clients import CanonicalAcquisition, ServiceError, ServiceRejected
     from config import ChannelConfig, load_channel_config
-    from database import RequestStore
+    from database import EbookCascadeStateError, RequestStore
     from notifications import (
         abba_state_notifications,
         lazylibrarian_state_notifications,
@@ -275,6 +275,11 @@ async def validate_discord_channels(
             )
 
 
+def _unavailable_retry_is_silent(store: Any, request_id: int) -> bool:
+    checker = getattr(store, "unavailable_retry_is_silent", None)
+    return bool(callable(checker) and checker(int(request_id)) is True)
+
+
 async def reconcile_notifications(
     client: Any,
     channel_config: ChannelConfig,
@@ -292,12 +297,18 @@ async def reconcile_notifications(
 
     async with lock:
         pending_terminal = await asyncio.to_thread(store.pending_notifications)
-        terminal_ids = {int(request["id"]) for request in pending_terminal}
+        terminal_ids: set[int] = set()
         for request in pending_terminal:
+            request_id = int(request["id"])
+            if await asyncio.to_thread(
+                _unavailable_retry_is_silent, store, request_id
+            ):
+                continue
+            terminal_ids.add(request_id)
             for plan in terminal_notifications(request):
                 await asyncio.to_thread(
                     store.enqueue_notification,
-                    int(request["id"]),
+                    request_id,
                     plan.event_key,
                     plan.route,
                     plan.message,
@@ -393,6 +404,34 @@ def reconcile_ebook_cascades(store: RequestStore, services: Any) -> int:
     return RequestProcessor(store, services=services).resume_ebook_cascades()
 
 
+def reconcile_unavailable_retries(processor: RequestProcessor) -> int:
+    """Run one bounded batch of due, identity-preserving silent retries."""
+
+    return processor.retry_due_unavailable_requests()
+
+
+def _visible_notification_plans(
+    store: RequestStore, request_id: int, plans: Any
+) -> tuple[Any, ...]:
+    """Drop routine Discord plans while a durable unavailable retry owns work."""
+
+    if _unavailable_retry_is_silent(store, int(request_id)):
+        return ()
+    return tuple(plans)
+
+
+def _enqueue_visible_notification(
+    store: RequestStore, request_id: int, plan: Any
+) -> None:
+    """Enqueue one plan only when the request is outside the silent lifecycle."""
+
+    if _unavailable_retry_is_silent(store, int(request_id)):
+        return
+    store.enqueue_notification(
+        int(request_id), plan.event_key, plan.route, plan.message
+    )
+
+
 class _OneShotAsyncRecovery:
     """Share one cached startup result (including failure) across all waiters."""
 
@@ -439,8 +478,12 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
             or request.get("title"),
             "external_status": str(recovered["status"]).casefold(),
         }
-        return response_notifications(
-            str(request.get("media_type") or "ebooks"), response, request
+        return _visible_notification_plans(
+            store,
+            int(request["id"]),
+            response_notifications(
+                str(request.get("media_type") or "ebooks"), response, request
+            ),
         )
 
     def persist_recovered_shelfarr(
@@ -475,6 +518,7 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
                 },
                 request,
             )
+        plans = _visible_notification_plans(store, int(request["id"]), plans)
         notifications = tuple(
             (plan.event_key, plan.route, plan.message) for plan in plans
         )
@@ -590,9 +634,7 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
         plan = shelfarr_correlation_attention_notification(
             request, startup=startup, format_mismatch=True
         )
-        store.enqueue_notification(
-            int(request["id"]), plan.event_key, plan.route, plan.message
-        )
+        _enqueue_visible_notification(store, int(request["id"]), plan)
         LOGGER.warning(
             "Shelfarr correlation has an unexpected book format for request %s; "
             "automatic retry is blocked",
@@ -615,12 +657,7 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
             plan = shelfarr_correlation_attention_notification(
                 uncertain, startup=False
             )
-            store.enqueue_notification(
-                int(uncertain["id"]),
-                plan.event_key,
-                plan.route,
-                plan.message,
-            )
+            _enqueue_visible_notification(store, int(uncertain["id"]), plan)
             LOGGER.warning(
                 "Shelfarr submission correlation remains uncertain for request %s; "
                 "automatic retry is blocked",
@@ -654,12 +691,7 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
             plan = shelfarr_correlation_attention_notification(
                 interrupted, startup=True
             )
-            store.enqueue_notification(
-                int(interrupted["id"]),
-                plan.event_key,
-                plan.route,
-                plan.message,
-            )
+            _enqueue_visible_notification(store, int(interrupted["id"]), plan)
             LOGGER.warning(
                 "Shelfarr crash-window correlation remains uncertain for request %s; "
                 "automatic retry is blocked",
@@ -677,6 +709,50 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
             message="Recovered ebook acquisition correlation after interrupted Huey dispatch",
         )
         changed_count += 1
+
+    # ``blocked`` is terminal for acquisition, but Shelfarr may publish the
+    # exact already-correlated final import after Huey observed an earlier
+    # failure.  Polling this retained remote ID is read-only: only an exact
+    # ``completed`` response can repair and fulfil the owner, and every other
+    # response remains silent and blocked.
+    for request in store.claim_blocked_shelfarr_proof_checks():
+        persisted_remote_id = str(request.get("external_id") or "")
+        try:
+            remote = services.shelfarr().get_request(persisted_remote_id)
+        except ServiceError as error:
+            LOGGER.warning(
+                "Blocked Shelfarr final-proof check deferred for request %s (%s)",
+                request["id"],
+                type(error).__name__,
+            )
+            continue
+        except Exception as error:
+            LOGGER.warning(
+                "Blocked Shelfarr final-proof check could not inspect request %s (%s)",
+                request["id"],
+                type(error).__name__,
+            )
+            continue
+
+        if (
+            str(remote.get("id") or "") != persisted_remote_id
+            or str(remote.get("status") or "").casefold() != "completed"
+        ):
+            continue
+        try:
+            changed = store.record_blocked_shelfarr_completion(
+                int(request["id"]),
+                remote.get("id"),
+            )
+        except (ValueError, EbookCascadeStateError) as error:
+            LOGGER.warning(
+                "Blocked Shelfarr final proof was rejected for request %s (%s)",
+                request["id"],
+                type(error).__name__,
+            )
+            continue
+        if changed:
+            changed_count += 1
 
     for request in store.queued_shelfarr_requests():
         try:
@@ -743,12 +819,7 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
                 plan = shelfarr_attention_notification(
                     alert_request, import_failure=import_failure
                 )
-                store.enqueue_notification(
-                    int(request["id"]),
-                    plan.event_key,
-                    plan.route,
-                    plan.message,
-                )
+                _enqueue_visible_notification(store, int(request["id"]), plan)
                 LOGGER.warning(
                     "Shelfarr retained an attention request %s for recovery (%s)",
                     request["id"],
@@ -778,12 +849,7 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
                     {**dict(request), "error": attention_message},
                     import_failure=import_failure,
                 )
-                store.enqueue_notification(
-                    int(request["id"]),
-                    plan.event_key,
-                    plan.route,
-                    plan.message,
-                )
+                _enqueue_visible_notification(store, int(request["id"]), plan)
                 LOGGER.warning(
                     "Shelfarr retained attention request %s without confirmed cancellation",
                     request["id"],
@@ -849,12 +915,7 @@ def reconcile_shelfarr_requests(store: RequestStore, services: Any) -> int:
 
         if terminal_status is None:
             for plan in shelfarr_state_notifications(request, external_status):
-                store.enqueue_notification(
-                    int(request["id"]),
-                    plan.event_key,
-                    plan.route,
-                    plan.message,
-                )
+                _enqueue_visible_notification(store, int(request["id"]), plan)
     return changed_count
 
 
@@ -876,7 +937,11 @@ def reconcile_lazylibrarian_requests(
             "external_title": recovered["external_title"],
             "external_status": recovered.get("external_status") or "queued",
         }
-        return response_notifications("ebooks", response, request)
+        return _visible_notification_plans(
+            store,
+            int(request["id"]),
+            response_notifications("ebooks", response, request),
+        )
 
     def attention(
         request: dict[str, Any], *, startup: bool, identity_mismatch: bool = False
@@ -887,14 +952,13 @@ def reconcile_lazylibrarian_requests(
             startup=startup,
             identity_mismatch=identity_mismatch,
         )
-        store.enqueue_notification(
-            int(request["id"]), plan.event_key, plan.route, plan.message
-        )
+        _enqueue_visible_notification(store, int(request["id"]), plan)
 
     def inspect(request: dict[str, Any], *, startup: bool) -> bool:
         try:
             remote = services.lazylibrarian().recover_submission(
-                request.get("lazylibrarian_book_id")
+                request.get("lazylibrarian_book_id"),
+                request_id=int(request["id"]),
             )
         except ServiceRejected as error:
             attention(request, startup=startup, identity_mismatch=True)
@@ -1039,6 +1103,28 @@ def reconcile_lazylibrarian_requests(
             )
             continue
 
+        # The hash is durably bound to this Huey request, but qBittorrent
+        # routing is mutable.  Restore BookBot correlation only after the
+        # current torrent still proves the exact ebook category and path.
+        try:
+            qbittorrent.add_tags(
+                expected_hash, f"huey-{int(request['id'])}"
+            )
+        except ServiceError as error:
+            LOGGER.warning(
+                "LazyLibrarian correlation tag deferred for request %s (%s)",
+                request["id"],
+                type(error).__name__,
+            )
+            continue
+        except Exception as error:
+            LOGGER.warning(
+                "LazyLibrarian correlation tag could not be restored for request %s (%s)",
+                request["id"],
+                type(error).__name__,
+            )
+            continue
+
         qbit_state = str(torrent.get("state") or "").strip().casefold()
         try:
             download_complete = (
@@ -1065,7 +1151,11 @@ def reconcile_lazylibrarian_requests(
                 "external_title": request.get("external_title"),
                 "external_status": "failed",
             }
-            plans = response_notifications("ebooks", response, request)
+            plans = _visible_notification_plans(
+                store,
+                int(request["id"]),
+                response_notifications("ebooks", response, request),
+            )
             if store.record_lazylibrarian_state(
                 int(request["id"]),
                 expected_hash,
@@ -1090,7 +1180,11 @@ def reconcile_lazylibrarian_requests(
             continue
 
         current = {**dict(request), "external_status": phase}
-        plans = lazylibrarian_state_notifications(current, phase)
+        plans = _visible_notification_plans(
+            store,
+            int(request["id"]),
+            lazylibrarian_state_notifications(current, phase),
+        )
         if store.record_lazylibrarian_state(
             int(request["id"]),
             expected_hash,
@@ -1508,6 +1602,26 @@ async def abba_reconciliation_loop(
         await asyncio.sleep(max(1.0, interval_seconds))
 
 
+async def unavailable_retry_loop(
+    client: Any,
+    processor: RequestProcessor,
+    interval_seconds: float = 30,
+) -> None:
+    """Run durable unavailable retries independently of lifecycle polling."""
+
+    while not client.is_closed():
+        try:
+            await asyncio.to_thread(reconcile_unavailable_retries, processor)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.error(
+                "Unavailable ebook retry reconciliation failed (%s)",
+                type(error).__name__,
+            )
+        await asyncio.sleep(max(1.0, interval_seconds))
+
+
 def build_client(
     channel_config: ChannelConfig,
     processor: RequestProcessor,
@@ -1528,6 +1642,7 @@ def build_client(
     shelfarr_task: asyncio.Task | None = None
     lazylibrarian_task: asyncio.Task | None = None
     abba_task: asyncio.Task | None = None
+    unavailable_retry_task: asyncio.Task | None = None
     ebook_recovery = _OneShotAsyncRecovery(
         reconcile_ebook_cascades,
         processor.store,
@@ -1544,6 +1659,7 @@ def build_client(
     @client.event
     async def on_ready():
         nonlocal reconcile_task, shelfarr_task, lazylibrarian_task, abba_task
+        nonlocal unavailable_retry_task
         try:
             await validate_discord_channels(client, channel_config)
         except RuntimeError as error:
@@ -1604,6 +1720,11 @@ def build_client(
                     reconcile_seconds,
                 ),
                 name="huey-abba-reconciliation",
+            )
+        if unavailable_retry_task is None or unavailable_retry_task.done():
+            unavailable_retry_task = asyncio.create_task(
+                unavailable_retry_loop(client, processor, reconcile_seconds),
+                name="huey-unavailable-retry-reconciliation",
             )
 
     async def deliver_response(message: Any, media_type: str, response: dict[str, Any]) -> None:

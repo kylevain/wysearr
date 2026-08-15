@@ -383,7 +383,7 @@ def _has_unique_columns(
 
 
 def huey_database_check(database: Path) -> Check:
-    """Require Huey's request, confirmation, and serial ebook-cascade schema."""
+    """Require Huey's request, ebook-cascade, and unavailable-retry schema."""
 
     try:
         with closing(_open_readonly_database(database)) as connection:
@@ -403,6 +403,7 @@ def huey_database_check(database: Path) -> Check:
                 "ebook_cascades",
                 "ebook_backend_attempts",
                 "ebook_backend_reservations",
+                "unavailable_retries",
             }
             if not required_tables <= tables:
                 return Check(
@@ -453,6 +454,7 @@ def huey_database_check(database: Path) -> Check:
             cascade_columns = columns("ebook_cascades")
             attempt_columns = columns("ebook_backend_attempts")
             reservation_columns = columns("ebook_backend_reservations")
+            retry_columns = columns("unavailable_retries")
             request_indexes = _sqlite_indexes(connection, "requests")
             delivery_indexes = _sqlite_indexes(connection, "notification_deliveries")
             confirmation_indexes = _sqlite_indexes(connection, "candidate_confirmations")
@@ -463,12 +465,36 @@ def huey_database_check(database: Path) -> Check:
             reservation_indexes = _sqlite_indexes(
                 connection, "ebook_backend_reservations"
             )
+            retry_indexes = _sqlite_indexes(connection, "unavailable_retries")
+            retry_active_index_row = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'index' "
+                "AND name = 'unavailable_retries_active_identity_uq'"
+            ).fetchone()
+            retry_active_sql = (
+                " ".join(
+                    str(retry_active_index_row[0] or "").casefold().split()
+                )
+                if retry_active_index_row
+                else ""
+            )
+            retry_active_compact_sql = "".join(retry_active_sql.split())
 
             active_index = connection.execute(
                 "SELECT sql FROM sqlite_master "
                 "WHERE type = 'index' AND name = 'requests_active_target_uq'"
             ).fetchone()
             active_sql = str(active_index[0] or "").casefold() if active_index else ""
+            ll_hash_index_row = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'index' "
+                "AND name = 'requests_active_ll_hash_uq'"
+            ).fetchone()
+            ll_hash_index_sql = (
+                "".join(str(ll_hash_index_row[0] or "").casefold().split())
+                if ll_hash_index_row
+                else ""
+            )
             abba_hash_index_row = connection.execute(
                 "SELECT sql FROM sqlite_master "
                 "WHERE type = 'index' "
@@ -512,6 +538,15 @@ def huey_database_check(database: Path) -> Check:
                 if attempt_sql_row
                 else ""
             )
+            retry_sql_row = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'unavailable_retries'"
+            ).fetchone()
+            retry_sql = (
+                " ".join(str(retry_sql_row[0] or "").casefold().split())
+                if retry_sql_row
+                else ""
+            )
             terminal_trigger_row = connection.execute(
                 "SELECT sql FROM sqlite_master "
                 "WHERE type = 'trigger' "
@@ -520,6 +555,42 @@ def huey_database_check(database: Path) -> Check:
             terminal_trigger_sql = (
                 " ".join(str(terminal_trigger_row[0] or "").casefold().split())
                 if terminal_trigger_row
+                else ""
+            )
+            retry_failure_trigger_row = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'trigger' "
+                "AND name = 'unavailable_retry_import_failure_sync'"
+            ).fetchone()
+            retry_failure_trigger_sql = (
+                " ".join(
+                    str(retry_failure_trigger_row[0] or "").casefold().split()
+                )
+                if retry_failure_trigger_row
+                else ""
+            )
+            retry_blocked_guard_row = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'trigger' "
+                "AND name = 'unavailable_retry_blocked_completion_guard'"
+            ).fetchone()
+            retry_blocked_guard_sql = (
+                " ".join(
+                    str(retry_blocked_guard_row[0] or "").casefold().split()
+                )
+                if retry_blocked_guard_row
+                else ""
+            )
+            retry_terminal_trigger_row = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'trigger' "
+                "AND name = 'unavailable_retry_terminal_sync'"
+            ).fetchone()
+            retry_terminal_trigger_sql = (
+                " ".join(
+                    str(retry_terminal_trigger_row[0] or "").casefold().split()
+                )
+                if retry_terminal_trigger_row
                 else ""
             )
             cascade_active_index_row = connection.execute(
@@ -537,10 +608,272 @@ def huey_database_check(database: Path) -> Check:
             reservation_primary_key = primary_key(
                 "ebook_backend_reservations"
             )
+            retry_primary_key = primary_key("unavailable_retries")
             cascade_foreign_keys = foreign_keys("ebook_cascades")
             attempt_foreign_keys = foreign_keys("ebook_backend_attempts")
             reservation_foreign_keys = foreign_keys(
                 "ebook_backend_reservations"
+            )
+            retry_foreign_keys = foreign_keys("unavailable_retries")
+
+            retry_rows = connection.execute(
+                """
+                SELECT retry.metadata_json, retry.canonical_title,
+                       retry.canonical_creator, retry.canonical_year,
+                       cascade.identity_json,
+                       cascade.identity_fingerprint
+                FROM unavailable_retries AS retry
+                LEFT JOIN ebook_cascades AS cascade
+                  ON cascade.request_id = retry.request_id
+                """
+            ).fetchall()
+            retry_metadata_violations = 0
+            retry_metadata_keys = {
+                "fingerprint",
+                "label",
+                "work_id",
+                "source_work_ids",
+                "title",
+                "author",
+                "year",
+                "content_kind",
+                "media_type",
+                "book_type",
+            }
+            retry_sensitive_metadata = re.compile(
+                r'(?:https?://|ftp://|magnet:|"(?:api[_-]?key|token|password|'
+                r'secret|authorization)"\s*:)',
+                re.IGNORECASE,
+            )
+            for retry_row in retry_rows:
+                raw_metadata = str(retry_row["metadata_json"] or "")
+                try:
+                    metadata = json.loads(raw_metadata)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    retry_metadata_violations += 1
+                    continue
+                if not isinstance(metadata, dict):
+                    retry_metadata_violations += 1
+                    continue
+                source_work_ids = metadata.get("source_work_ids", [])
+                year = metadata.get("year")
+                if (
+                    set(metadata) != retry_metadata_keys
+                    or not re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(metadata.get("fingerprint") or ""),
+                    )
+                    or metadata.get("fingerprint")
+                    != retry_row["identity_fingerprint"]
+                    or not isinstance(metadata.get("label"), str)
+                    or not isinstance(metadata.get("work_id"), str)
+                    or not isinstance(source_work_ids, list)
+                    or not 1 <= len(source_work_ids) <= 8
+                    or any(
+                        not isinstance(value, str) or not value
+                        for value in source_work_ids
+                    )
+                    or source_work_ids[0] != metadata.get("work_id")
+                    or metadata.get("title") != retry_row["canonical_title"]
+                    or metadata.get("author") != retry_row["canonical_creator"]
+                    or year != retry_row["canonical_year"]
+                    or isinstance(year, bool)
+                    or (year is not None and not isinstance(year, int))
+                    or metadata.get("content_kind") != "book"
+                    or metadata.get("media_type") != "ebooks"
+                    or metadata.get("book_type") != "ebook"
+                    or raw_metadata != str(retry_row["identity_json"] or "")
+                    or retry_sensitive_metadata.search(raw_metadata)
+                ):
+                    retry_metadata_violations += 1
+
+            retry_link_violations = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM unavailable_retries AS retry
+                LEFT JOIN requests AS request
+                  ON request.id = retry.request_id
+                LEFT JOIN ebook_cascades AS cascade
+                  ON cascade.request_id = retry.request_id
+                WHERE request.id IS NULL
+                   OR cascade.request_id IS NULL
+                   OR retry.media_type != 'ebooks'
+                   OR request.media_type != 'ebooks'
+                   OR cascade.identity_key IS NOT retry.identity_key
+                   OR request.discord_user_id IS NOT retry.discord_user_id
+                   OR request.discord_username IS NOT retry.discord_username
+                   OR request.channel_id IS NOT retry.channel_id
+                   OR request.message_id IS NOT retry.message_id
+                   OR NOT EXISTS (
+                       SELECT 1 FROM ebook_backend_attempts AS attempt
+                       WHERE attempt.request_id = retry.request_id
+                   )
+                   OR (
+                       retry.state IN (
+                           'queued', 'retrying', 'awaiting_import', 'blocked',
+                           'fulfilled'
+                       )
+                       AND (
+                           NOT EXISTS (
+                               SELECT 1 FROM ebook_backend_reservations AS reservation
+                               WHERE reservation.request_id = retry.request_id
+                           )
+                           OR EXISTS (
+                               SELECT 1 FROM ebook_backend_attempts AS attempt
+                               WHERE attempt.request_id = retry.request_id
+                                 AND attempt.backend_identity IS NOT NULL
+                                 AND NOT EXISTS (
+                                     SELECT 1
+                                     FROM ebook_backend_reservations AS reservation
+                                     WHERE reservation.request_id = retry.request_id
+                                       AND reservation.backend = attempt.backend
+                                       AND reservation.backend_identity =
+                                           attempt.backend_identity
+                                 )
+                           )
+                       )
+                   )
+                   OR (retry.retry_count = 0 AND retry.last_retry_at IS NOT NULL)
+                   OR (retry.retry_count > 0 AND retry.last_retry_at IS NULL)
+                   OR (
+                       retry.state = 'queued'
+                       AND (
+                           request.status != 'failed'
+                           OR cascade.state != 'failed'
+                           OR retry.retry_count >= 7
+                       )
+                   )
+                   OR (
+                       retry.state = 'awaiting_import'
+                       AND (
+                           request.status != 'queued'
+                           OR NOT (
+                               (
+                                   cascade.state = 'queued'
+                                   AND cascade.final_backend IS NOT NULL
+                                   AND cascade.finalizer IS NOT NULL
+                               )
+                               OR (
+                                   cascade.state = 'uncertain'
+                                   AND cascade.mutation_backend IS NOT NULL
+                                   AND cascade.mutation_started_at IS NOT NULL
+                                   AND cascade.final_backend IS NULL
+                                   AND cascade.finalizer IS NULL
+                               )
+                           )
+                       )
+                   )
+                   OR (
+                       retry.state = 'blocked'
+                       AND (
+                           request.status != 'failed'
+                           OR cascade.state != 'failed'
+                           OR NOT (
+                               (
+                                   cascade.final_backend IS NOT NULL
+                                   AND cascade.finalizer IS NOT NULL
+                               )
+                               OR (
+                                   cascade.mutation_backend IS NOT NULL
+                                   AND cascade.mutation_started_at IS NOT NULL
+                               )
+                           )
+                           OR NOT EXISTS (
+                               SELECT 1
+                               FROM ebook_backend_attempts AS attempt
+                               JOIN ebook_backend_reservations AS reservation
+                                 ON reservation.request_id = attempt.request_id
+                                AND reservation.backend = attempt.backend
+                                AND reservation.backend_identity =
+                                    attempt.backend_identity
+                               WHERE attempt.request_id = retry.request_id
+                                 AND attempt.ordinal = cascade.current_ordinal
+                                 AND attempt.backend_identity IS NOT NULL
+                           )
+                       )
+                   )
+                   OR (
+                       retry.state = 'fulfilled'
+                       AND (
+                           request.status NOT IN ('complete', 'completed')
+                           OR cascade.state != 'completed'
+                           OR cascade.final_backend IS NULL
+                           OR cascade.finalizer IS NULL
+                       )
+                   )
+                   OR (
+                       retry.state = 'expired'
+                       AND (
+                           request.status != 'failed'
+                           OR cascade.state != 'failed'
+                           OR retry.retry_count != 7
+                           OR EXISTS (
+                               SELECT 1 FROM ebook_backend_reservations AS reservation
+                               WHERE reservation.request_id = retry.request_id
+                           )
+                       )
+                   )
+                """
+            ).fetchone()[0]
+            duplicate_retry_owners = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT identity_key
+                    FROM unavailable_retries
+                    WHERE state IN (
+                        'queued', 'retrying', 'awaiting_import', 'blocked'
+                    )
+                    GROUP BY identity_key
+                    HAVING COUNT(*) > 1
+                )
+                """
+            ).fetchone()[0]
+            retry_silence_violations = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM notification_deliveries AS delivery
+                JOIN unavailable_retries AS retry
+                  ON retry.request_id = delivery.request_id
+                WHERE retry.state IN ('retrying', 'awaiting_import', 'blocked')
+                  AND delivery.event_key NOT IN (
+                      'request_accepted', 'request_failed'
+                  )
+                """
+            ).fetchone()[0]
+            retry_proof_cursor_violations = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM unavailable_retries
+                WHERE last_proof_check_at IS NOT NULL
+                  AND (
+                      state NOT IN ('blocked', 'fulfilled')
+                      OR datetime(last_proof_check_at) IS NULL
+                  )
+                """
+            ).fetchone()[0]
+            premature_retry_success = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM notification_deliveries AS delivery
+                JOIN unavailable_retries AS retry
+                  ON retry.request_id = delivery.request_id
+                WHERE retry.state != 'fulfilled'
+                  AND delivery.event_key IN (
+                      'request_completed', 'library_imported'
+                  )
+                """
+            ).fetchone()[0]
+            retry_violations = sum(
+                int(value)
+                for value in (
+                    retry_metadata_violations,
+                    retry_link_violations,
+                    duplicate_retry_owners,
+                    retry_silence_violations,
+                    retry_proof_cursor_violations,
+                    premature_retry_success,
+                )
             )
 
             ownership_violations = 0
@@ -702,11 +1035,36 @@ def huey_database_check(database: Path) -> Check:
                 "created_at",
             }
             <= reservation_columns
+            and {
+                "request_id",
+                "media_type",
+                "identity_key",
+                "metadata_json",
+                "canonical_title",
+                "canonical_creator",
+                "canonical_year",
+                "discord_user_id",
+                "discord_username",
+                "channel_id",
+                "message_id",
+                "first_unavailable_at",
+                "last_retry_at",
+                "last_proof_check_at",
+                "next_retry_at",
+                "retry_count",
+                "state",
+                "final_import_state",
+                "fulfilled_at",
+                "expired_at",
+                "updated_at",
+            }
+            <= retry_columns
             and cascade_primary_key == ("request_id",)
             and attempt_primary_key
             == ("request_id", "ordinal")
             and reservation_primary_key
             == ("backend", "backend_identity")
+            and retry_primary_key == ("request_id",)
             and (
                 "request_id",
                 "requests",
@@ -728,8 +1086,22 @@ def huey_database_check(database: Path) -> Check:
                 "cascade",
             )
             in reservation_foreign_keys
+            and (
+                "request_id",
+                "requests",
+                "id",
+                "cascade",
+            )
+            in retry_foreign_keys
             and _has_unique_columns(request_indexes, ("message_id",))
             and _has_unique_columns(request_indexes, ("target_key",))
+            and request_indexes.get(
+                "requests_active_ll_hash_uq", (False, ())
+            )[0]
+            and "onrequests(lower(external_id))" in ll_hash_index_sql
+            and ll_hash_index_sql.partition("where")[2]
+            == "service='lazylibrarian'andexternal_idisnotnull"
+            "andstatusin('processing','queued','complete','completed')"
             and request_indexes.get("requests_active_abba_hash_uq", (False, ()))[0]
             and "onrequests(lower(external_id))" in abba_hash_index_sql
             and abba_hash_index_sql.partition("where")[2]
@@ -779,6 +1151,13 @@ def huey_database_check(database: Path) -> Check:
             and _has_unique_columns(
                 reservation_indexes, ("backend", "backend_identity")
             )
+            and retry_indexes.get("unavailable_retries_active_identity_uq")
+            == (True, ("identity_key",))
+            and "onunavailable_retries(identity_key)" in retry_active_compact_sql
+            and retry_active_compact_sql.partition("where")[2]
+            == "statein('queued','retrying','awaiting_import','blocked')"
+            and retry_indexes.get("unavailable_retries_due_idx")
+            == (False, ("state", "next_retry_at", "request_id"))
             and all(
                 token in cascade_active_sql
                 for token in (
@@ -841,20 +1220,86 @@ def huey_database_check(database: Path) -> Check:
                     "when 'shelfarr' then 'shelfarr'",
                     "delete from ebook_backend_reservations",
                     "new.status = 'failed'",
+                    "state in ('queued', 'retrying', 'awaiting_import', 'blocked', 'fulfilled')",
+                )
+            )
+            and all(
+                token in retry_sql
+                for token in (
+                    "media_type = 'ebooks'",
+                    "retry_count between 0 and 7",
+                    "'queued'",
+                    "'retrying'",
+                    "'awaiting_import'",
+                    "'blocked'",
+                    "'fulfilled'",
+                    "'expired'",
+                    "final_import_state = 'verified'",
+                    "state = 'queued' and next_retry_at is not null",
+                    "state = 'expired' and expired_at is not null",
+                )
+            )
+            and all(
+                token in retry_active_sql
+                for token in (
+                    "where state in",
+                    "'queued'",
+                    "'retrying'",
+                    "'awaiting_import'",
+                    "'blocked'",
+                )
+            )
+            and all(
+                token in retry_failure_trigger_sql
+                for token in (
+                    "after update of status on requests",
+                    "new.status = 'failed'",
+                    "state = 'awaiting_import'",
+                    "set state = 'blocked'",
+                    "'unavailable_retry_blocked'",
+                )
+            )
+            and all(
+                token in retry_blocked_guard_sql
+                for token in (
+                    "before update of status on requests",
+                    "state = 'blocked'",
+                    "new.service in ('lazylibrarian', 'shelfarr')",
+                    "cascade.state = 'failed'",
+                    "lower(attempt.external_id) = lower(new.external_id)",
+                    "raise(",
+                    "blocked unavailable retry lacks exact final-import correlation",
+                )
+            )
+            and all(
+                token in retry_terminal_trigger_sql
+                for token in (
+                    "after update of status on requests",
+                    "new.status in ('complete', 'completed')",
+                    "state in ('retrying', 'awaiting_import', 'blocked')",
+                    "update ebook_backend_attempts",
+                    "update ebook_cascades",
+                    "state != 'blocked'",
+                    "lower(external_id) = lower(new.external_id)",
+                    "set state = 'fulfilled', final_import_state = 'verified'",
+                    "update requests set notified_at = null",
+                    "'unavailable_retry_fulfilled'",
                 )
             )
             and "awaiting_selection" in active_sql
             and ownership_violations == 0
+            and retry_violations == 0
         )
         return Check(
             "huey:database",
             integrity == "ok" and schema_ok,
             (
-                "integrity, request/outbox, selection, ebook cascade, and "
-                "canonical ABBA ownership valid; violations=0"
+                "integrity, request/outbox, selection, ebook cascade, unavailable "
+                "retry, and canonical ABBA ownership valid; violations=0"
                 if integrity == "ok" and schema_ok
-                else "request/outbox, selection, ebook cascade, or canonical "
-                f"ABBA ownership invalid; violations={ownership_violations}"
+                else "request/outbox, selection, ebook cascade, unavailable retry, "
+                "or canonical ABBA ownership invalid; "
+                f"violations={ownership_violations + retry_violations}"
             ),
         )
     except Exception as error:

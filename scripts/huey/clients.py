@@ -53,6 +53,87 @@ class SubmissionUncertain(ServiceError):
 
 SQLITE_MAX_REQUEST_ID = 9_223_372_036_854_775_807
 _HUEY_CORRELATION = re.compile(r"\Ahuey:([1-9][0-9]{0,18})\Z")
+_CANONICAL_BOOK_WORK_ID = re.compile(
+    r"\A(?:hardcover|google_books|openlibrary):"
+    r"[A-Za-z0-9][A-Za-z0-9._:-]{0,230}\Z"
+)
+_LAZYLIBRARIAN_WORK_ID = re.compile(r"\Alazylibrarian:[0-9a-f]{64}\Z")
+_SENSITIVE_CANONICAL_WORK_ID = re.compile(
+    r"(?:api[_-]?key|token|password|secret|authorization)", re.IGNORECASE
+)
+_LAZYLIBRARIAN_SOURCE_NAMES = {
+    "google_books": "googlebooks",
+    "hardcover": "hardcover",
+    "openlibrary": "openlibrary",
+}
+
+
+def _canonical_work_aliases(identity: Mapping[str, Any]) -> frozenset[str]:
+    """Return non-reversible exact-work tokens suitable for provider crossover.
+
+    LazyLibrarian intentionally persists a digest instead of its raw metadata
+    BookID.  Shelfarr persists source-qualified IDs, so normalize those through
+    the same digest construction before comparing them.  This preserves the
+    Discord-safe snapshot contract and also works for legacy LL identities.
+    """
+
+    source_ids = identity.get("source_work_ids")
+    if not isinstance(source_ids, (list, tuple)) or not 1 <= len(source_ids) <= 8:
+        return frozenset()
+    aliases: set[str] = set()
+    for value in source_ids:
+        normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
+        if _LAZYLIBRARIAN_WORK_ID.fullmatch(normalized):
+            aliases.add(normalized)
+            continue
+        if (
+            not _CANONICAL_BOOK_WORK_ID.fullmatch(normalized)
+            or _SENSITIVE_CANONICAL_WORK_ID.search(normalized)
+        ):
+            continue
+        namespace, provider_id = normalized.split(":", 1)
+        source_name = _LAZYLIBRARIAN_SOURCE_NAMES.get(namespace)
+        if source_name is None:
+            continue
+        digest = hashlib.sha256(
+            json.dumps(
+                [source_name, provider_id],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        aliases.add(f"lazylibrarian:{digest}")
+    return frozenset(aliases)
+
+
+def _cross_provider_work_matches(
+    authoritative: Mapping[str, Any], candidate: Mapping[str, Any]
+) -> bool:
+    """Require bibliography plus a durable discriminator across providers.
+
+    A shared canonical source ID is exact proof.  The non-null publication year
+    path preserves legacy snapshots that predate source aliases while ensuring
+    a yearless title/author match can never silently switch works or editions.
+    """
+
+    if normalize_identity_text(candidate.get("title")) != normalize_identity_text(
+        authoritative.get("title")
+    ):
+        return False
+    if normalize_identity_text(candidate.get("author")) != normalize_identity_text(
+        authoritative.get("author")
+    ):
+        return False
+    if _canonical_work_aliases(authoritative).intersection(
+        _canonical_work_aliases(candidate)
+    ):
+        return True
+    year = authoritative.get("year")
+    return bool(
+        not isinstance(year, bool)
+        and isinstance(year, int)
+        and candidate.get("year") == year
+    )
 
 
 def _correlation_request_id(value: object) -> int | None:
@@ -1299,6 +1380,15 @@ class ShelfarrClient(JsonClient):
         expected_type = self.BOOK_TYPES.get(media_type)
         if expected_type != "ebook" or not isinstance(resolved_identity, Mapping):
             raise ValueError("Shelfarr authoritative continuation requires an ebook")
+        work_id = str(resolved_identity.get("work_id") or "")
+        same_provider_identity = not work_id.startswith("lazylibrarian:")
+        persisted = (
+            self._validated_proposal_snapshot(resolved_identity, media_type)
+            if same_provider_identity
+            else None
+        )
+        if same_provider_identity and persisted is None:
+            return self._selection_refresh_result()
         title = sanitize_display_text(resolved_identity.get("title"), limit=160)
         raw_author = resolved_identity.get("author")
         author = (
@@ -1320,13 +1410,14 @@ class ShelfarrClient(JsonClient):
             snapshot = self._candidate_snapshot(candidate, media_type)
             if snapshot is None:
                 continue
-            if normalize_identity_text(snapshot["title"]) != normalize_identity_text(title):
+            if same_provider_identity:
+                if hmac.compare_digest(
+                    snapshot["fingerprint"], persisted["fingerprint"]
+                ):
+                    exact.append(snapshot)
                 continue
-            if normalize_identity_text(snapshot.get("author")) != normalize_identity_text(author):
-                continue
-            if year is not None and snapshot.get("year") != year:
-                continue
-            exact.append(snapshot)
+            if _cross_provider_work_matches(resolved_identity, snapshot):
+                exact.append(snapshot)
         if len(exact) != 1:
             return result(
                 "needs_selection",
@@ -1796,6 +1887,7 @@ class LazyLibrarianClient(JsonClient):
         self,
         candidate: Mapping[str, Any],
         *,
+        request_id: int | None,
         before_create: Callable[[str], None] | None,
         on_resolved: Callable[[Mapping[str, Any], str], None] | None = None,
         release_preflight: Callable[[str, str | None], bool] | None = None,
@@ -1956,6 +2048,7 @@ class LazyLibrarianClient(JsonClient):
             )
         return self._acquire_candidate(
             selection.selected,
+            request_id=request_id,
             before_create=before_create,
             on_resolved=on_resolved,
             release_preflight=release_preflight,
@@ -1998,6 +2091,7 @@ class LazyLibrarianClient(JsonClient):
             )
         return self._acquire_candidate(
             matching[0],
+            request_id=request_id,
             before_create=before_create,
             on_resolved=on_resolved,
             release_preflight=release_preflight,
@@ -2017,6 +2111,15 @@ class LazyLibrarianClient(JsonClient):
 
         if media_type != "ebooks" or not isinstance(resolved_identity, Mapping):
             raise ValueError("LazyLibrarian authoritative continuation requires an ebook")
+        work_id = str(resolved_identity.get("work_id") or "")
+        same_provider_identity = work_id.startswith("lazylibrarian:")
+        persisted = (
+            self._validated_snapshot(resolved_identity)
+            if same_provider_identity
+            else None
+        )
+        if same_provider_identity and persisted is None:
+            return self._selection_refresh_result()
         title = sanitize_display_text(resolved_identity.get("title"), limit=160)
         raw_author = resolved_identity.get("author")
         author = (
@@ -2029,13 +2132,17 @@ class LazyLibrarianClient(JsonClient):
             return self._selection_refresh_result()
         exact: list[Mapping[str, Any]] = []
         for candidate in self.search(title, author):
-            if normalize_identity_text(candidate.get("title")) != normalize_identity_text(title):
+            snapshot = self._candidate_snapshot(candidate)
+            if same_provider_identity:
+                if snapshot is not None and hmac.compare_digest(
+                    snapshot["fingerprint"], persisted["fingerprint"]
+                ):
+                    exact.append(candidate)
                 continue
-            if normalize_identity_text(candidate.get("author")) != normalize_identity_text(author):
-                continue
-            if year is not None and candidate.get("year") != year:
-                continue
-            exact.append(candidate)
+            if snapshot is not None and _cross_provider_work_matches(
+                resolved_identity, snapshot
+            ):
+                exact.append(candidate)
         if len(exact) != 1:
             return result(
                 "needs_selection",
@@ -2046,13 +2153,20 @@ class LazyLibrarianClient(JsonClient):
             )
         return self._acquire_candidate(
             exact[0],
+            request_id=request_id,
             before_create=before_create,
             on_resolved=on_resolved,
             release_preflight=release_preflight,
         )
 
-    def recover_submission(self, book_id: object) -> dict[str, Any]:
-        """Read exact LL book/history state without repeating a search."""
+    def recover_submission(
+        self, book_id: object, *, request_id: int | None = None
+    ) -> dict[str, Any]:
+        """Read exact LL state without mutating search or torrent ownership.
+
+        The caller attaches Huey's qBittorrent tag only after SQLite accepts
+        this hash as the request's unique durable owner.
+        """
 
         normalized_id = self._safe_book_id(book_id)
         if normalized_id is None:

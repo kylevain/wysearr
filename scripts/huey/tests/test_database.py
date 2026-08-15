@@ -125,6 +125,12 @@ class DatabaseTests(unittest.TestCase):
         columns = set()
         with self.store.connect() as connection:
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(requests)")}
+            retry_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(unavailable_retries)"
+                )
+            }
             self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
         self.assertTrue(
             {
@@ -138,6 +144,7 @@ class DatabaseTests(unittest.TestCase):
             }
             <= columns
         )
+        self.assertIn("last_proof_check_at", retry_columns)
         with self.store.connect() as connection:
             aliases = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_aliases'"
@@ -151,6 +158,25 @@ class DatabaseTests(unittest.TestCase):
         self.assertIsNotNone(aliases)
         self.assertIsNotNone(outbox)
         self.assertIsNotNone(target_index)
+
+    def test_unavailable_retry_proof_cursor_migrates_idempotently(self):
+        self.store.initialize()
+        with self.store.connect() as connection:
+            connection.execute(
+                "ALTER TABLE unavailable_retries DROP COLUMN last_proof_check_at"
+            )
+
+        self.store.initialize()
+        self.store.initialize()
+
+        with self.store.connect() as connection:
+            retry_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(unavailable_retries)"
+                )
+            }
+        self.assertIn("last_proof_check_at", retry_columns)
 
     def test_candidate_schema_migrates_idempotently_without_backfilling_legacy_selection(self):
         self.store.initialize()

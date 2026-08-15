@@ -29,6 +29,8 @@ class HueyUpdater:
         torrent_hash: str,
         destination: Path,
         tags: str = "",
+        *,
+        source_category: str | None = None,
     ) -> bool:
         if self.database_path is None or not self.database_path.is_file():
             return False
@@ -40,6 +42,7 @@ class HueyUpdater:
                 event_type="completed",
                 message=f"BookBot imported media to {destination}",
                 destination=destination,
+                source_category=source_category,
             )
         except (OSError, sqlite3.Error, ValueError) as exc:
             LOGGER.warning("Huey completion update skipped: %s", exc)
@@ -251,6 +254,7 @@ class HueyUpdater:
         message: str,
         destination: Path | None = None,
         error: str | None = None,
+        source_category: str | None = None,
     ) -> bool:
         assert self.database_path is not None
         raw_connection = sqlite3.connect(self.database_path, timeout=5)
@@ -315,6 +319,65 @@ class HueyUpdater:
             if not normalized_hash:
                 return False
 
+            # A final-library copy may finish just after a previously
+            # correlated unavailable retry was marked failed/blocked.  Permit
+            # completion (never failure or reacquisition) only for that exact
+            # persisted LazyLibrarian hash, current cascade attempt, and
+            # BookBot finalizer.  Legacy/minimal Huey databases simply do not
+            # expose this opt-in path and retain the normal active-only rule.
+            blocked_completion_ids: set[int] = set()
+            if status in {"complete", "completed"} and {
+                "service",
+                "media_type",
+                "external_id",
+            }.issubset(request_columns):
+                table_names = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                if {
+                    "unavailable_retries",
+                    "ebook_cascades",
+                    "ebook_backend_attempts",
+                }.issubset(table_names):
+                    blocked_completion_ids = {
+                        int(row[0])
+                        for row in connection.execute(
+                            """
+                            SELECT request.id
+                            FROM requests AS request
+                            JOIN unavailable_retries AS retry
+                              ON retry.request_id = request.id
+                            JOIN ebook_cascades AS cascade
+                              ON cascade.request_id = request.id
+                            JOIN ebook_backend_attempts AS attempt
+                              ON attempt.request_id = cascade.request_id
+                             AND attempt.ordinal = cascade.current_ordinal
+                            WHERE retry.state = 'blocked'
+                              AND request.status = 'failed'
+                              AND request.service = 'lazylibrarian'
+                              AND request.media_type = 'ebooks'
+                              AND request.external_id IS NOT NULL
+                              AND lower(request.external_id) = ?
+                              AND cascade.state = 'failed'
+                              AND cascade.identity_key IS NOT NULL
+                              AND (
+                                  cascade.final_backend = 'lazylibrarian'
+                                  OR (
+                                      cascade.final_backend IS NULL
+                                      AND cascade.mutation_backend = 'lazylibrarian'
+                                  )
+                              )
+                              AND attempt.backend = 'lazylibrarian'
+                              AND attempt.external_id IS NOT NULL
+                              AND lower(attempt.external_id) = ?
+                            """,
+                            (normalized_hash, normalized_hash),
+                        ).fetchall()
+                    }
+
             resolved_owner_ids: set[int] = set()
             for tagged in tagged_rows:
                 tagged_id = int(tagged["id"])
@@ -347,6 +410,7 @@ class HueyUpdater:
                 elif (
                     str(tagged["status"] or "").casefold()
                     not in ACTIVE_OWNER_STATUSES
+                    and tagged_id not in blocked_completion_ids
                     or tagged_hashes != {normalized_hash}
                 ):
                     return False
@@ -362,6 +426,7 @@ class HueyUpdater:
                 if (
                     str(owner["status"] or "").casefold()
                     not in ACTIVE_OWNER_STATUSES
+                    and owner_id not in blocked_completion_ids
                     or owner_hashes != {normalized_hash}
                     or (
                         "canonical_request_id" in owner.keys()
@@ -380,6 +445,24 @@ class HueyUpdater:
                 return False
             existing_ids = resolved_owner_ids
             if not existing_ids:
+                return False
+
+            owner = rows_by_id.get(next(iter(existing_ids)))
+            if (
+                status in {"complete", "completed"}
+                and owner is not None
+                and "service" in owner.keys()
+                and "media_type" in owner.keys()
+                and str(owner["service"] or "").casefold()
+                == "lazylibrarian"
+                and str(owner["media_type"] or "").casefold() == "ebooks"
+                and source_category != "ebooks"
+            ):
+                # A Huey tag/hash proves the logical request, but not the
+                # processing lane.  A drifted qBittorrent category can route
+                # the same bytes to Comics or another library, which is not an
+                # ebook final-library proof.  Only BookBot's exact ebook
+                # CategorySpec may complete a LazyLibrarian ebook owner.
                 return False
 
             assignments: list[str] = []

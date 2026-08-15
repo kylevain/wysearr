@@ -10,6 +10,7 @@ HUEY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HUEY_ROOT))
 
 from clients import (
+    LazyLibrarianClient,
     LidarrClient,
     MAX_TORRENT_BYTES,
     ProwlarrClient,
@@ -276,6 +277,23 @@ class ArrClientTests(unittest.TestCase):
 
 
 class ShelfarrClientTests(unittest.TestCase):
+    @staticmethod
+    def lazylibrarian_identity(book_id="OL893415W", *, year=None):
+        client = LazyLibrarianClient(
+            "http://lazylibrarian:5299", "ll-key", session=FakeSession()
+        )
+        return client._candidate_snapshot(
+            client._metadata_candidate(
+                {
+                    "bookid": book_id,
+                    "bookname": "Dune",
+                    "authorname": "Frank Herbert",
+                    "bookpub": year,
+                    "source": "OpenLibrary",
+                }
+            )
+        )
+
     def metadata_result(self, **overrides):
         value = {
             "work_id": "openlibrary:OL893415W",
@@ -382,6 +400,88 @@ class ShelfarrClientTests(unittest.TestCase):
             payload["source_work_ids"],
             ["openlibrary:OL893415W", "hardcover:book:123"],
         )
+
+    def test_authoritative_retry_rejects_replacement_work_with_same_bibliography(self):
+        original = ShelfarrClient._candidate_snapshot(
+            self.metadata_result(), "ebooks"
+        )
+        replacement = self.metadata_result(
+            work_id="openlibrary:OL-REPLACEMENT",
+            sources=[{"work_id": "openlibrary:OL-REPLACEMENT"}],
+        )
+        session = FakeSession(
+            [FakeResponse(json_value={"results": [replacement]})]
+        )
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit_authoritative(
+            "ebooks", 42, resolved_identity=original
+        )
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["backend_outcome"], "miss")
+        self.assertEqual(len(session.calls), 1)
+
+    def test_cross_provider_yearless_retry_rejects_different_edition_alias(self):
+        authoritative = self.lazylibrarian_identity("OL-ORIGINAL", year=None)
+        replacement = self.metadata_result(
+            work_id="openlibrary:OL-REPLACEMENT",
+            year=None,
+            sources=[{"work_id": "openlibrary:OL-REPLACEMENT"}],
+        )
+        session = FakeSession(
+            [FakeResponse(json_value={"results": [replacement]})]
+        )
+
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit_authoritative(
+            "ebooks", 42, resolved_identity=authoritative
+        )
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["backend_outcome"], "miss")
+        self.assertEqual([call[0] for call in session.calls], ["GET"])
+
+    def test_cross_provider_yearless_retry_accepts_shared_canonical_alias(self):
+        authoritative = self.lazylibrarian_identity(year=None)
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(status=201, json_value=self.create_response()),
+            ]
+        )
+
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit_authoritative(
+            "ebooks", 42, resolved_identity=authoritative
+        )
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET", "GET", "POST"])
+
+    def test_cross_provider_legacy_identity_can_use_exact_non_null_year(self):
+        authoritative = self.lazylibrarian_identity("OL-ORIGINAL", year=1965)
+        session = FakeSession(
+            [
+                FakeResponse(json_value={"results": [self.metadata_result()]}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(json_value={"requests": []}),
+                FakeResponse(status=201, json_value=self.create_response()),
+            ]
+        )
+
+        response = ShelfarrClient(
+            "http://shelfarr", "shf_secret", session=session
+        ).submit_authoritative(
+            "ebooks", 42, resolved_identity=authoritative
+        )
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(sum(call[0] == "POST" for call in session.calls), 1)
 
     def test_ambiguous_metadata_never_creates_request(self):
         session = FakeSession(

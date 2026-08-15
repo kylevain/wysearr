@@ -69,8 +69,14 @@ class RequestProcessor:
         record: Mapping[str, Any], delivery_message_id: str | int
     ) -> dict[str, Any]:
         status = str(record.get("status") or "")
+        retry_state = str(record.get("_unavailable_retry_state") or "")
         same_delivery = str(record.get("message_id")) == str(delivery_message_id)
-        if same_delivery:
+        if retry_state:
+            message = (
+                f"This exact target is already tracked as request #{record['id']} "
+                f"in the unavailable retry backlog (state: {retry_state})."
+            )
+        elif same_delivery:
             message = (
                 f"This Discord message is already request #{record['id']} "
                 f"(status: {status})."
@@ -86,6 +92,10 @@ class RequestProcessor:
             (
                 "completed"
                 if status in {"complete", "completed"}
+                else "queued"
+                if retry_state in {"queued", "retrying", "awaiting_import"}
+                else "failed"
+                if retry_state == "blocked"
                 else "queued"
                 if status in {"new", "processing", "queued"}
                 else "needs_selection"
@@ -343,6 +353,8 @@ class RequestProcessor:
         request: Mapping[str, Any],
         response: Mapping[str, Any],
     ) -> tuple[tuple[str, str, str], ...]:
+        if self._silent_unavailable_retry(int(request["id"])):
+            return ()
         plans = response_notifications(
             "ebooks",
             {**dict(response), "request_id": int(request["id"]), "duplicate": False},
@@ -350,12 +362,38 @@ class RequestProcessor:
         )
         return tuple((plan.event_key, plan.route, plan.message) for plan in plans)
 
+    def _silent_unavailable_retry(self, request_id: int) -> bool:
+        checker = getattr(self.store, "unavailable_retry_is_silent", None)
+        return bool(callable(checker) and checker(int(request_id)) is True)
+
+    def _tag_lazylibrarian_owner(
+        self, request_id: int, download_id: object
+    ) -> None:
+        """Attach BookBot correlation only after the DB accepts hash ownership."""
+
+        try:
+            qbittorrent = self.services.qbittorrent()
+            add_tags = getattr(qbittorrent, "add_tags", None)
+            if not callable(add_tags):
+                raise ServiceError("qBittorrent tagging is unavailable.")
+            add_tags(str(download_id), f"huey-{int(request_id)}")
+        except Exception as error:
+            # The exact DB/hash owner is already durable.  LL reconciliation
+            # restores this idempotent tag before BookBot can mark completion;
+            # never authorize fallback merely because correlation is delayed.
+            LOGGER.warning(
+                "LazyLibrarian correlation tag deferred for request %s (%s)",
+                int(request_id),
+                type(error).__name__,
+            )
+
     def _run_ebook_cascade(
         self,
         request: Mapping[str, Any],
         *,
         selected_candidate: Mapping[str, Any] | None = None,
         allow_prompt: bool = True,
+        retry_now: Any | None = None,
     ) -> dict[str, Any]:
         """Run serial attempts until one owns acquisition or policy exhausts."""
 
@@ -373,6 +411,7 @@ class RequestProcessor:
                         request_id, backend, selected_candidate
                     )
                 except EbookIdentityCollision as collision:
+                    self.store.force_unavailable_retry(collision.owner_request_id)
                     collision_message = (
                         f"This exact ebook is already tracked as request "
                         f"#{collision.owner_request_id}."
@@ -449,6 +488,7 @@ class RequestProcessor:
                 )
                 handler_result = normalize_result(dict(raw_result))
             except EbookIdentityCollision as collision:
+                self.store.force_unavailable_retry(collision.owner_request_id)
                 collision_message = (
                     f"This exact ebook is already tracked as request "
                     f"#{collision.owner_request_id}."
@@ -508,6 +548,7 @@ class RequestProcessor:
                         notifications=self._ebook_notifications(
                             dispatch_request, exhausted
                         ),
+                        now=retry_now,
                     )
                     if next_backend is not None:
                         continue
@@ -618,6 +659,7 @@ class RequestProcessor:
                     notifications=self._ebook_notifications(
                         dispatch_request, exhausted
                     ),
+                    now=retry_now,
                 )
                 if next_backend is not None:
                     continue
@@ -672,6 +714,15 @@ class RequestProcessor:
                     handler_result,
                     notifications=notifications,
                 )
+            if (
+                backend == "lazylibrarian"
+                and handler_result.get("external_id") is not None
+                and handler_result.get("external_status") != "submission_uncertain"
+                and handler_result["status"] in {"queued", "completed"}
+            ):
+                self._tag_lazylibrarian_owner(
+                    request_id, handler_result["external_id"]
+                )
             handler_result.update({"request_id": request_id, "duplicate": False})
             return handler_result
 
@@ -687,8 +738,11 @@ class RequestProcessor:
             request_ids = tuple(int(request["id"]) for request in batch)
             for request in batch:
                 selected_candidate = None
-                confirmation = self.store.get_candidate_confirmation(
-                    int(request["id"])
+                silent_retry = self._silent_unavailable_retry(int(request["id"]))
+                confirmation = (
+                    None
+                    if silent_retry
+                    else self.store.get_candidate_confirmation(int(request["id"]))
                 )
                 if confirmation is not None and confirmation.get("status") == "claimed":
                     selected = [
@@ -704,17 +758,59 @@ class RequestProcessor:
                             "Claimed ebook confirmation has no unique persisted selection"
                         )
                     selected_candidate = selected[0]["candidate"]
-                self._run_ebook_cascade(
-                    request,
-                    selected_candidate=selected_candidate,
-                    allow_prompt=False,
-                )
+                try:
+                    self._run_ebook_cascade(
+                        request,
+                        selected_candidate=selected_candidate,
+                        allow_prompt=False,
+                    )
+                finally:
+                    if silent_retry:
+                        # Scheduler claims normally close their retry state in
+                        # retry_due_unavailable_requests().  A restart can
+                        # resume the same search through this path instead, so
+                        # give terminal pre-mutation outcomes the identical
+                        # deterministic requeue/expiry cleanup.
+                        self.store.finish_unavailable_retry_attempt(
+                            int(request["id"])
+                        )
                 resumed += 1
             remaining = self.store.resumable_ebook_requests(limit=batch_limit)
             if remaining and tuple(int(row["id"]) for row in remaining) == request_ids:
                 raise EbookCascadeStateError(
                     "Ebook startup recovery made no durable progress"
                 )
+
+    def retry_due_unavailable_requests(
+        self, *, now: Any | None = None, limit: int = 100
+    ) -> int:
+        """Claim due backlog rows and feed them through the same ebook cascade."""
+
+        claimed = self.store.claim_due_unavailable_retries(now=now, limit=limit)
+        attempted = 0
+        for request in claimed:
+            request_id = int(request["id"])
+            try:
+                self._run_ebook_cascade(
+                    request,
+                    allow_prompt=False,
+                    retry_now=now,
+                )
+            except Exception as error:
+                LOGGER.error(
+                    "Silent unavailable retry %s deferred after %s",
+                    request_id,
+                    type(error).__name__,
+                )
+            finally:
+                # Normal miss/handoff/completion paths close this state inside
+                # their transaction.  This repairs only a pre-mutation
+                # terminal path that returned without doing so.
+                self.store.finish_unavailable_retry_attempt(
+                    request_id, now=now
+                )
+            attempted += 1
+        return attempted
 
     def process(self, delivery: Mapping[str, Any]) -> dict[str, Any]:
         """Process one serializable Discord delivery synchronously.

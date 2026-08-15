@@ -283,6 +283,119 @@ with the authenticated command in
 [the operator model](wysearr-architecture.md#administrator-use) until a
 least-privilege catalog check is configured.
 
+## Silent unavailable ebook retries
+
+This queue applies only to a valid ebook request with a persisted canonical work
+identity after the configured cascade exhausts in safe pre-mutation misses and
+at least one exact release probe conclusively reports no usable release. Huey sends the existing final unavailable message once, then
+creates one `unavailable_retries` row in `state/huey/huey.db`. Transient service
+errors, metadata ambiguity, an unresolved or changed identity, mutation
+uncertainty, downloader failure, and finalizer/import failure do not create a new
+retry record. No audiobook, movie/TV, manga/comics, ROM, or sheet-music path uses
+this queue.
+
+The schedule is fixed in code and has no environment override:
+
+| Attempt | Earliest eligibility after initial unavailability |
+| --- | --- |
+| 1 | day 7 |
+| 2 | day 37 |
+| 3 | day 67 |
+| 4 | day 97 |
+| 5 | day 127 |
+| 6 | day 157 |
+| 7 | day 187 |
+
+Each failed search-safe attempt schedules the next one 30 days later. Huey's
+background reconciliation loop claims eligible rows on its next pass. The
+seventh failed attempt changes the record to `expired`, with no Discord expiry
+message. A service outage can delay an attempt beyond its earliest date; later
+dates then follow the actual previous-attempt time rather than causing catch-up
+bursts.
+
+`unavailable_retries.request_id` is both its primary key and a cascading foreign
+key to the original `requests` row. The record stores the ebook-only media type,
+provider-independent `identity_key`, bounded sanitized `metadata_json`, canonical
+title/creator/year, original Discord user/channel/message correlation,
+`first_unavailable_at`, `last_retry_at`, the nullable blocked-Shelfarr
+`last_proof_check_at` fairness cursor, `next_retry_at`, `retry_count`, `state`,
+`final_import_state`, and terminal timestamps. Its states mean:
+
+| State | Meaning |
+| --- | --- |
+| `queued` | No mutation is owned; wait for `next_retry_at`. |
+| `retrying` | Huey atomically claimed the row and is reusing the saved identity in the normal cascade. |
+| `awaiting_import` | A backend handoff is proven or a mutation-uncertain correlation remains owned; established finalizer/correlation reconciliation runs. |
+| `blocked` | A post-mutation or import failure retains terminal ownership and its backend reservation. No acquisition runs; only exact late final proof from the existing BookBot hash/tag or Shelfarr request may repair it to `fulfilled`. |
+| `fulfilled` | The established finalizer proved the final DAS import. |
+| `expired` | Seven search-safe retries ended without a usable release. |
+
+One partial unique index covers `identity_key` in `queued`, `retrying`,
+`awaiting_import`, and `blocked`. It prevents duplicate backlog owners and makes
+a live request for the same canonical work reuse the original request. A new
+live request can make a `queued` row due immediately, but cannot bypass an
+in-progress, handed-off, or blocked owner. A retry claim resets only transient
+attempt lifecycle and external-correlation fields. It retains every attempt's
+exact backend identity and every provider reservation/alias, so the same request
+can reuse its IDs while a changed title or year cannot take them for a second
+owner. `queued`, `retrying`, `awaiting_import`, `blocked`, and `fulfilled` rows
+retain those reservations; `expired` releases them. The retry never creates a
+parallel downloader or replaces the selected metadata. If the saved work
+identity is stale or cannot be resolved exactly, the attempt fails safely,
+remains silent, and retains the row until a later schedule or expiry.
+
+Every background attempt is silent. It creates no retry-start, metadata-choice,
+accepted, queued, download-progress, miss, error, blocked, or expiry delivery in
+Discord. Internal events and sanitized logs remain available to operators. Even
+a successful backend handoff remains silent until final import. LazyLibrarian
+fulfilment requires BookBot to commit its exact-hash, ledger-validated copy to
+`/mnt/media/ebooks/Books` from the exact `ebooks` CategorySpec. Missing category
+proof, `manga-comics`, and every other processing lane fail closed even when the
+Huey tag and hash match. Shelfarr fulfilment requires its correlated request to
+report completed final publication to that DAS path. Search results, API `OK`,
+backend acceptance, qBittorrent acceptance, and complete payload bytes are not
+success. At final proof, the retry becomes `fulfilled` and Huey's unique outbox
+stages each logical `request_completed` and `library_imported` notification once.
+
+Inspect the live queue with the bundled non-networked operator CLI. The list
+operation performs only bounded SQLite reads and emits canonical display fields
+and lifecycle timestamps; it omits saved metadata, Discord identities, and
+error text. Add `--state queued` (or another lifecycle state) to filter it:
+
+```bash
+docker compose exec -T huey \
+  python /app/scripts/huey/retry_admin.py list --limit 100
+```
+
+To force one safe immediate attempt, first inspect it and require state
+`queued`. Then use the CLI's transaction-aware force operation; it refuses every
+other state and changes only `next_retry_at` plus a sanitized audit event:
+
+```bash
+docker compose exec -T huey \
+  python /app/scripts/huey/retry_admin.py force 123
+```
+
+The command prints a small JSON result and exits nonzero if the request is
+absent or is not safely `queued`. For offline inspection of a restored database,
+run the same script from the repository root with `--database PATH` before the
+`list` subcommand.
+
+Do not edit dates with raw SQL, force `retrying`/`awaiting_import`/`blocked`
+records, or call a backend mutation endpoint manually. After a restart, `queued`
+dates remain durable; search-safe `retrying` work resumes through the saved
+cascade; `awaiting_import` work returns to backend-specific reconciliation;
+completed final imports are repaired to `fulfilled`; post-mutation failures are
+retained as terminal `blocked` operator-review ownership with no reacquisition.
+For blocked owners, normal reconciliation performs read-only proof checks only:
+the exact BookBot tag/hash copy or the exact Shelfarr remote request reporting
+`completed` can atomically repair the original attempt and fulfil it. Shelfarr
+checks claim the least-recently-checked bounded batch and persist
+`last_proof_check_at` before remote reads, providing fair rotation across every
+blocked owner even after restart.
+`scripts/backup.py` transactionally checkpoints this state as part of the
+existing Huey database.
+
 ## Production acceptance
 
 The authoritative ebook policy is
@@ -311,7 +424,8 @@ Acquisition acceptance combines deterministic, controlled state-machine tests
 with genuine, non-acquiring transport validation. The controlled cases cover
 metadata selection and ambiguity, backend order and availability, safe
 pre-mutation fallback, timeouts and uncertain mutation, deduplication, replay,
-correlation, lifecycle routing, restart recovery, and partial outages. The live
+correlation, unavailable scheduling and silence, final-import gating, lifecycle
+routing, restart recovery, and partial outages. The live
 checks use the deployed LazyLibrarian, ABBA, Shelfarr, qBittorrent, Huey, and
 BookBot transports and persisted configuration, but do not submit a title,
 search AudioBookBay, create a Shelfarr request, add a LazyLibrarian book, or add

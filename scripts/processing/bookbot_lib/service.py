@@ -383,6 +383,7 @@ class BookBotService:
             torrent_hash,
             destination,
             str(torrent.get("tags") or ""),
+            source_category=spec.name,
         )
         LOGGER.info(
             "Import complete hash=%s category=%s destination=%s",
@@ -432,7 +433,12 @@ class BookBotService:
         if row["status"] == "imported":
             # A later duplicate Huey request can share this retained torrent.
             # Re-running the guarded update is safe and does not extend retention.
-            return self.huey.complete(torrent_hash, destination, tags)
+            return self.huey.complete(
+                torrent_hash,
+                destination,
+                tags,
+                source_category=spec.name,
+            )
         self.ledger.mark_imported(
             torrent_hash,
             source_category,
@@ -440,7 +446,12 @@ class BookBotService:
             destination,
             timestamp,
         )
-        self.huey.complete(torrent_hash, destination, tags)
+        self.huey.complete(
+            torrent_hash,
+            destination,
+            tags,
+            source_category=spec.name,
+        )
         return True
 
     def _audiobook_metadata(

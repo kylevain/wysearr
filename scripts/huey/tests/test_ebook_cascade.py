@@ -872,7 +872,9 @@ class EbookCascadeTests(unittest.TestCase):
         self.assertEqual(
             reconcile_lazylibrarian_requests(self.store, services), 0
         )
-        ll_client.recover_submission.assert_called_once_with(LL_BOOK_ID)
+        ll_client.recover_submission.assert_called_once_with(
+            LL_BOOK_ID, request_id=request["id"]
+        )
         cascade = self.store.get_ebook_cascade(request["id"])
         self.assertEqual(cascade["state"], "queued")
         self.assertEqual(cascade["final_backend"], "lazylibrarian")

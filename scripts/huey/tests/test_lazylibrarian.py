@@ -16,6 +16,8 @@ import requests
 
 HUEY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HUEY_ROOT))
+PROCESSING_ROOT = HUEY_ROOT.parent / "processing"
+sys.path.insert(0, str(PROCESSING_ROOT))
 
 from clients import (
     LazyLibrarianClient,
@@ -32,6 +34,7 @@ from notifications import response_notifications
 from orchestrator import RequestProcessor
 from results import result
 from services import ServiceRegistry
+from bookbot_lib.huey import HueyUpdater
 
 
 BOOK_A = "OL893415W"
@@ -69,11 +72,21 @@ class ScriptedSession:
 
 
 class FakeQbittorrent:
-    def __init__(self, *, category="ebooks", save_path="/downloads/ebooks", error=None):
+    def __init__(
+        self,
+        *,
+        category="ebooks",
+        save_path="/downloads/ebooks",
+        error=None,
+        tag_error=None,
+    ):
         self.category = category
         self.save_path = save_path
         self.error = error
+        self.tag_error = tag_error
         self.calls = []
+        self.tag_calls = []
+        self.tags = set()
 
     def find_torrent(self, torrent_hash):
         self.calls.append(torrent_hash)
@@ -86,6 +99,12 @@ class FakeQbittorrent:
             "category": self.category,
             "save_path": self.save_path,
         }
+
+    def add_tags(self, torrent_hash, tags):
+        self.tag_calls.append((torrent_hash, tags))
+        if self.tag_error is not None:
+            raise self.tag_error
+        self.tags.add((torrent_hash, tags))
 
 
 def metadata(
@@ -176,10 +195,26 @@ class LazyLibrarianClientTests(unittest.TestCase):
             **kwargs,
         )
 
+    @staticmethod
+    def shelfarr_identity(book_id=BOOK_A, *, year=None):
+        return {
+            "fingerprint": "f" * 64,
+            "label": "Dune · by Frank Herbert · Ebook · Open Library",
+            "work_id": f"openlibrary:{book_id}",
+            "source_work_ids": (f"openlibrary:{book_id}",),
+            "title": "Dune",
+            "author": "Frank Herbert",
+            "year": year,
+            "content_kind": "book",
+            "media_type": "ebooks",
+            "book_type": "ebook",
+        }
+
     def test_unique_match_uses_official_order_and_binds_exact_hash(self):
         session = ScriptedSession(*successful_responses())
         callback_events = []
-        client = self.client(session)
+        qbittorrent = FakeQbittorrent()
+        client = self.client(session, qbittorrent=qbittorrent)
 
         def before_create(book_id):
             callback_events.append((book_id, len(session.calls)))
@@ -192,6 +227,7 @@ class LazyLibrarianClientTests(unittest.TestCase):
         self.assertEqual(response["service"], "lazylibrarian")
         self.assertEqual(response["external_id"], HASH_A)
         self.assertEqual(callback_events, [(BOOK_A, 1)])
+        self.assertEqual(qbittorrent.tag_calls, [])
         self.assertEqual(
             [call[2]["data"]["cmd"] for call in session.calls],
             [
@@ -220,6 +256,71 @@ class LazyLibrarianClientTests(unittest.TestCase):
         self.assertEqual(params[4]["wait"], "1")
         self.assertNotIn("source", params[3])
         self.assertNotIn("source", params[4])
+
+    def test_authoritative_retry_rejects_replacement_book_id_with_same_bibliography(self):
+        client = self.client(ScriptedSession())
+        original = client._candidate_snapshot(client._metadata_candidate(metadata()))
+        session = ScriptedSession(FakeResponse([metadata(BOOK_B)]))
+        crossed = []
+
+        response = self.client(session).submit_authoritative(
+            "ebooks",
+            42,
+            resolved_identity=original,
+            before_create=crossed.append,
+        )
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["backend_outcome"], "miss")
+        self.assertEqual(crossed, [])
+        self.assertEqual(
+            [call[2]["data"]["cmd"] for call in session.calls], ["findBook"]
+        )
+
+    def test_cross_provider_yearless_retry_rejects_different_edition_alias(self):
+        session = ScriptedSession(
+            FakeResponse([metadata(BOOK_B, year=0)])
+        )
+        crossed = []
+
+        response = self.client(session).submit_authoritative(
+            "ebooks",
+            42,
+            resolved_identity=self.shelfarr_identity(BOOK_A, year=None),
+            before_create=crossed.append,
+        )
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["backend_outcome"], "miss")
+        self.assertEqual(crossed, [])
+        self.assertEqual(
+            [call[2]["data"]["cmd"] for call in session.calls], ["findBook"]
+        )
+
+    def test_cross_provider_yearless_retry_accepts_shared_canonical_alias(self):
+        session = ScriptedSession(*successful_responses())
+        crossed = []
+
+        response = self.client(session).submit_authoritative(
+            "ebooks",
+            42,
+            resolved_identity=self.shelfarr_identity(BOOK_A, year=None),
+            before_create=crossed.append,
+        )
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(crossed, [BOOK_A])
+        self.assertEqual(
+            [call[2]["data"]["cmd"] for call in session.calls],
+            [
+                "findBook",
+                "addBook",
+                "getAllBooks",
+                "queueBook",
+                "searchBook",
+                "getHistory",
+            ],
+        )
 
     def test_api_command_uses_clean_post_url_and_form_body_credentials(self):
         secret = "0123456789abcdef0123456789abcdef"
@@ -322,6 +423,7 @@ class LazyLibrarianClientTests(unittest.TestCase):
                         42,
                         before_create=lambda _book_id: None,
                     )
+                self.assertEqual(qbittorrent.tag_calls, [])
 
         recovery = self.client(
             ScriptedSession(
@@ -332,6 +434,28 @@ class LazyLibrarianClientTests(unittest.TestCase):
         )
         with self.assertRaises(ServiceRejected):
             recovery.recover_submission(BOOK_A)
+
+    def test_client_defers_tag_until_durable_hash_ownership(self):
+        qbittorrent = FakeQbittorrent(
+            tag_error=ServiceError("qBittorrent tagging is unavailable.")
+        )
+        crossed = []
+
+        response = self.client(
+            ScriptedSession(*successful_responses()),
+            qbittorrent=qbittorrent,
+        ).submit(
+            "ebooks",
+            "Dune",
+            "Frank Herbert",
+            42,
+            before_create=crossed.append,
+        )
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(crossed, [BOOK_A])
+        self.assertEqual(qbittorrent.calls, [HASH_A])
+        self.assertEqual(qbittorrent.tag_calls, [])
 
     def test_fast_bookbot_import_binds_hash_but_remains_nonterminal(self):
         qbittorrent = FakeQbittorrent(category="ebooks-imported")
@@ -591,7 +715,10 @@ class LazyLibrarianClientTests(unittest.TestCase):
                 ]
             ),
         )
-        recovered = self.client(session).recover_submission(BOOK_A)
+        qbittorrent = FakeQbittorrent()
+        recovered = self.client(
+            session, qbittorrent=qbittorrent
+        ).recover_submission(BOOK_A, request_id=42)
 
         self.assertEqual(recovered["state"], "queued")
         self.assertEqual(recovered["external_id"], HASH_A)
@@ -599,6 +726,27 @@ class LazyLibrarianClientTests(unittest.TestCase):
             [call[2]["data"]["cmd"] for call in session.calls],
             ["getAllBooks", "getHistory"],
         )
+        self.assertEqual(qbittorrent.tag_calls, [])
+
+    def test_exact_recovery_does_not_tag_before_durable_hash_binding(self):
+        qbittorrent = FakeQbittorrent()
+        client = self.client(
+            ScriptedSession(
+                FakeResponse([library_book()]),
+                FakeResponse([history()]),
+                FakeResponse([library_book()]),
+                FakeResponse([history()]),
+            ),
+            qbittorrent=qbittorrent,
+        )
+
+        first = client.recover_submission(BOOK_A, request_id=42)
+        second = client.recover_submission(BOOK_A, request_id=42)
+
+        self.assertEqual(first["external_id"], HASH_A)
+        self.assertEqual(second["external_id"], HASH_A)
+        self.assertEqual(qbittorrent.tags, set())
+        self.assertEqual(qbittorrent.tag_calls, [])
 
     def test_recovery_unknown_and_pending_do_not_repeat_search(self):
         unknown_session = ScriptedSession(FakeResponse([]))
@@ -720,6 +868,106 @@ class LazyLibrarianStoreTests(unittest.TestCase):
                 for row in connection.execute("PRAGMA table_info(requests)")
             )
         self.assertEqual(count, 1)
+
+    def test_initialize_quarantines_legacy_completed_and_queued_hash_collision(self):
+        owner = self.make_request("legacy-hash-owner")
+        self.store.transition(
+            owner["id"],
+            "queued",
+            "Legacy LazyLibrarian handoff",
+            service="lazylibrarian",
+            external_id=HASH_A,
+            external_title="Dune",
+            external_status="queued",
+        )
+        self.store.transition(
+            owner["id"],
+            "complete",
+            "Legacy BookBot final import",
+            service="lazylibrarian",
+            external_id=HASH_A,
+            external_title="Dune",
+            external_status="processing",
+        )
+        contender = self.make_request("legacy-hash-contender")
+
+        # Recreate the former index, which protected only active rows and
+        # therefore permitted a completed owner plus one queued competitor.
+        with self.store.connect() as connection:
+            connection.execute("DROP INDEX requests_active_ll_hash_uq")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX requests_active_ll_hash_uq
+                    ON requests(lower(external_id))
+                    WHERE service = 'lazylibrarian'
+                      AND external_id IS NOT NULL
+                      AND status IN ('processing', 'queued')
+                """
+            )
+            connection.execute(
+                """
+                UPDATE requests
+                SET status = 'queued', external_id = ?,
+                    external_status = 'queued', external_title = 'Dune Messiah'
+                WHERE id = ?
+                """,
+                (HASH_A.upper(), contender["id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO notification_deliveries (
+                    request_id, event_key, route, message
+                ) VALUES (?, 'download_active', 'request-status', 'must not leak')
+                """,
+                (contender["id"],),
+            )
+
+        self.store.initialize()
+
+        preserved = self.store.get_request(owner["id"])
+        quarantined = self.store.get_request(contender["id"])
+        self.assertEqual(preserved["status"], "complete")
+        self.assertEqual(preserved["external_id"], HASH_A)
+        self.assertEqual(quarantined["status"], "failed")
+        self.assertEqual(quarantined["external_id"], HASH_A.upper())
+        self.assertEqual(
+            quarantined["external_status"],
+            "lazylibrarian_hash_identity_conflict",
+        )
+        self.assertIsNotNone(quarantined["notified_at"])
+        self.assertIsNone(quarantined["canonical_request_id"])
+        self.assertEqual(
+            [
+                row
+                for row in self.store.pending_notification_deliveries()
+                if row["request_id"] == contender["id"]
+            ],
+            [],
+        )
+        event_types = [
+            row["event_type"] for row in self.store.events_for(contender["id"])
+        ]
+        self.assertEqual(
+            event_types.count("lazylibrarian_hash_collision_migrated"), 1
+        )
+
+        # The stricter index and explicit collision check both survive restart.
+        replacement = self.make_request("legacy-hash-replacement")
+        self.store.mark_request_dispatch_started(
+            replacement["id"], "lazylibrarian", candidate_id=BOOK_B
+        )
+        with self.assertRaises(LazyLibrarianHashCollision):
+            self.store.record_lazylibrarian_download(
+                replacement["id"], BOOK_B, HASH_A, "Other", "legacy collision"
+            )
+        self.store.initialize()
+        self.assertEqual(
+            [
+                row["event_type"]
+                for row in self.store.events_for(contender["id"])
+            ].count("lazylibrarian_hash_collision_migrated"),
+            1,
+        )
 
     def test_ll_candidate_authorization_claims_exactly_once(self):
         request = self.make_request()
@@ -940,7 +1188,7 @@ class LazyLibrarianStoreTests(unittest.TestCase):
             external_title="Dune",
             external_status="processing",
         )
-        self.assertTrue(
+        with self.assertRaises(LazyLibrarianHashCollision):
             self.store.record_lazylibrarian_download(
                 unbound["id"],
                 str(unbound["lazylibrarian_book_id"]),
@@ -948,7 +1196,7 @@ class LazyLibrarianStoreTests(unittest.TestCase):
                 "Dune",
                 "retained imported payload recovered",
             )
-        )
+        self.assertIsNone(self.store.get_request(unbound["id"])["external_id"])
 
     def test_qbit_observation_is_hash_guarded_and_cannot_overwrite_bookbot(self):
         request = self.make_request("state-race")
@@ -1051,17 +1299,26 @@ class LazyLibrarianOrchestrationTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def registry(self, session=None, *, enabled=True, owner="lazylibrarian"):
-        services = ServiceRegistry(
-            {
-                "EBOOK_ACQUISITION_OWNER": owner,
-                "LAZYLIBRARIAN_ENABLED": "true" if enabled else "false",
-                "LAZYLIBRARIAN_API_KEY": "0123456789abcdef0123456789abcdef",
-                "PROWLARR_API_KEY": "prowlarr-key",
-                "SHELFARR_ENABLED": "true",
-                "SHELFARR_API_TOKEN": "rollback-token",
-            }
-        )
+    def registry(
+        self,
+        session=None,
+        *,
+        enabled=True,
+        owner="lazylibrarian",
+        backends=None,
+        qbittorrent=None,
+    ):
+        environment = {
+            "EBOOK_ACQUISITION_OWNER": owner,
+            "LAZYLIBRARIAN_ENABLED": "true" if enabled else "false",
+            "LAZYLIBRARIAN_API_KEY": "0123456789abcdef0123456789abcdef",
+            "PROWLARR_API_KEY": "prowlarr-key",
+            "SHELFARR_ENABLED": "true",
+            "SHELFARR_API_TOKEN": "rollback-token",
+        }
+        if backends is not None:
+            environment["EBOOK_ACQUISITION_BACKENDS"] = backends
+        services = ServiceRegistry(environment)
         prowlarr = Mock()
         prowlarr.search.side_effect = lambda query, _categories: [
             {
@@ -1073,11 +1330,13 @@ class LazyLibrarianOrchestrationTests(unittest.TestCase):
         ]
         services._clients["prowlarr"] = prowlarr
         if session is not None:
+            resolved_qbittorrent = qbittorrent or FakeQbittorrent()
+            services._clients["qbittorrent"] = resolved_qbittorrent
             services._clients["lazylibrarian"] = LazyLibrarianClient(
                 "http://ll:5299",
                 "0123456789abcdef0123456789abcdef",
                 session=session,
-                qbittorrent=FakeQbittorrent(),
+                qbittorrent=resolved_qbittorrent,
             )
         return services
 
@@ -1247,7 +1506,8 @@ class LazyLibrarianOrchestrationTests(unittest.TestCase):
             *successful_responses(),
             *successful_responses(second_candidate, download_id=HASH_A),
         )
-        services = self.registry(session)
+        qbittorrent = FakeQbittorrent()
+        services = self.registry(session, qbittorrent=qbittorrent)
         processor = RequestProcessor(self.store, services=services)
 
         first = processor.process(delivery())
@@ -1272,6 +1532,24 @@ class LazyLibrarianOrchestrationTests(unittest.TestCase):
         )
         commands = [call[2]["data"]["cmd"] for call in session.calls]
         self.assertEqual(commands.count("searchBook"), 2)
+        self.assertEqual(
+            qbittorrent.tags,
+            {(HASH_A, f"huey-{first['request_id']}")},
+        )
+        self.assertNotIn(
+            (HASH_A, f"huey-{second['request_id']}"), qbittorrent.tags
+        )
+        self.assertTrue(
+            HueyUpdater(self.store.path).complete(
+                HASH_A,
+                Path("/media/ebooks/Books/Dune"),
+                f"huey-{first['request_id']}",
+                source_category="ebooks",
+            )
+        )
+        self.assertEqual(
+            self.store.get_request(first["request_id"])["status"], "complete"
+        )
 
         call_count = len(session.calls)
         replay = processor.process(second_delivery)
@@ -1291,7 +1569,9 @@ class LazyLibrarianOrchestrationTests(unittest.TestCase):
             reconcile_lazylibrarian_requests(self.store, services),
             0,
         )
-        recovery.recover_submission.assert_called_once_with(BOOK_B)
+        recovery.recover_submission.assert_called_once_with(
+            BOOK_B, request_id=second["request_id"]
+        )
         self.assertEqual(len(session.calls), call_count)
         self.assertIsNone(
             self.store.get_request(second["request_id"])["external_id"]
@@ -1394,6 +1674,31 @@ class LazyLibrarianOrchestrationTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_post_binding_tag_failure_never_invokes_fallback(self):
+        qbittorrent = FakeQbittorrent(
+            tag_error=ServiceError("sensitive qBittorrent transport detail")
+        )
+        services = self.registry(
+            ScriptedSession(*successful_responses()),
+            backends="lazylibrarian,shelfarr",
+            qbittorrent=qbittorrent,
+        )
+        shelfarr = Mock()
+        services._clients["shelfarr"] = shelfarr
+
+        response = RequestProcessor(self.store, services=services).process(delivery())
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["external_status"], "queued")
+        self.assertEqual(response["external_id"], HASH_A)
+        self.assertNotIn("sensitive", response["message"].casefold())
+        self.assertEqual(qbittorrent.tag_calls, [(HASH_A, "huey-1")])
+        self.assertEqual(shelfarr.mock_calls, [])
+        cascade = self.store.get_ebook_cascade(response["request_id"])
+        self.assertEqual(cascade["state"], "queued")
+        self.assertEqual(cascade["mutation_backend"], "lazylibrarian")
+        self.assertEqual(cascade["final_backend"], "lazylibrarian")
 
     def test_restart_recovery_binds_hash_and_stages_acceptance_once(self):
         request, _ = self.store.create_request(
@@ -1651,7 +1956,8 @@ class LazyLibrarianOrchestrationTests(unittest.TestCase):
     def test_qbittorrent_routing_mismatch_is_quarantined_not_failed(self):
         request = self.bound_request("routing-mismatch")
         services = Mock()
-        services.qbittorrent.return_value.find_torrent.return_value = {
+        qbittorrent = services.qbittorrent.return_value
+        qbittorrent.find_torrent.return_value = {
             "hash": HASH_A,
             "category": "movies",
             "save_path": "/downloads/ebooks",
@@ -1663,6 +1969,7 @@ class LazyLibrarianOrchestrationTests(unittest.TestCase):
         saved = self.store.get_request(request["id"])
         self.assertEqual(saved["status"], "queued")
         self.assertEqual(saved["external_status"], "queued")
+        qbittorrent.add_tags.assert_not_called()
         attention = [
             row
             for row in self.store.pending_notification_deliveries()

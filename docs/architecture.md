@@ -122,9 +122,65 @@ Each ebook request has one row in `ebook_cascades`: immutable `policy_json`,
 `mutation_backend`, and the proven `final_backend`/`finalizer`. Ordered rows in
 `ebook_backend_attempts` retain each backend's status, local identity, external
 correlation, mutation timestamps, and outcome. `ebook_backend_reservations`
-uniquely binds backend-local identities across active/successful requests. The
-active identity and resume indexes make restart recovery select the current
-attempt without repeating an earlier mutation.
+uniquely binds backend-local primary identities and aliases across active or
+successful requests and active or fulfilled unavailable-retry owners. The active
+identity and resume indexes make restart recovery select the current attempt
+without repeating an earlier mutation.
+
+When a canonically resolved ebook exhausts the configured cascade in safe
+pre-mutation misses, and at least one exact release probe conclusively reports
+that no usable release exists, the same transaction that records the normal
+one-time failure also creates one `unavailable_retries` row. Operational errors,
+ambiguous or stale metadata, uncertain submission state, downloader failures,
+and import failures do not create a new retry owner. The row retains the
+original Huey request and Discord correlation, the sanitized selected-work
+snapshot, its provider-independent identity key, and retry/final-import state in
+`state/huey/huey.db`; no second queue service or database exists.
+
+The deterministic eligibility dates are 7, 37, 67, 97, 127, 157, and 187 days
+after the original unavailability result, assuming each preceding retry ends in
+another safe miss. Huey's existing background reconciliation loop claims due
+rows. The seventh failed retry expires the row, so the bounded lifetime is about
+six months. A retry reuses the saved work identity and the normal
+`lazylibrarian,shelfarr` cascade. It does not ask for metadata again and will not
+substitute a different work when the saved identity can no longer be resolved.
+Claiming a retry resets transient attempt timing, status, and external correlation
+only; persisted backend identities and every provider alias remain reserved for
+that logical request. The request can therefore revalidate and reuse its own
+provider ID, while changed title/year metadata cannot claim the same ID as a new
+owner. Reservations persist through `fulfilled` final proof and are released only
+when the retry expires.
+
+The retry states are `queued`, `retrying`, `awaiting_import`, `blocked`,
+`fulfilled`, and `expired`. Search-only misses return to `queued`; a proven
+handoff or mutation-uncertain correlation moves to `awaiting_import`. A
+definitive failure after a mutation or downloader handoff becomes `blocked`,
+retains its backend reservation and ownership, and is never acquired again
+automatically. The only allowed later edge is proof-only completion for that
+same persisted handoff: BookBot's exact Huey tag/hash, ledger-validated DAS copy
+from the exact `ebooks` processing category into the Books library for the
+LazyLibrarian path, or Shelfarr's exact retained remote request reporting
+completed final DAS publication. A drifted `manga-comics` or other processing
+category cannot complete an ebook owner. The atomic final-proof trigger repairs the
+failed attempt/cascade and moves the row to `fulfilled`; all other blocked
+observations remain unchanged and silent. Blocked Shelfarr proof polling uses
+the durable `last_proof_check_at` cursor and atomically advances each claimed
+least-recently-checked batch before remote reads, so a leading set of unfinished
+owners cannot starve later proof across reconciliation cycles or restarts.
+Indexer results, submission
+acceptance, downloader acceptance, and completed payload bytes are all
+nonterminal.
+
+The active retry identity index includes `blocked`, so a live request, a due
+retry, and another Discord delivery cannot race into duplicate acquisition. A
+new live request for the same canonical work resolves to the existing owner and
+may make a still-queued pre-mutation retry immediately due; it cannot bypass an
+active, awaiting-import, or blocked owner. Background attempts stage no
+acknowledgement, selection, queue, download, miss, error, or expiry notification.
+After verified final import, Huey's existing unique outbox stages each logical
+request-completion and recent-addition event once. This policy currently covers
+ebooks only; audiobook, movie/TV, comics, ROM, and sheet-music failure behavior
+is unchanged.
 
 Historical active/completed requests receive the same key during migration but
 are never replayed or silently merged. Titles are never silently guessed. When
@@ -210,8 +266,10 @@ continues only when every tag and stored hash resolves to the same root canonica
 ABBA audiobook owner; an unknown, mixed-media, chained, or conflicting owner
 fails closed before copy or lifecycle mutation.
 LazyLibrarian-created ebook jobs instead bind their exact qBittorrent hash into
-Huey's durable external ID; BookBot's case-insensitive hash reconciliation maps
-that terminal import without requiring LazyLibrarian to synthesize a tag. Huey
+Huey's durable external ID. Only after that database ownership succeeds does Huey
+attach the same exact `huey-<request-id>` tag; reconciliation restores the tag
+only after exact hash/category/save-path validation. BookBot requires both the
+tag and case-insensitive persisted hash before mapping the terminal import. Huey
 records delivery per logical
 event and destination. Discord itself does not provide an atomic exactly-once
 send transaction, so a route is marked delivered only after its send succeeds.

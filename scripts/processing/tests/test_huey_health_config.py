@@ -74,6 +74,51 @@ class HueyUpdaterTests(unittest.TestCase):
         self.assertEqual("completed", event[0])
         self.assertIn(str(destination), event[1])
 
+    def test_lazylibrarian_ebook_completion_requires_exact_ebook_lane(self) -> None:
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            connection.execute(
+                """
+                UPDATE requests
+                SET status='queued', media_type='ebooks',
+                    service='lazylibrarian', external_id=?
+                WHERE id=42
+                """,
+                (HASH,),
+            )
+
+        updater = HueyUpdater(self.database)
+        self.assertFalse(
+            updater.complete(
+                HASH,
+                Path("/media/ebooks/Comics/Book"),
+                "huey-42",
+                source_category="manga-comics",
+            )
+        )
+        self.assertFalse(
+            updater.complete(
+                HASH,
+                Path("/media/ebooks/Books/Book"),
+                "huey-42",
+            )
+        )
+        raw_connection = sqlite3.connect(self.database)
+        with closing(raw_connection) as connection, connection:
+            status = connection.execute(
+                "SELECT status FROM requests WHERE id=42"
+            ).fetchone()[0]
+        self.assertEqual("queued", status)
+
+        self.assertTrue(
+            updater.complete(
+                HASH,
+                Path("/media/ebooks/Books/Book"),
+                "huey-42",
+                source_category="ebooks",
+            )
+        )
+
     def test_failure_by_huey_tag_records_error_and_event(self) -> None:
         updater = HueyUpdater(self.database)
         self.assertTrue(updater.failed(HASH, "unsupported payload", "huey-42"))

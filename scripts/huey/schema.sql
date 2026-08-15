@@ -222,7 +222,8 @@ CREATE TABLE IF NOT EXISTS ebook_backend_attempts (
 
 -- Backend-local IDs remain reserved for the lifetime of an active/successful
 -- logical request, even after that backend cleanly misses and the service
--- field advances.  An exhausted failed cascade releases these reservations.
+-- field advances.  Active/fulfilled unavailable retries retain them; only an
+-- ordinary terminal failure or an expired retry releases them.
 CREATE TABLE IF NOT EXISTS ebook_backend_reservations (
     backend TEXT NOT NULL CHECK (backend IN ('lazylibrarian', 'shelfarr')),
     backend_identity TEXT NOT NULL CHECK (length(backend_identity) BETWEEN 1 AND 255),
@@ -245,6 +246,80 @@ CREATE INDEX IF NOT EXISTS ebook_cascades_resume_idx
 
 CREATE INDEX IF NOT EXISTS ebook_backend_attempts_state_idx
     ON ebook_backend_attempts(status, request_id, ordinal);
+
+-- A cleanly exhausted ebook cascade keeps its canonical work identity here.
+-- The row owns every later silent attempt and remains tied to the original
+-- Discord/Huey correlation until a final-library import is proved or the
+-- bounded retry policy expires.
+CREATE TABLE IF NOT EXISTS unavailable_retries (
+    request_id INTEGER PRIMARY KEY,
+    media_type TEXT NOT NULL CHECK (media_type = 'ebooks'),
+    identity_key TEXT NOT NULL CHECK (
+        length(identity_key) = 64
+        AND identity_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    metadata_json TEXT NOT NULL CHECK (
+        length(metadata_json) BETWEEN 2 AND 4096
+    ),
+    canonical_title TEXT NOT NULL CHECK (
+        length(canonical_title) BETWEEN 1 AND 160
+    ),
+    canonical_creator TEXT CHECK (
+        canonical_creator IS NULL
+        OR length(canonical_creator) BETWEEN 1 AND 160
+    ),
+    canonical_year INTEGER CHECK (
+        canonical_year IS NULL OR canonical_year BETWEEN 0 AND 9999
+    ),
+    discord_user_id TEXT NOT NULL,
+    discord_username TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    first_unavailable_at TEXT NOT NULL,
+    last_retry_at TEXT,
+    -- Durable fairness cursor for read-only checks of blocked Shelfarr jobs.
+    -- NULL rows are checked first; each claimed polling batch advances this
+    -- value atomically before making any remote request.
+    last_proof_check_at TEXT,
+    next_retry_at TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (
+        retry_count BETWEEN 0 AND 7
+    ),
+    state TEXT NOT NULL DEFAULT 'queued' CHECK (
+        state IN (
+            'queued', 'retrying', 'awaiting_import', 'blocked',
+            'fulfilled', 'expired'
+        )
+    ),
+    final_import_state TEXT NOT NULL DEFAULT 'pending' CHECK (
+        final_import_state IN ('pending', 'verified')
+    ),
+    fulfilled_at TEXT,
+    expired_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE,
+    CHECK (
+        (state = 'fulfilled' AND final_import_state = 'verified'
+            AND fulfilled_at IS NOT NULL)
+        OR (state != 'fulfilled' AND final_import_state = 'pending'
+            AND fulfilled_at IS NULL)
+    ),
+    CHECK (
+        (state = 'expired' AND expired_at IS NOT NULL)
+        OR (state != 'expired' AND expired_at IS NULL)
+    ),
+    CHECK (
+        (state = 'queued' AND next_retry_at IS NOT NULL)
+        OR (state != 'queued' AND next_retry_at IS NULL)
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS unavailable_retries_active_identity_uq
+    ON unavailable_retries(identity_key)
+    WHERE state IN ('queued', 'retrying', 'awaiting_import', 'blocked');
+
+CREATE INDEX IF NOT EXISTS unavailable_retries_due_idx
+    ON unavailable_retries(state, next_retry_at, request_id);
 
 -- BookBot writes Huey's requests table directly after its ledger-validated
 -- import.  Keep the cascade audit terminal in that same SQLite transaction,
@@ -313,5 +388,185 @@ BEGIN
       AND state IN ('mutating', 'uncertain', 'queued');
 
     DELETE FROM ebook_backend_reservations
-    WHERE request_id = NEW.id AND NEW.status = 'failed';
+    WHERE request_id = NEW.id AND NEW.status = 'failed'
+      AND NOT EXISTS (
+          SELECT 1 FROM unavailable_retries
+          WHERE request_id = NEW.id
+            AND state IN ('queued', 'retrying', 'awaiting_import', 'blocked',
+                          'fulfilled')
+      );
+END;
+
+-- A definitive failure after a downloader/submission boundary is not safe to
+-- reacquire automatically.  Keep ownership and remain silent for operator
+-- review; operators must resolve the terminal owner rather than redispatch it.
+DROP TRIGGER IF EXISTS unavailable_retry_import_failure_sync;
+CREATE TRIGGER unavailable_retry_import_failure_sync
+AFTER UPDATE OF status ON requests
+WHEN NEW.status = 'failed'
+ AND OLD.status != 'failed'
+ AND EXISTS (
+     SELECT 1 FROM unavailable_retries
+     WHERE request_id = NEW.id AND state = 'awaiting_import'
+ )
+BEGIN
+    UPDATE unavailable_retries
+    SET state = 'blocked', next_retry_at = NULL,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE request_id = NEW.id AND state = 'awaiting_import';
+
+    INSERT INTO events (request_id, event_type, message)
+    VALUES (
+        NEW.id,
+        'unavailable_retry_blocked',
+        'Unavailable retry retained ownership after a post-mutation failure'
+    );
+END;
+
+-- Both supported ebook finalizers update requests only after final-library
+-- proof: Shelfarr reports its exact request completed, or BookBot commits its
+-- ledger-validated copy for the exact Huey tag and download hash.  A blocked
+-- owner is never reacquired, but that already-correlated final proof may still
+-- repair its failed cascade and fulfil it.  Reopen only the normal terminal
+-- notification outbox at that same boundary.
+DROP TRIGGER IF EXISTS unavailable_retry_blocked_completion_guard;
+CREATE TRIGGER unavailable_retry_blocked_completion_guard
+BEFORE UPDATE OF status ON requests
+WHEN NEW.status IN ('complete', 'completed')
+ AND OLD.status NOT IN ('complete', 'completed')
+ AND EXISTS (
+     SELECT 1 FROM unavailable_retries
+     WHERE request_id = NEW.id AND state = 'blocked'
+ )
+ AND NOT EXISTS (
+     SELECT 1
+     FROM ebook_cascades AS cascade
+     JOIN ebook_backend_attempts AS attempt
+       ON attempt.request_id = cascade.request_id
+      AND attempt.ordinal = cascade.current_ordinal
+     WHERE cascade.request_id = NEW.id
+       AND cascade.state = 'failed'
+       AND cascade.identity_key IS NOT NULL
+       AND NEW.service IN ('lazylibrarian', 'shelfarr')
+       AND (
+           cascade.final_backend = NEW.service
+           OR (cascade.final_backend IS NULL
+               AND cascade.mutation_backend = NEW.service)
+       )
+       AND attempt.backend = NEW.service
+       AND attempt.external_id IS NOT NULL
+       AND NEW.external_id IS NOT NULL
+       AND lower(attempt.external_id) = lower(NEW.external_id)
+ )
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'Blocked unavailable retry lacks exact final-import correlation'
+    );
+END;
+
+DROP TRIGGER IF EXISTS unavailable_retry_terminal_sync;
+CREATE TRIGGER unavailable_retry_terminal_sync
+AFTER UPDATE OF status ON requests
+WHEN NEW.status IN ('complete', 'completed')
+ AND OLD.status NOT IN ('complete', 'completed')
+ AND EXISTS (
+     SELECT 1 FROM unavailable_retries
+     WHERE request_id = NEW.id
+       AND state IN ('retrying', 'awaiting_import', 'blocked')
+ )
+BEGIN
+    -- A post-import failure can race the finalizer.  Restore only a blocked
+    -- current attempt whose persisted backend and external ID still match the
+    -- terminal request exactly; this is final proof, never a new acquisition.
+    UPDATE ebook_backend_attempts
+    SET status = 'completed', finished_at = CURRENT_TIMESTAMP,
+        mutation_resolved_at = CASE
+            WHEN mutation_started_at IS NOT NULL THEN CURRENT_TIMESTAMP
+            ELSE mutation_resolved_at
+        END,
+        external_status = 'completed'
+    WHERE request_id = NEW.id
+      AND ordinal = (
+          SELECT current_ordinal FROM ebook_cascades WHERE request_id = NEW.id
+      )
+      AND backend = NEW.service
+      AND external_id IS NOT NULL
+      AND NEW.external_id IS NOT NULL
+      AND lower(external_id) = lower(NEW.external_id)
+      AND EXISTS (
+          SELECT 1 FROM unavailable_retries
+          WHERE request_id = NEW.id AND state = 'blocked'
+      )
+      AND EXISTS (
+          SELECT 1 FROM ebook_cascades
+          WHERE request_id = NEW.id AND state = 'failed'
+            AND identity_key IS NOT NULL
+            AND (
+                final_backend = NEW.service
+                OR (final_backend IS NULL AND mutation_backend = NEW.service)
+            )
+      );
+
+    UPDATE ebook_cascades
+    SET state = 'completed',
+        final_backend = COALESCE(final_backend, NEW.service),
+        finalizer = COALESCE(
+            finalizer,
+            CASE NEW.service
+                WHEN 'lazylibrarian' THEN 'bookbot'
+                WHEN 'shelfarr' THEN 'shelfarr'
+            END
+        ),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE request_id = NEW.id AND state = 'failed'
+      AND EXISTS (
+          SELECT 1 FROM unavailable_retries
+          WHERE request_id = NEW.id AND state = 'blocked'
+      )
+      AND EXISTS (
+          SELECT 1 FROM ebook_backend_attempts
+          WHERE request_id = NEW.id
+            AND ordinal = ebook_cascades.current_ordinal
+            AND status = 'completed'
+            AND backend = NEW.service
+            AND external_id IS NOT NULL
+            AND NEW.external_id IS NOT NULL
+            AND lower(external_id) = lower(NEW.external_id)
+      );
+
+    UPDATE unavailable_retries
+    SET state = 'fulfilled', final_import_state = 'verified',
+        fulfilled_at = CURRENT_TIMESTAMP, next_retry_at = NULL,
+        expired_at = NULL, updated_at = CURRENT_TIMESTAMP
+    WHERE request_id = NEW.id
+      AND state IN ('retrying', 'awaiting_import', 'blocked')
+      AND (
+          state != 'blocked'
+          OR EXISTS (
+              SELECT 1 FROM ebook_cascades
+              WHERE request_id = NEW.id AND state = 'completed'
+                AND (
+                    (final_backend = 'lazylibrarian' AND finalizer = 'bookbot')
+                    OR (final_backend = 'shelfarr' AND finalizer = 'shelfarr')
+                )
+          )
+      );
+
+    UPDATE requests
+    SET notified_at = NULL
+    WHERE id = NEW.id
+      AND EXISTS (
+          SELECT 1 FROM unavailable_retries
+          WHERE request_id = NEW.id AND state = 'fulfilled'
+      );
+
+    INSERT INTO events (request_id, event_type, message)
+    SELECT NEW.id,
+           'unavailable_retry_fulfilled',
+           'Unavailable retry resolved by verified final-library import'
+    WHERE EXISTS (
+        SELECT 1 FROM unavailable_retries
+        WHERE request_id = NEW.id AND state = 'fulfilled'
+    );
 END;

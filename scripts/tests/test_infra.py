@@ -1000,6 +1000,13 @@ class ValidationTests(unittest.TestCase):
                           'new', 'processing', 'awaiting_selection',
                           'queued', 'complete', 'completed'
                       );
+                CREATE UNIQUE INDEX requests_active_ll_hash_uq
+                    ON requests(lower(external_id))
+                    WHERE service = 'lazylibrarian'
+                      AND external_id IS NOT NULL
+                      AND status IN (
+                          'processing', 'queued', 'complete', 'completed'
+                      );
                 CREATE UNIQUE INDEX requests_active_abba_hash_uq
                     ON requests(lower(external_id))
                     WHERE service = 'abba'
@@ -1050,6 +1057,218 @@ class ValidationTests(unittest.TestCase):
                 "canonical_duplicate" if canonical_request_id is not None else None,
                 candidate_id,
                 canonical_request_id,
+            ),
+        )
+
+    @staticmethod
+    def _insert_huey_validation_retry(
+        connection: sqlite3.Connection,
+        request_id: int,
+        *,
+        identity_key: str | None = None,
+        state: str = "queued",
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        identity_key = identity_key or ("a" * 64)
+        metadata = metadata or {
+            "fingerprint": "b" * 64,
+            "label": "Example Book — Example Author",
+            "work_id": "openlibrary:OL1W",
+            "source_work_ids": ["openlibrary:OL1W"],
+            "title": "Example Book",
+            "author": "Example Author",
+            "year": 2026,
+            "content_kind": "book",
+            "media_type": "ebooks",
+            "book_type": "ebook",
+        }
+        metadata_json = json.dumps(
+            metadata,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        request_status = {
+            "queued": "failed",
+            "retrying": "processing",
+            "awaiting_import": "queued",
+            "blocked": "failed",
+            "fulfilled": "complete",
+            "expired": "failed",
+        }[state]
+        cascade_state = {
+            "queued": "failed",
+            "retrying": "searching",
+            "awaiting_import": "queued",
+            "blocked": "failed",
+            "fulfilled": "completed",
+            "expired": "failed",
+        }[state]
+        current_ordinal = 0 if state in {
+            "retrying",
+            "awaiting_import",
+            "blocked",
+            "fulfilled",
+        } else 1
+        final_backend = (
+            "lazylibrarian"
+            if state in {"awaiting_import", "blocked", "fulfilled"}
+            else None
+        )
+        finalizer = "bookbot" if final_backend else None
+        connection.execute(
+            """
+            INSERT INTO requests(
+                id, discord_user_id, discord_username, channel_id, message_id,
+                media_type, raw_request, title, author, target_key, status,
+                service
+            ) VALUES (?, '1', 'requester', '2', ?, 'ebooks',
+                      'Example Book by Example Author', 'Example Book',
+                      'Example Author', ?, ?, 'lazylibrarian')
+            """,
+            (
+                request_id,
+                f"ebook-message-{request_id}",
+                f"ebooks:{request_id}",
+                request_status,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO ebook_cascades(
+                request_id, policy_json, current_ordinal, state, identity_key,
+                identity_fingerprint, identity_json, final_backend, finalizer
+            ) VALUES (?, '["lazylibrarian","shelfarr"]', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                current_ordinal,
+                cascade_state,
+                identity_key,
+                metadata["fingerprint"],
+                metadata_json,
+                final_backend,
+                finalizer,
+            ),
+        )
+        first_attempt_status = {
+            "queued": "miss",
+            "retrying": "searching",
+            "awaiting_import": "queued",
+            "blocked": "failed",
+            "fulfilled": "completed",
+            "expired": "miss",
+        }[state]
+        second_attempt_status = (
+            "miss" if state in {"queued", "expired"} else "pending"
+        )
+        connection.executemany(
+            """
+            INSERT INTO ebook_backend_attempts(
+                request_id, ordinal, backend, status, started_at, finished_at,
+                external_id
+            ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+            """,
+            (
+                (
+                    request_id,
+                    0,
+                    "lazylibrarian",
+                    first_attempt_status,
+                    (
+                        None
+                        if first_attempt_status in {"searching", "queued"}
+                        else "2026-01-01 00:00:00"
+                    ),
+                    ("c" * 40 if final_backend else None),
+                ),
+                (
+                    request_id,
+                    1,
+                    "shelfarr",
+                    second_attempt_status,
+                    (
+                        "2026-01-01 00:00:00"
+                        if second_attempt_status == "miss"
+                        else None
+                    ),
+                    None,
+                ),
+            ),
+        )
+        retained_provider_states = {
+            "queued",
+            "retrying",
+            "awaiting_import",
+            "blocked",
+            "fulfilled",
+        }
+        provider_identity = f"OL{request_id}W"
+        if state in {"awaiting_import", "blocked"}:
+            connection.execute(
+                """
+                UPDATE requests
+                SET external_id = ?, external_status = ?
+                WHERE id = ?
+                """,
+                (
+                    "c" * 40,
+                    "failed" if state == "blocked" else "queued",
+                    request_id,
+                ),
+            )
+        if state in retained_provider_states:
+            connection.execute(
+                """
+                UPDATE ebook_backend_attempts
+                SET backend_identity = ?
+                WHERE request_id = ? AND ordinal = 0
+                """,
+                (provider_identity, request_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO ebook_backend_reservations(
+                    backend, backend_identity, request_id
+                ) VALUES ('lazylibrarian', ?, ?)
+                """,
+                (provider_identity, request_id),
+            )
+        retry_count = 0 if state == "queued" else 7 if state == "expired" else 1
+        last_retry_at = None if retry_count == 0 else "2026-01-08 00:00:00"
+        next_retry_at = "2026-01-08 00:00:00" if state == "queued" else None
+        final_import_state = "verified" if state == "fulfilled" else "pending"
+        fulfilled_at = "2026-01-08 01:00:00" if state == "fulfilled" else None
+        expired_at = "2026-07-07 00:00:00" if state == "expired" else None
+        last_proof_check_at = (
+            "2026-01-08 01:30:00.000001" if state == "blocked" else None
+        )
+        connection.execute(
+            """
+            INSERT INTO unavailable_retries(
+                request_id, media_type, identity_key, metadata_json,
+                canonical_title, canonical_creator, canonical_year,
+                discord_user_id, discord_username, channel_id, message_id,
+                first_unavailable_at, last_retry_at, last_proof_check_at,
+                next_retry_at, retry_count, state, final_import_state,
+                fulfilled_at, expired_at
+            ) VALUES (?, 'ebooks', ?, ?, 'Example Book', 'Example Author', 2026,
+                      '1', 'requester', '2', ?, '2026-01-01 00:00:00', ?, ?,
+                      ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                identity_key,
+                metadata_json,
+                f"ebook-message-{request_id}",
+                last_retry_at,
+                last_proof_check_at,
+                next_retry_at,
+                retry_count,
+                state,
+                final_import_state,
+                fulfilled_at,
+                expired_at,
             ),
         )
 
@@ -2720,7 +2939,7 @@ class ValidationTests(unittest.TestCase):
                     ).ok
                 )
 
-    def test_huey_database_requires_confirmation_and_ebook_cascade_schema(self):
+    def test_huey_database_requires_confirmation_ebook_and_retry_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "huey.db"
             self._create_huey_validation_database(database)
@@ -2746,6 +2965,297 @@ class ValidationTests(unittest.TestCase):
                 )
                 connection.execute("DROP TRIGGER ebook_request_terminal_sync")
             self.assertFalse(validate.huey_database_check(database).ok)
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "huey.db"
+            self._create_huey_validation_database(database)
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    "ALTER TABLE unavailable_retries "
+                    "DROP COLUMN last_proof_check_at"
+                )
+            self.assertFalse(validate.huey_database_check(database).ok)
+
+    def test_huey_database_requires_retry_indexes_and_terminal_triggers(self):
+        objects = (
+            ("INDEX", "requests_active_ll_hash_uq"),
+            ("INDEX", "unavailable_retries_due_idx"),
+            ("INDEX", "unavailable_retries_active_identity_uq"),
+            ("TRIGGER", "unavailable_retry_import_failure_sync"),
+            ("TRIGGER", "unavailable_retry_blocked_completion_guard"),
+            ("TRIGGER", "unavailable_retry_terminal_sync"),
+        )
+        for object_type, name in objects:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "huey.db"
+                self._create_huey_validation_database(database)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    connection.execute(f"DROP {object_type} {name}")
+                self.assertFalse(validate.huey_database_check(database).ok)
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "huey.db"
+            self._create_huey_validation_database(database)
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute("DROP INDEX requests_active_ll_hash_uq")
+                connection.execute(
+                    """
+                    CREATE UNIQUE INDEX requests_active_ll_hash_uq
+                    ON requests(lower(external_id))
+                    WHERE service = 'lazylibrarian'
+                      AND external_id IS NOT NULL
+                      AND status IN ('processing', 'queued')
+                    """
+                )
+            self.assertFalse(validate.huey_database_check(database).ok)
+
+        invalid_predicates = (
+            "state IN ('queued', 'retrying', 'awaiting_import')",
+            "state IN ('queued', 'retrying', 'awaiting_import', 'blocked', "
+            "'fulfilled')",
+        )
+        for predicate in invalid_predicates:
+            with self.subTest(predicate=predicate), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "huey.db"
+                self._create_huey_validation_database(database)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    connection.execute(
+                        "DROP INDEX unavailable_retries_active_identity_uq"
+                    )
+                    connection.execute(
+                        "CREATE UNIQUE INDEX unavailable_retries_active_identity_uq "
+                        "ON unavailable_retries(identity_key) WHERE " + predicate
+                    )
+                self.assertFalse(validate.huey_database_check(database).ok)
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "huey.db"
+            self._create_huey_validation_database(database)
+            with closing(sqlite3.connect(database)) as connection, connection:
+                trigger_sql = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name = 'unavailable_retry_terminal_sync'"
+                ).fetchone()[0]
+                connection.execute("DROP TRIGGER unavailable_retry_terminal_sync")
+                connection.execute(
+                    str(trigger_sql).replace(
+                        "state IN ('retrying', 'awaiting_import', 'blocked')",
+                        "state != 'fulfilled'",
+                    )
+                )
+            self.assertFalse(validate.huey_database_check(database).ok)
+
+    def test_huey_database_accepts_consistent_unavailable_retry_states(self):
+        for state in (
+            "queued",
+            "retrying",
+            "awaiting_import",
+            "blocked",
+            "fulfilled",
+            "expired",
+        ):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "huey.db"
+                self._create_huey_validation_database(database)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    self._insert_huey_validation_retry(connection, 1, state=state)
+                self.assertTrue(validate.huey_database_check(database).ok)
+
+    def test_huey_database_accepts_owned_uncertain_and_blocked_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "huey.db"
+            self._create_huey_validation_database(database)
+            with closing(sqlite3.connect(database)) as connection, connection:
+                self._insert_huey_validation_retry(
+                    connection, 1, state="awaiting_import"
+                )
+                connection.execute(
+                    """
+                    UPDATE ebook_cascades
+                    SET state = 'uncertain',
+                        mutation_backend = 'lazylibrarian',
+                        mutation_started_at = '2026-01-08 00:00:00',
+                        final_backend = NULL, finalizer = NULL
+                    WHERE request_id = 1
+                    """
+                )
+                connection.execute(
+                    """
+                    UPDATE ebook_backend_attempts
+                    SET status = 'uncertain',
+                        mutation_started_at = '2026-01-08 00:00:00',
+                        external_id = NULL,
+                        external_status = 'submission_uncertain'
+                    WHERE request_id = 1 AND ordinal = 0
+                    """
+                )
+
+            self.assertTrue(validate.huey_database_check(database).ok)
+
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute(
+                    """
+                    UPDATE ebook_backend_attempts
+                    SET status = 'failed', finished_at = CURRENT_TIMESTAMP,
+                        mutation_resolved_at = CURRENT_TIMESTAMP
+                    WHERE request_id = 1 AND ordinal = 0
+                    """
+                )
+                connection.execute(
+                    "UPDATE ebook_cascades SET state = 'failed' WHERE request_id = 1"
+                )
+                connection.execute(
+                    "UPDATE requests SET status = 'failed' WHERE id = 1"
+                )
+
+            self.assertTrue(validate.huey_database_check(database).ok)
+
+    def test_huey_database_rejects_unavailable_retry_invariant_corruption(self):
+        def mismatched_identity(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_retry(connection, 1)
+            connection.execute(
+                "UPDATE unavailable_retries SET identity_key = ? WHERE request_id = 1",
+                ("c" * 64,),
+            )
+
+        def duplicate_owner(connection: sqlite3.Connection) -> None:
+            connection.execute("DROP INDEX unavailable_retries_active_identity_uq")
+            self._insert_huey_validation_retry(connection, 1)
+            self._insert_huey_validation_retry(connection, 2)
+
+        def inconsistent_state(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_retry(connection, 1)
+            connection.execute("UPDATE requests SET status = 'processing' WHERE id = 1")
+
+        def unowned_awaiting_import(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_retry(
+                connection, 1, state="awaiting_import"
+            )
+            connection.execute(
+                """
+                UPDATE ebook_cascades
+                SET state = 'uncertain', final_backend = NULL, finalizer = NULL
+                WHERE request_id = 1
+                """
+            )
+
+        def unowned_blocked(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_retry(connection, 1, state="blocked")
+            connection.execute(
+                """
+                UPDATE ebook_cascades
+                SET final_backend = NULL, finalizer = NULL
+                WHERE request_id = 1
+                """
+            )
+
+        def released_blocked_reservation(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_retry(connection, 1, state="blocked")
+            connection.execute(
+                "DELETE FROM ebook_backend_reservations WHERE request_id = 1"
+            )
+
+        def released_retry_reservation(
+            connection: sqlite3.Connection, state: str
+        ) -> None:
+            self._insert_huey_validation_retry(connection, 1, state=state)
+            connection.execute(
+                "DELETE FROM ebook_backend_reservations WHERE request_id = 1"
+            )
+
+        def retained_expired_reservation(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_retry(connection, 1, state="expired")
+            connection.execute(
+                """
+                INSERT INTO ebook_backend_reservations(
+                    backend, backend_identity, request_id
+                ) VALUES ('lazylibrarian', 'OL1W', 1)
+                """
+            )
+
+        def retry_lifecycle_delivery(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_retry(connection, 1, state="retrying")
+            connection.execute(
+                """
+                INSERT INTO notification_deliveries(
+                    request_id, event_key, route, message
+                ) VALUES (1, 'download_queued', 'download-queue', 'must be silent')
+                """
+            )
+
+        def proof_cursor_on_reacquirable_state(
+            connection: sqlite3.Connection,
+        ) -> None:
+            self._insert_huey_validation_retry(connection, 1, state="queued")
+            connection.execute(
+                "UPDATE unavailable_retries "
+                "SET last_proof_check_at = '2026-01-08 01:30:00.000001' "
+                "WHERE request_id = 1"
+            )
+
+        def premature_completion_delivery(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_retry(connection, 1)
+            connection.execute(
+                """
+                INSERT INTO notification_deliveries(
+                    request_id, event_key, route, message
+                ) VALUES (1, 'request_completed', 'request-status', 'too early')
+                """
+            )
+
+        def sensitive_metadata(connection: sqlite3.Connection) -> None:
+            self._insert_huey_validation_retry(connection, 1)
+            raw = connection.execute(
+                "SELECT metadata_json FROM unavailable_retries WHERE request_id = 1"
+            ).fetchone()[0]
+            changed = str(raw).replace("Example Book", "https://private.invalid")
+            connection.execute(
+                "UPDATE unavailable_retries SET metadata_json = ?, "
+                "canonical_title = 'https://private.invalid' WHERE request_id = 1",
+                (changed,),
+            )
+            connection.execute(
+                "UPDATE ebook_cascades SET identity_json = ? WHERE request_id = 1",
+                (changed,),
+            )
+
+        corruptions = {
+            "mismatched identity": mismatched_identity,
+            "duplicate active owner": duplicate_owner,
+            "inconsistent lifecycle state": inconsistent_state,
+            "unowned awaiting import": unowned_awaiting_import,
+            "unowned blocked retry": unowned_blocked,
+            "released blocked reservation": released_blocked_reservation,
+            "released queued reservation": lambda connection: (
+                released_retry_reservation(connection, "queued")
+            ),
+            "released retrying reservation": lambda connection: (
+                released_retry_reservation(connection, "retrying")
+            ),
+            "released awaiting-import reservation": lambda connection: (
+                released_retry_reservation(connection, "awaiting_import")
+            ),
+            "released fulfilled reservation": lambda connection: (
+                released_retry_reservation(connection, "fulfilled")
+            ),
+            "expired retry retained reservation": retained_expired_reservation,
+            "retry lifecycle delivery": retry_lifecycle_delivery,
+            "proof cursor on reacquirable state": proof_cursor_on_reacquirable_state,
+            "premature completion delivery": premature_completion_delivery,
+            "sensitive metadata": sensitive_metadata,
+        }
+        for name, corrupt in corruptions.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "huey.db"
+                self._create_huey_validation_database(database)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    corrupt(connection)
+
+                check = validate.huey_database_check(database)
+
+                self.assertFalse(check.ok)
+                self.assertRegex(check.detail, r"violations=\d+$")
+                self.assertNotIn("private.invalid", check.detail)
 
     def test_huey_database_accepts_inert_abba_canonical_alias(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -220,6 +220,68 @@ request rows because the deployed endpoint ignores offsets. An exact match can
 be attached; fewer than 100 rows with no match proves absence; a full page with
 no match remains quarantined. Do not bypass that horizon with a blind retry.
 
+## Unavailable ebook retry recovery
+
+The silent retry backlog is part of `state/huey/huey.db`, not a separate queue
+service. Its schedule, selected canonical metadata, Discord correlation,
+ownership, and final-import state therefore move with the same transactionally
+copied Huey database as `requests`, `ebook_cascades`, and the notification
+outbox. Restore all of those tables from one checkpoint; never copy an
+`unavailable_retries` row into another database generation or reconstruct it
+from logs.
+
+Normal restart handling is state-specific:
+
+- `queued` retains its exact `next_retry_at`; downtime does not reset the
+  seven-attempt ceiling.
+- Search-safe `retrying` work resumes through the existing ebook cascade and
+  saved work identity. It is not re-parsed and does not ask Discord for another
+  metadata selection.
+- `awaiting_import` retains a proven backend handoff or mutation-uncertain
+  correlation and returns to the normal LazyLibrarian/BookBot or Shelfarr
+  finalizer/correlation reconciliation. A request already marked complete is
+  repaired to `fulfilled` during startup.
+- A definitive post-mutation failure becomes `blocked`. It remains the unique
+  terminal operator-review owner and is never converted into another automatic
+  acquisition attempt. Its backend reservation stays held. Read-only
+  reconciliation may still accept exact final proof from the already-correlated
+  BookBot hash/tag or Shelfarr remote request and atomically repair it to
+  `fulfilled`; it cannot search, submit, cancel, or select another work. Blocked
+  Shelfarr checks rotate by the durable least-recently-checked cursor, which is
+  claimed atomically and survives restart instead of repeatedly polling only
+  the first bounded batch.
+- `fulfilled` and `expired` are terminal. Restart does not reacquire or renotify
+  either state.
+
+All retry reconciliation remains silent until an exact final-library proof
+makes the original request complete. Do not infer success from a search hit,
+backend acceptance, qBittorrent state, or completed payload. The only success
+boundaries are BookBot's exact-hash ledger-validated DAS copy for a
+LazyLibrarian acquisition and Shelfarr's correlated completed DAS publication.
+Once an item is `blocked`, acquisition never resumes automatically. BookBot may
+finish only the exact retained LazyLibrarian hash with its exact Huey tag after
+the `ebooks` CategorySpec validates a Books-library destination. A torrent
+drifted into `manga-comics` or another category is not ebook final proof. Huey
+may poll only the exact retained Shelfarr request ID for `completed`; every other
+state remains blocked and silent. Investigate its retained correlation without
+resubmitting it.
+
+Use the bounded queue listing and guarded `retry_admin.py force` command in [the
+service runbook](services.md#silent-unavailable-ebook-retries). The force
+operation is valid only for `queued`, pre-mutation ownership. Never force
+`retrying`, `awaiting_import`, or `blocked`, edit retry timestamps with raw SQL,
+clear the active-identity index, or delete a row to make a live request bypass
+ownership. An unresolved saved identity is a silent failed attempt, not
+authority to select a nearby edition.
+
+For restoration or rollback, stop Huey and BookBot along with both ebook
+acquisition services, restore the Huey database without live WAL/SHM sidecars,
+then start the schema-owning Huey generation before allowing import completion
+writes. A version that predates `unavailable_retries` does not understand this
+ownership. Treat removal of the table, its partial unique index, or its terminal
+triggers as a stateful schema rollback and use a matching pre-feature checkpoint;
+do not run downgraded code against the migrated database.
+
 ## ABBA feature rollback
 
 `ABBA_ENABLED` owns only new audiobook acquisition. Shelfarr remains ebook-only,

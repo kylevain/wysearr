@@ -80,7 +80,7 @@ class FakeQbittorrent:
 
 class FakeHuey:
     def __init__(self) -> None:
-        self.completed: list[tuple[str, Path, str]] = []
+        self.completed: list[tuple[str, Path, str, str | None]] = []
         self.failures: list[tuple[str, str, str]] = []
         self.metadata: AudiobookMetadata | None = None
         self.metadata_error: Exception | None = None
@@ -94,8 +94,17 @@ class FakeHuey:
             raise self.metadata_error
         return self.metadata
 
-    def complete(self, torrent_hash: str, destination: Path, tags: str = "") -> bool:
-        self.completed.append((torrent_hash, destination, tags))
+    def complete(
+        self,
+        torrent_hash: str,
+        destination: Path,
+        tags: str = "",
+        *,
+        source_category: str | None = None,
+    ) -> bool:
+        self.completed.append(
+            (torrent_hash, destination, tags, source_category)
+        )
         return True
 
     def failed(self, torrent_hash: str, error: object, tags: str = "") -> bool:
@@ -197,6 +206,10 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse((destination / ".bookbot-import.json").exists())
         self.assertEqual([(HASH_A, "ebooks-imported")], qbit.set_calls)
         self.assertEqual(2, len(self.huey.completed))
+        self.assertEqual(
+            ["ebooks", "ebooks"],
+            [call[3] for call in self.huey.completed],
+        )
         self.assertTrue(self.config.health_path.is_file())
 
     def test_trusted_abba_audiobook_metadata_is_staged_with_import(self) -> None:
