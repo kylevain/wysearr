@@ -1974,6 +1974,13 @@ def _settings_equal(current: Any, desired: Any) -> bool:
     return str(current) == str(desired)
 
 
+def _bazarr_base_url_equal(current: Any, desired: Any) -> bool:
+    """Treat Bazarr's two representations of an application root as equal."""
+    if current is None:
+        return False
+    return str(current).strip().rstrip("/") == str(desired).strip().rstrip("/")
+
+
 def english_language_profile(profile_id: int) -> dict[str, Any]:
     item_id = 1
     return {
@@ -2078,7 +2085,13 @@ def build_bazarr_settings_form(
         ("subf2m", "verify_ssl", "settings-subf2m-verify_ssl", True),
     )
     for section, key, form_key, desired in desired_settings:
-        if not _settings_equal(_nested_setting(settings, section, key), desired):
+        current = _nested_setting(settings, section, key)
+        matches = (
+            _bazarr_base_url_equal(current, desired)
+            if key == "base_url"
+            else _settings_equal(current, desired)
+        )
+        if not matches:
             form[form_key] = _form_value(desired)
 
     current_providers = _nested_setting(settings, "general", "enabled_providers")
@@ -2203,6 +2216,22 @@ def bootstrap(
         f"ARR qBittorrent integrations verified ({arr_updates} repaired)."
     )
 
+    # Bazarr's ping can remain responsive while a synchronization job ties up
+    # its authenticated settings routes.  Converge it before the slower live
+    # indexer tests and give those read-only routes a wider retry window.
+    bazarr_changed = configure_bazarr(
+        root,
+        environment,
+        api_keys["SONARR_API_KEY"],
+        api_keys["RADARR_API_KEY"],
+        timeout=timeout,
+        retries=max(retries, 10),
+    )
+    reporter.info(
+        "Bazarr Sonarr/Radarr, English profile, and providers verified"
+        + (" (updated)." if bazarr_changed else ".")
+    )
+
     all_secrets = [
         qbit_password,
         *api_keys.values(),
@@ -2218,19 +2247,6 @@ def bootstrap(
     )
     reporter.info(
         f"Prowlarr applications and {len(indexers)} public indexer(s) verified."
-    )
-
-    bazarr_changed = configure_bazarr(
-        root,
-        environment,
-        api_keys["SONARR_API_KEY"],
-        api_keys["RADARR_API_KEY"],
-        timeout=timeout,
-        retries=retries,
-    )
-    reporter.info(
-        "Bazarr Sonarr/Radarr, English profile, and providers verified"
-        + (" (updated)." if bazarr_changed else ".")
     )
 
 

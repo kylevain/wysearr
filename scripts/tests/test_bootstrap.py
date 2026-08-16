@@ -366,7 +366,9 @@ class QbittorrentTests(unittest.TestCase):
                 bootstrap, "configure_arr_services", return_value=0
             ) as configure_arr,
             mock.patch.object(bootstrap, "configure_prowlarr", return_value=[]),
-            mock.patch.object(bootstrap, "configure_bazarr", return_value=False),
+            mock.patch.object(
+                bootstrap, "configure_bazarr", return_value=False
+            ) as configure_bazarr,
             mock.patch.object(
                 bootstrap, "restart_qbittorrent_with_rotation_guard"
             ) as restart,
@@ -377,6 +379,7 @@ class QbittorrentTests(unittest.TestCase):
         restart.assert_not_called()
         qbit.set_preferences.assert_not_called()
         self.assertFalse(configure_arr.call_args.kwargs["force_credentials"])
+        self.assertEqual(10, configure_bazarr.call_args.kwargs["retries"])
 
     def test_bootstrap_restarts_only_after_signaled_credential_repair(self):
         authenticated = mock.Mock()
@@ -1564,6 +1567,8 @@ class BazarrTests(unittest.TestCase):
         self.assertEqual(form["languages-enabled"], ["fr", "en"])
         self.assertEqual(form["settings-sonarr-ip"], "sonarr")
         self.assertEqual(form["settings-radarr-ip"], "radarr")
+        self.assertEqual(form["settings-sonarr-base_url"], "/")
+        self.assertEqual(form["settings-radarr-base_url"], "/")
         self.assertEqual(form["settings-sonarr-apikey"], "sonarr-secret")
         self.assertEqual(form["settings-radarr-apikey"], "radarr-secret")
         self.assertEqual(
@@ -1607,15 +1612,30 @@ class BazarrTests(unittest.TestCase):
                 "verify_ssl": True,
             },
         }
-        form, profile_id = bootstrap.build_bazarr_settings_form(
+        for root_base_url in ("/", ""):
+            with self.subTest(root_base_url=root_base_url):
+                settings["sonarr"]["base_url"] = root_base_url
+                settings["radarr"]["base_url"] = root_base_url
+                form, profile_id = bootstrap.build_bazarr_settings_form(
+                    settings,
+                    [bootstrap.english_language_profile(1)],
+                    [{"code2": "en", "enabled": True}],
+                    "sonarr-secret",
+                    "radarr-secret",
+                )
+                self.assertEqual(profile_id, 1)
+                self.assertEqual(form, {})
+
+        settings["sonarr"]["base_url"] = "/sonarr"
+        form, _ = bootstrap.build_bazarr_settings_form(
             settings,
             [bootstrap.english_language_profile(1)],
             [{"code2": "en", "enabled": True}],
             "sonarr-secret",
             "radarr-secret",
         )
-        self.assertEqual(profile_id, 1)
-        self.assertEqual(form, {})
+        self.assertEqual("/", form["settings-sonarr-base_url"])
+        self.assertNotIn("settings-radarr-base_url", form)
 
 
 class HttpAndSecretSafetyTests(unittest.TestCase):
