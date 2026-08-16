@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -14,6 +16,25 @@ from bookbot_lib.huey import HueyUpdater
 
 
 HASH = "a" * 40
+
+
+class HealthcheckImportTests(unittest.TestCase):
+    def test_health_module_does_not_load_worker_or_http_stack(self) -> None:
+        processing_root = Path(__file__).resolve().parents[1]
+        probe = (
+            "import sys; import bookbot_lib.health; "
+            "blocked = {'bookbot_lib.service', 'requests'} & set(sys.modules); "
+            "sys.exit(','.join(sorted(blocked)) if blocked else 0)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=processing_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
 
 
 class HueyUpdaterTests(unittest.TestCase):
