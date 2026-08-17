@@ -4910,6 +4910,22 @@ class RequestStore:
             rows = connection.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
 
+    def update_trusted_library_event_source_path(
+        self, event_id: int, source_path: str
+    ) -> bool:
+        if not source_path:
+            raise ValueError("Trusted event source path cannot be empty")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE trusted_library_events
+                SET source_path = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND state != 'completed'
+                """,
+                (str(source_path), int(event_id)),
+            )
+            return cursor.rowcount == 1
+
     def transition_trusted_library_event(
         self,
         event_id: int,

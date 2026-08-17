@@ -167,8 +167,25 @@ class PhysicalMediaTests(unittest.TestCase):
         self.assertEqual(call["fingerprint"], manifest["sha256"])
         self.assertEqual(
             call["source_path"],
-            "/downloads/physical-media/incoming/arm-test/feature.mkv",
+            "/downloads/physical-media/incoming/arm-test/Into the Woods (2014).mkv",
         )
+        self.assertFalse((self.intake_root / "arm-test" / "feature.mkv").exists())
+        self.assertTrue((self.intake_root / "arm-test" / "Into the Woods (2014).mkv").is_file())
+        rewritten = json.loads((self.intake_root / "arm-test" / "manifest.json").read_text())
+        self.assertEqual(rewritten["file"], "Into the Woods (2014).mkv")
+
+    def test_generic_physical_filename_is_made_deterministic_before_preview(self):
+        _path, manifest = self.delivery(title="Greedy", year=1994)
+        self.intake.reconcile()
+        self.intake.reconcile()
+        event = self.event()
+        self.assertEqual(event["state"], "importing")
+        self.assertEqual(
+            self.radarr.start_calls[0]["source_path"],
+            "/downloads/physical-media/incoming/arm-test/Greedy (1994).mkv",
+        )
+        deterministic = self.intake_root / "arm-test" / "Greedy (1994).mkv"
+        self.assertEqual(hashlib.sha256(deterministic.read_bytes()).hexdigest(), manifest["sha256"])
 
     def test_manual_import_uses_exact_nested_movie_preview_correlation(self):
         source_path = "/downloads/physical-media/incoming/arm-test/movie.mkv"
@@ -265,7 +282,7 @@ class PhysicalMediaTests(unittest.TestCase):
         self.intake.reconcile()
         final = self.media_root / "movies" / "Into the Woods (2014)" / "movie.mkv"
         final.parent.mkdir(parents=True)
-        source = self.intake_root / "arm-test" / "feature.mkv"
+        source = self.intake_root / "arm-test" / "Into the Woods (2014).mkv"
         final.write_bytes(source.read_bytes())
         self.radarr.imported = {"path": "/media/movies/Into the Woods (2014)/movie.mkv"}
         self.intake.reconcile()
@@ -285,7 +302,7 @@ class PhysicalMediaTests(unittest.TestCase):
         self.intake.reconcile()
         final = self.media_root / "movies" / "movie.mkv"
         final.parent.mkdir(parents=True)
-        final.write_bytes((self.intake_root / "arm-test" / "feature.mkv").read_bytes())
+        final.write_bytes((self.intake_root / "arm-test" / "Into the Woods (2014).mkv").read_bytes())
         self.radarr.imported = {"path": "/media/movies/movie.mkv"}
         self.intake.reconcile()
         for _ in range(4):
@@ -298,7 +315,7 @@ class PhysicalMediaTests(unittest.TestCase):
         manifest_path, _manifest = self.delivery()
         self.intake.reconcile()
         self.intake.reconcile()
-        source = self.intake_root / "arm-test" / "feature.mkv"
+        source = self.intake_root / "arm-test" / "Into the Woods (2014).mkv"
         final = self.media_root / "movies" / "Into the Woods (2014)" / "movie.mkv"
         final.parent.mkdir(parents=True)
         source.rename(final)

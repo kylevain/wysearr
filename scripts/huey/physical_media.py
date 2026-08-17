@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - direct container entrypoint
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _IMDB = re.compile(r"\Att[0-9]{7,10}\Z")
 _SAFE_TITLE = re.compile(r"\A[^\x00-\x1f/\\]{1,160}\Z")
+_SAFE_FILENAME_CHAR = re.compile(r"[^A-Za-z0-9 ._()'&!+-]+")
 _TERMINAL_STATES = frozenset({"completed", "manual_review", "failed"})
 _ACTIVE_STATES = (
     "received",
@@ -54,6 +55,24 @@ def _clean_title(value: object) -> str:
     if not _SAFE_TITLE.fullmatch(title) or any(marker in title for marker in ("@", "`", "<", ">")):
         raise PhysicalMediaError("movie title is missing or unsafe")
     return title
+
+
+def _deterministic_mkv_name(title: object, year: object) -> str:
+    clean = _clean_title(title)
+    parsed_year = _integer(year, "movie year", 1878, 2200)
+    safe_title = _SAFE_FILENAME_CHAR.sub(" ", clean)
+    safe_title = re.sub(r"\s+", " ", safe_title).strip(" .")
+    if not safe_title:
+        raise PhysicalMediaError("movie title is unsafe for import filename")
+    return f"{safe_title} ({parsed_year}).mkv"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def load_delivery_manifest(
@@ -110,8 +129,8 @@ def load_delivery_manifest(
     with media_path.open("rb") as stream:
         if stream.read(4) != b"\x1aE\xdf\xa3":
             raise PhysicalMediaError("delivered file does not have an MKV/EBML header")
-        digest = hashlib.sha256()
         stream.seek(0)
+        digest = hashlib.sha256()
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     fingerprint = str(raw.get("sha256") or "").casefold()
@@ -348,6 +367,72 @@ class PhysicalMediaIntake:
             return False
         return True
 
+    def _verify_staged_source(self, path: Path, event: Mapping[str, Any]) -> None:
+        if path.is_symlink() or not path.is_file():
+            raise PhysicalMediaError("trusted physical-media MKV is missing")
+        if path.stat().st_size != int(event["size_bytes"]):
+            raise PhysicalMediaError("trusted physical-media MKV size changed before import")
+        if _sha256_file(path) != str(event["source_fingerprint"]):
+            raise PhysicalMediaError("trusted physical-media MKV checksum changed before import")
+
+    def _rewrite_manifest_file(self, manifest_path: Path, file_name: str) -> None:
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise PhysicalMediaError("delivery manifest is not valid UTF-8 JSON") from error
+        if not isinstance(raw, dict):
+            raise PhysicalMediaError("delivery manifest version is unsupported")
+        raw["file"] = file_name
+        temporary = manifest_path.with_name(f"{manifest_path.name}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(raw, sort_keys=True, separators=(",", ": ")) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(manifest_path)
+        except OSError as error:
+            raise PhysicalMediaError("failed to update deterministic import manifest") from error
+
+    def _prepare_import_source(self, event: Mapping[str, Any]) -> Path:
+        source_path = Path(str(event["source_path"]))
+        try:
+            source_path.relative_to(self.intake_root)
+        except ValueError as error:
+            raise PhysicalMediaError(
+                "delivery resolves outside the physical-media intake"
+            ) from error
+        if source_path.parent.is_symlink() or source_path.parent.parent != self.intake_root:
+            raise PhysicalMediaError("delivery directory cannot be a symlink")
+
+        desired = source_path.with_name(
+            _deterministic_mkv_name(event.get("title"), event.get("year"))
+        )
+        source = source_path
+        if not source.exists():
+            matches = [
+                candidate
+                for candidate in source_path.parent.glob("*.mkv")
+                if candidate.is_file()
+                and not candidate.is_symlink()
+                and candidate.stat().st_size == int(event["size_bytes"])
+                and _sha256_file(candidate) == str(event["source_fingerprint"])
+            ]
+            if len(matches) != 1:
+                raise PhysicalMediaError("trusted physical-media MKV is missing")
+            source = matches[0]
+
+        self._verify_staged_source(source, event)
+        if source != desired:
+            if desired.exists() and desired != source:
+                self._verify_staged_source(desired, event)
+                source.unlink()
+            else:
+                source.rename(desired)
+            source = desired
+        self._rewrite_manifest_file(source.parent / "manifest.json", source.name)
+        self.store.update_trusted_library_event_source_path(int(event["id"]), str(source))
+        return source
+
     def _final_file(self, event: Mapping[str, Any]) -> str | None:
         movie_id = event.get("radarr_movie_id")
         if not movie_id:
@@ -363,6 +448,8 @@ class PhysicalMediaIntake:
             raise PhysicalMediaError("Radarr final file is not a readable regular DAS file")
         if local.stat().st_size != int(event["size_bytes"]):
             raise PhysicalMediaError("Radarr final DAS file size differs from the validated MKV")
+        if _sha256_file(local) != str(event["source_fingerprint"]):
+            raise PhysicalMediaError("Radarr final DAS file checksum differs from the validated MKV")
         return str(path)
 
     def _attention(self, event: Mapping[str, Any], detail: str, *, failed: bool = False) -> None:
@@ -464,12 +551,13 @@ class PhysicalMediaIntake:
                     changed += 1
                     continue
                 if state == "identity_resolved":
+                    source_path = self._prepare_import_source(event)
                     self.store.transition_trusted_library_event(
                         int(event["id"]), "import_submitting"
                     )
                     command_id = self.radarr.start_manual_import(
                         movie_id=int(event["radarr_movie_id"]),
-                        source_path=self._radarr_source_path(str(event["source_path"])),
+                        source_path=self._radarr_source_path(str(source_path)),
                         fingerprint=str(event["source_fingerprint"]),
                     )
                     self.store.transition_trusted_library_event(
