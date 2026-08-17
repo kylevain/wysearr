@@ -72,6 +72,21 @@ class PreviewRadarr(PhysicalRadarrClient):
         raise AssertionError(f"unexpected request: {method} {endpoint}")
 
 
+class ExistingMovieRadarr(PhysicalRadarrClient):
+    def __init__(self, movies):
+        self.movies = movies
+        self.calls = []
+
+    def _api(self, endpoint):
+        return endpoint
+
+    def _request(self, method, endpoint, **kwargs):
+        self.calls.append((method, endpoint, kwargs))
+        if method == "GET" and endpoint == "movie":
+            return self.movies
+        raise AssertionError(f"unexpected request: {method} {endpoint}")
+
+
 class PhysicalMediaTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -205,6 +220,44 @@ class PhysicalMediaTests(unittest.TestCase):
                 fingerprint="a" * 64,
             )
         self.assertEqual(len(radarr.calls), 1)
+
+    def test_existing_radarr_movie_is_reused_by_exact_durable_identity(self):
+        existing = {
+            "id": 38,
+            "title": "The Secret of My Success",
+            "year": 1987,
+            "imdbId": "tt0093936",
+            "tmdbId": 10021,
+            "hasFile": False,
+        }
+        radarr = ExistingMovieRadarr([existing])
+        movie = radarr.ensure_movie({
+            "title": "The Secret of My Success",
+            "year": 1987,
+            "imdbId": "tt0093936",
+            "tmdbId": 10021,
+        })
+        self.assertEqual(movie, existing)
+        self.assertEqual([(call[0], call[1]) for call in radarr.calls], [("GET", "movie")])
+
+    def test_existing_radarr_movie_requires_all_available_ids_to_match(self):
+        radarr = ExistingMovieRadarr([
+            {
+                "id": 38,
+                "title": "The Secret of My Success",
+                "year": 1987,
+                "imdbId": "tt0093936",
+                "tmdbId": 99999,
+            }
+        ])
+        with self.assertRaises(AssertionError):
+            radarr.ensure_movie({
+                "title": "The Secret of My Success",
+                "year": 1987,
+                "imdbId": "tt0093936",
+                "tmdbId": 10021,
+            })
+        self.assertEqual(len(radarr.calls), 2)
 
     def test_success_requires_readable_nonempty_das_file_and_notifies_once(self):
         self.delivery()

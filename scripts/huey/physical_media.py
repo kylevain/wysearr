@@ -167,6 +167,26 @@ class PhysicalRadarrClient(RadarrClient):
     def ensure_movie(self, candidate: Mapping[str, Any]) -> Mapping[str, Any]:
         if candidate.get("id"):
             return self._get_entity(int(candidate["id"]))
+        movies = self._request("GET", self._api("movie"))
+        if not isinstance(movies, list):
+            raise ServiceError("radarr returned an invalid movie library")
+        tmdb_id = int(candidate.get("tmdbId") or 0)
+        imdb_id = str(candidate.get("imdbId") or "")
+        existing = [
+            movie
+            for movie in movies
+            if isinstance(movie, Mapping)
+            and bool(tmdb_id or imdb_id)
+            and (not tmdb_id or int(movie.get("tmdbId") or 0) == tmdb_id)
+            and (not imdb_id or str(movie.get("imdbId") or "") == imdb_id)
+            and str(movie.get("title") or "").casefold()
+            == str(candidate.get("title") or "").casefold()
+            and int(movie.get("year") or 0) == int(candidate.get("year") or 0)
+        ]
+        if len(existing) == 1:
+            return existing[0]
+        if len(existing) > 1:
+            raise PhysicalMediaError("Radarr has multiple matching movie library entries")
         payload = self._payload(
             candidate, self._discover_root_folder(), self._discover_quality_profile()
         )
