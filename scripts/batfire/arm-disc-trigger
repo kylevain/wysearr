@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+raw_dev="${1:-}"
+dev="${raw_dev#/dev/}"
+
+case "$dev" in
+  sr[0-9]*) ;;
+  *)
+    logger -t arm-disc-trigger "ignoring non-optical device argument: ${raw_dev:-<empty>}"
+    exit 0
+    ;;
+esac
+
+dev_path="/dev/$dev"
+lock_path="/run/lock/arm-disc-trigger.lock"
+state_dir="/run/arm-physical-media"
+last_sig_path="$state_dir/last-triggered-signature"
+
+log() {
+  logger -t arm-disc-trigger -- "$*"
+}
+
+prop_from() {
+  printf '%s\n' "$1" | awk -F= -v key="$2" '$1==key {print substr($0, index($0, "=") + 1); exit}'
+}
+
+exec 9>"$lock_path"
+if ! flock -n 9; then
+  log "another trigger is already evaluating; ignoring duplicate event for $dev_path"
+  exit 0
+fi
+
+mkdir -p "$state_dir"
+
+props=""
+size_bytes=""
+media=""
+for _ in $(seq 1 45); do
+  props="$(udevadm info --query=property --name="$dev_path" 2>/dev/null || true)"
+  size_bytes="$(blockdev --getsize64 "$dev_path" 2>/dev/null || true)"
+  media="$(prop_from "$props" ID_CDROM_MEDIA)"
+  if [[ "$media" == "1" && "$size_bytes" =~ ^[0-9]+$ && "$size_bytes" -gt 0 ]]; then
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$media" != "1" ]]; then
+  if [[ -f "$last_sig_path" ]] && grep -q "^$dev:" "$last_sig_path"; then
+    rm -f "$last_sig_path"
+    log "rearmed $dev_path after no-media event"
+  else
+    log "ignoring $dev_path because no optical media is present"
+  fi
+  exit 0
+fi
+
+if ! [[ "$size_bytes" =~ ^[0-9]+$ ]] || [[ "$size_bytes" -le 0 ]]; then
+  log "ignoring $dev_path because media size is not readable"
+  exit 0
+fi
+
+dvd="$(prop_from "$props" ID_CDROM_MEDIA_DVD)"
+bd="$(prop_from "$props" ID_CDROM_MEDIA_BD)"
+if [[ "$dvd" != "1" && "$bd" != "1" ]]; then
+  rm -f "$last_sig_path"
+  log "ignoring unsupported optical media in $dev_path"
+  exit 0
+fi
+
+blkid_props="$(blkid -p -o export "$dev_path" 2>/dev/null || true)"
+uuid="$(prop_from "$blkid_props" UUID)"
+label="$(prop_from "$blkid_props" LABEL)"
+fs_type="$(prop_from "$blkid_props" TYPE)"
+diskseq="$(prop_from "$props" DISKSEQ)"
+serial="$(prop_from "$props" ID_SERIAL_SHORT)"
+signature="$dev:${diskseq:-no-diskseq}:${uuid:-no-uuid}:${label:-no-label}:${serial:-no-serial}:$size_bytes"
+
+if [[ -f "$last_sig_path" ]] && [[ "$(cat "$last_sig_path")" == "$signature" ]]; then
+  log "ignoring duplicate media-ready event for $dev_path signature=$signature"
+  exit 0
+fi
+
+if ! docker inspect --format '{{.State.Running}}' arm-rippers 2>/dev/null | grep -qx true; then
+  log "arm-rippers is not running; refusing to trigger ARM for $dev_path"
+  exit 1
+fi
+
+if docker exec arm-rippers pgrep -f '/opt/arm/arm/ripper/main.py' >/dev/null 2>&1; then
+  log "ARM ripper is already running; ignoring duplicate event for $dev_path"
+  exit 0
+fi
+
+printf '%s\n' "$signature" > "$last_sig_path.tmp"
+mv "$last_sig_path.tmp" "$last_sig_path"
+
+log "starting ARM for $dev_path signature=$signature"
+exec docker exec \
+  --env "DEVNAME=$dev_path" \
+  --env "ID_CDROM_MEDIA=1" \
+  --env "ID_CDROM_MEDIA_DVD=${dvd:-}" \
+  --env "ID_CDROM_MEDIA_BD=${bd:-}" \
+  --env "ID_FS_TYPE=${fs_type:-}" \
+  --env "ID_FS_LABEL=${label:-}" \
+  arm-rippers /sbin/setuser arm /opt/arm/scripts/docker/docker_arm_wrapper.sh "$dev"

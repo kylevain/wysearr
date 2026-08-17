@@ -1,0 +1,4 @@
+# Host-owned ARM trigger. Keep the hardware event boundary on BatFire and
+# invoke the existing ARM container only after the helper confirms media.
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sr[0-9]", TAG+="systemd", ENV{SYSTEMD_WANTS}+="arm-disc-trigger@%k.service"
+ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]", TAG+="systemd", ENV{SYSTEMD_WANTS}+="arm-disc-trigger@%k.service"
