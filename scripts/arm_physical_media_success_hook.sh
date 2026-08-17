@@ -33,7 +33,7 @@ with sqlite3.connect(database) as connection:
         SELECT job_id, title, year, imdb_id, path
         FROM job
         WHERE stop_time IS NULL
-          AND video_type = 'movie'
+          AND video_type IN ('movie', 'unknown')
           AND disctype IN ('dvd', 'bluray')
           AND COALESCE(errors, '') = ''
         ORDER BY job_id DESC
