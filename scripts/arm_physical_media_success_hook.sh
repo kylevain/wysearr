@@ -33,11 +33,18 @@ with sqlite3.connect(database) as connection:
         SELECT
             j.job_id, j.title, j.year, j.imdb_id, j.path,
             j.label, j.crc_id, j.title_auto, j.year_auto, j.imdb_id_auto,
-            t.length AS duration_seconds
+            (
+                SELECT tr.length
+                FROM track tr
+                WHERE tr.job_id = j.job_id
+                  AND tr.length IS NOT NULL
+                ORDER BY COALESCE(tr.main_feature, 0) DESC,
+                         COALESCE(tr.ripped, 0) DESC,
+                         CAST(tr.length AS INTEGER) DESC,
+                         CAST(tr.track_number AS INTEGER) ASC
+                LIMIT 1
+            ) AS duration_seconds
         FROM job j
-        LEFT JOIN track t
-          ON t.job_id = j.job_id
-         AND COALESCE(t.main_feature, 0) = 1
         WHERE j.stop_time IS NULL
           AND j.video_type IN ('movie', 'unknown')
           AND j.disctype IN ('dvd', 'bluray')
