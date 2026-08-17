@@ -10,6 +10,14 @@ imdb_id="${4:-}"
 remote_host="${WYSEARR_SSH_HOST:-192.168.4.86}"
 remote_user="${WYSEARR_SSH_USER:-wyseadmin}"
 remote_root="${WYSEARR_PHYSICAL_ROOT:-/home/wyseadmin/homelab/state/physical-media/incoming}"
+ssh_identity="${WYSEARR_SSH_IDENTITY:-}"
+
+ssh_args=(-o BatchMode=yes -o StrictHostKeyChecking=yes)
+if [ -n "$ssh_identity" ]; then
+    [ -r "$ssh_identity" ] || { echo "SSH identity is unreadable" >&2; exit 2; }
+    ssh_args+=(-i "$ssh_identity")
+fi
+printf -v rsync_rsh '%q ' ssh "${ssh_args[@]}"
 
 [ -f "$source_mkv" ] || { echo "source MKV is missing" >&2; exit 2; }
 [ "${source_mkv##*.}" = mkv ] || [ "${source_mkv##*.}" = MKV ] || {
@@ -46,15 +54,15 @@ with open(sys.argv[1], "w", encoding="utf-8") as stream:
 PY
 
 remote_dir="$remote_root/$delivery_id"
-ssh -o BatchMode=yes -- "$remote_user@$remote_host" \
+ssh "${ssh_args[@]}" -- "$remote_user@$remote_host" \
     "mkdir -p -- '$remote_dir' && chmod 775 -- '$remote_dir'"
-rsync --partial --append-verify --protect-args -- \
+rsync -e "$rsync_rsh" --partial --append-verify --protect-args -- \
     "$source_mkv" "$remote_user@$remote_host:$remote_dir/feature.mkv.partial"
-ssh -o BatchMode=yes -- "$remote_user@$remote_host" \
+ssh "${ssh_args[@]}" -- "$remote_user@$remote_host" \
     "mv -- '$remote_dir/feature.mkv.partial' '$remote_dir/feature.mkv'"
-rsync --protect-args -- "$manifest_tmp" \
+rsync -e "$rsync_rsh" --protect-args -- "$manifest_tmp" \
     "$remote_user@$remote_host:$remote_dir/manifest.json.partial"
-ssh -o BatchMode=yes -- "$remote_user@$remote_host" \
+ssh "${ssh_args[@]}" -- "$remote_user@$remote_host" \
     "mv -- '$remote_dir/manifest.json.partial' '$remote_dir/manifest.json'"
 
 printf 'Delivered %s to %s:%s\n' "$sha256" "$remote_host" "$remote_dir"
