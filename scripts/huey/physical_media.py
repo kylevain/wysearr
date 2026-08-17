@@ -185,13 +185,27 @@ class PhysicalRadarrClient(RadarrClient):
             self._api("manualimport"),
             params={
                 "folder": str(Path(source_path).parent),
-                "movieId": int(movie_id),
                 "filterExistingFiles": "true",
             },
         )
         if not isinstance(candidates, list):
             raise ServiceError("radarr returned an invalid manual-import preview")
-        exact = [item for item in candidates if isinstance(item, Mapping) and item.get("path") == source_path]
+        exact = [
+            item
+            for item in candidates
+            if isinstance(item, Mapping)
+            and item.get("path") == source_path
+            and int(
+                item.get("movieId")
+                or (
+                    item.get("movie", {}).get("id")
+                    if isinstance(item.get("movie"), Mapping)
+                    else 0
+                )
+                or 0
+            )
+            == int(movie_id)
+        ]
         if len(exact) != 1 or exact[0].get("rejections"):
             raise PhysicalMediaError("Radarr manual-import preview rejected or could not correlate the MKV")
         preview = exact[0]

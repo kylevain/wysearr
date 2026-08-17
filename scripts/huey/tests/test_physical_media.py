@@ -13,7 +13,12 @@ if str(HUEY_DIR) not in sys.path:
     sys.path.insert(0, str(HUEY_DIR))
 
 from database import RequestStore
-from physical_media import PhysicalMediaError, PhysicalMediaIntake, load_delivery_manifest
+from physical_media import (
+    PhysicalMediaError,
+    PhysicalMediaIntake,
+    PhysicalRadarrClient,
+    load_delivery_manifest,
+)
 from huey import reconcile_notifications
 
 
@@ -48,6 +53,23 @@ class FakeRadarr:
     def imported_file(self, movie_id):
         self.last_movie_id = movie_id
         return self.imported
+
+
+class PreviewRadarr(PhysicalRadarrClient):
+    def __init__(self, preview):
+        self.preview = preview
+        self.calls = []
+
+    def _api(self, endpoint):
+        return endpoint
+
+    def _request(self, method, endpoint, **kwargs):
+        self.calls.append((method, endpoint, kwargs))
+        if method == "GET" and endpoint == "manualimport":
+            return self.preview
+        if method == "POST" and endpoint == "command":
+            return {"id": 81}
+        raise AssertionError(f"unexpected request: {method} {endpoint}")
 
 
 class PhysicalMediaTests(unittest.TestCase):
@@ -132,6 +154,57 @@ class PhysicalMediaTests(unittest.TestCase):
             call["source_path"],
             "/downloads/physical-media/incoming/arm-test/feature.mkv",
         )
+
+    def test_manual_import_uses_exact_nested_movie_preview_correlation(self):
+        source_path = "/downloads/physical-media/incoming/arm-test/movie.mkv"
+        radarr = PreviewRadarr([
+            {
+                "path": source_path,
+                "movieId": None,
+                "movie": {"id": 44},
+                "quality": {"quality": {"id": 8}},
+                "languages": [{"id": 1, "name": "English"}],
+                "rejections": [],
+            }
+        ])
+        command_id = radarr.start_manual_import(
+            movie_id=44,
+            source_path=source_path,
+            fingerprint="a" * 64,
+        )
+        self.assertEqual(command_id, 81)
+        preview_call, import_call = radarr.calls
+        self.assertEqual(preview_call[0:2], ("GET", "manualimport"))
+        self.assertEqual(
+            preview_call[2]["params"],
+            {
+                "folder": "/downloads/physical-media/incoming/arm-test",
+                "filterExistingFiles": "true",
+            },
+        )
+        self.assertEqual(import_call[0:2], ("POST", "command"))
+        self.assertEqual(import_call[2]["json"]["name"], "ManualImport")
+        self.assertEqual(import_call[2]["json"]["importMode"], "move")
+        self.assertEqual(import_call[2]["json"]["files"][0]["movieId"], 44)
+        self.assertEqual(import_call[2]["json"]["files"][0]["path"], source_path)
+
+    def test_manual_import_rejects_mismatched_nested_movie_without_post(self):
+        source_path = "/downloads/physical-media/incoming/arm-test/movie.mkv"
+        radarr = PreviewRadarr([
+            {
+                "path": source_path,
+                "movieId": None,
+                "movie": {"id": 45},
+                "rejections": [],
+            }
+        ])
+        with self.assertRaises(PhysicalMediaError):
+            radarr.start_manual_import(
+                movie_id=44,
+                source_path=source_path,
+                fingerprint="a" * 64,
+            )
+        self.assertEqual(len(radarr.calls), 1)
 
     def test_success_requires_readable_nonempty_das_file_and_notifies_once(self):
         self.delivery()
