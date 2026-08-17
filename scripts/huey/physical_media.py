@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - direct container entrypoint
 
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _IMDB = re.compile(r"\Att[0-9]{7,10}\Z")
+_CRC64 = re.compile(r"\A[0-9a-f]{16}\Z")
 _SAFE_TITLE = re.compile(r"\A[^\x00-\x1f/\\]{1,160}\Z")
 _SAFE_FILENAME_CHAR = re.compile(r"[^A-Za-z0-9 ._()'&!+-]+")
 _TERMINAL_STATES = frozenset({"completed", "manual_review", "failed"})
@@ -55,6 +56,31 @@ def _clean_title(value: object) -> str:
     if not _SAFE_TITLE.fullmatch(title) or any(marker in title for marker in ("@", "`", "<", ">")):
         raise PhysicalMediaError("movie title is missing or unsafe")
     return title
+
+
+def _title_key(value: object) -> str:
+    return " ".join(re.sub(r"[^0-9a-z]+", " ", str(value or "").casefold()).split())
+
+
+def _optional_safe_text(value: object, *, label: str, limit: int = 160) -> str | None:
+    if value in (None, ""):
+        return None
+    text = " ".join(str(value or "").split())
+    if (
+        not text
+        or len(text) > limit
+        or any(marker in text for marker in ("\x00", "/", "\\", "@", "`", "<", ">"))
+    ):
+        raise PhysicalMediaError(f"{label} is unsafe")
+    return text
+
+
+def _optional_integer(
+    value: object, *, label: str, minimum: int, maximum: int
+) -> int | None:
+    if value in (None, ""):
+        return None
+    return _integer(value, label, minimum, maximum)
 
 
 def _deterministic_mkv_name(title: object, year: object) -> str:
@@ -107,6 +133,26 @@ def load_delivery_manifest(
         tmdb_id = _integer(tmdb_id, "TMDb identity", 1, 2_147_483_647)
     else:
         tmdb_id = None
+    duration_seconds = _optional_integer(
+        raw.get("duration_seconds") or raw.get("main_feature_seconds"),
+        label="main-feature duration",
+        minimum=60,
+        maximum=24 * 60 * 60,
+    )
+    dvd_crc64 = str(raw.get("dvd_crc64") or "").casefold() or None
+    if dvd_crc64 is not None and not _CRC64.fullmatch(dvd_crc64):
+        raise PhysicalMediaError("DVD CRC64 fingerprint is invalid")
+    arm_job_id = _optional_integer(
+        raw.get("arm_job_id"), label="ARM job id", minimum=1, maximum=10**12
+    )
+    disc_label = _optional_safe_text(raw.get("disc_label"), label="disc label", limit=120)
+    arm_title = _optional_safe_text(raw.get("arm_title"), label="ARM title", limit=160)
+    arm_year = _optional_integer(
+        raw.get("arm_year"), label="ARM year", minimum=1878, maximum=2200
+    )
+    arm_imdb_id = str(raw.get("arm_imdb_id") or "").strip() or None
+    if arm_imdb_id is not None and not _IMDB.fullmatch(arm_imdb_id):
+        raise PhysicalMediaError("ARM IMDb identity is invalid")
 
     file_name = str(raw.get("file") or "")
     if (
@@ -145,11 +191,116 @@ def load_delivery_manifest(
         "size_bytes": actual_size,
         "host_path": str(media_path),
         "manifest_path": str(path),
+        "duration_seconds": duration_seconds,
+        "dvd_crc64": dvd_crc64,
+        "arm_job_id": arm_job_id,
+        "disc_label": disc_label,
+        "arm_title": arm_title,
+        "arm_year": arm_year,
+        "arm_imdb_id": arm_imdb_id,
     }
 
 
 class PhysicalRadarrClient(RadarrClient):
     """Radarr operations used by the trusted physical-media state machine."""
+
+    @staticmethod
+    def _movie_key(movie: Mapping[str, Any]) -> tuple[int, str]:
+        tmdb_id = int(movie.get("tmdbId") or movie.get("tmdb_id") or 0)
+        imdb_id = str(movie.get("imdbId") or movie.get("imdb_id") or "")
+        return tmdb_id, imdb_id
+
+    @staticmethod
+    def _runtime_minutes(movie: Mapping[str, Any]) -> int | None:
+        try:
+            runtime = int(movie.get("runtime") or 0)
+        except (TypeError, ValueError):
+            return None
+        return runtime if 1 <= runtime <= 1000 else None
+
+    def _same_title_candidates(self, title: object) -> list[Mapping[str, Any]]:
+        title_key = _title_key(title)
+        if not title_key:
+            return []
+        seen: set[tuple[int, str]] = set()
+        candidates: list[Mapping[str, Any]] = []
+        for candidate in self.lookup(str(title)):
+            if not isinstance(candidate, Mapping):
+                continue
+            if _title_key(candidate.get("title")) != title_key:
+                continue
+            key = self._movie_key(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+        return candidates
+
+    def validate_physical_identity(
+        self,
+        identity: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        evidence: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Require disc-level corroboration before importing same-title collisions."""
+
+        evidence = evidence or {}
+        title = str(candidate.get("title") or identity.get("title") or "")
+        same_title = self._same_title_candidates(title)
+        if len(same_title) <= 1:
+            return
+
+        duration_seconds = evidence.get("duration_seconds")
+        try:
+            disc_minutes = int(round(int(duration_seconds) / 60)) if duration_seconds else None
+        except (TypeError, ValueError):
+            disc_minutes = None
+        if disc_minutes is None:
+            raise PhysicalMediaError(
+                "Physical-disc identity collision: multiple same-title Radarr candidates exist "
+                "and the delivery has no main-feature duration corroboration."
+            )
+
+        candidate_key = self._movie_key(candidate)
+        candidate_runtime = self._runtime_minutes(candidate)
+
+        def runtime_delta(movie: Mapping[str, Any]) -> int | None:
+            runtime = self._runtime_minutes(movie)
+            return abs(runtime - disc_minutes) if runtime is not None else None
+
+        candidate_delta = runtime_delta(candidate)
+        matching_alternates = [
+            item
+            for item in same_title
+            if self._movie_key(item) != candidate_key
+            and (delta := runtime_delta(item)) is not None
+            and delta <= 15
+        ]
+        if candidate_delta is not None and candidate_delta <= 15 and not matching_alternates:
+            return
+
+        alternate_detail = "; ".join(
+            f"{item.get('title')} ({item.get('year')}) "
+            f"IMDb {item.get('imdbId') or 'unknown'} TMDb {item.get('tmdbId') or 'unknown'} "
+            f"runtime {self._runtime_minutes(item) or 'unknown'} min"
+            for item in matching_alternates[:3]
+        ) or "no alternate with matching runtime"
+        disc_detail = (
+            f"disc label {evidence.get('disc_label') or 'unknown'}, "
+            f"DVD CRC64 {evidence.get('dvd_crc64') or 'unknown'}, "
+            f"main feature {disc_minutes} min"
+        )
+        candidate_detail = (
+            f"{candidate.get('title')} ({candidate.get('year')}) "
+            f"IMDb {candidate.get('imdbId') or identity.get('imdb_id') or 'unknown'} "
+            f"TMDb {candidate.get('tmdbId') or identity.get('tmdb_id') or 'unknown'} "
+            f"runtime {candidate_runtime or 'unknown'} min"
+        )
+        raise PhysicalMediaError(
+            "Physical-disc identity collision: "
+            f"{disc_detail}; selected candidate {candidate_detail}; "
+            f"same-title alternate evidence: {alternate_detail}. Manual review required."
+        )
 
     def resolve_movie(self, identity: Mapping[str, Any]) -> Mapping[str, Any]:
         if identity.get("tmdb_id"):
@@ -168,7 +319,7 @@ class PhysicalRadarrClient(RadarrClient):
             candidate
             for candidate in candidates
             if isinstance(candidate, Mapping)
-            and str(candidate.get("title") or "").casefold() == str(identity["title"]).casefold()
+            and _title_key(candidate.get("title")) == _title_key(identity["title"])
             and int(candidate.get("year") or 0) == int(identity["year"])
             and (
                 not identity.get("tmdb_id")
@@ -393,6 +544,32 @@ class PhysicalMediaIntake:
         except OSError as error:
             raise PhysicalMediaError("failed to update deterministic import manifest") from error
 
+    def _identity_evidence(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        source_path = Path(str(event["source_path"]))
+        manifest_path = source_path.parent / "manifest.json"
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, Mapping):
+            return {}
+        evidence: dict[str, Any] = {}
+        for key in (
+            "duration_seconds",
+            "main_feature_seconds",
+            "dvd_crc64",
+            "arm_job_id",
+            "disc_label",
+            "arm_title",
+            "arm_year",
+            "arm_imdb_id",
+        ):
+            if raw.get(key) not in (None, ""):
+                evidence[key] = raw[key]
+        if "duration_seconds" not in evidence and "main_feature_seconds" in evidence:
+            evidence["duration_seconds"] = evidence["main_feature_seconds"]
+        return evidence
+
     def _prepare_import_source(self, event: Mapping[str, Any]) -> Path:
         source_path = Path(str(event["source_path"]))
         try:
@@ -534,6 +711,9 @@ class PhysicalMediaIntake:
                 state = str(event["state"])
                 if state in {"received", "validated"}:
                     candidate = self.radarr.resolve_movie(event)
+                    self.radarr.validate_physical_identity(
+                        event, candidate, self._identity_evidence(event)
+                    )
                     movie = self.radarr.ensure_movie(candidate)
                     if movie.get("hasFile") is True:
                         raise PhysicalMediaError(

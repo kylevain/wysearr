@@ -42,6 +42,9 @@ class FakeRadarr:
     def ensure_movie(self, candidate):
         return {**candidate, "id": 44, "hasFile": False}
 
+    def validate_physical_identity(self, identity, candidate, evidence=None):
+        self.last_identity_evidence = dict(evidence or {})
+
     def start_manual_import(self, **values):
         self.start_calls.append(values)
         return 81
@@ -87,6 +90,51 @@ class ExistingMovieRadarr(PhysicalRadarrClient):
         raise AssertionError(f"unexpected request: {method} {endpoint}")
 
 
+class CollisionRadarr(PhysicalRadarrClient):
+    def __init__(self):
+        self.ensure_calls = []
+        self.start_calls = []
+
+    def resolve_movie(self, identity):
+        return {
+            "id": 2014,
+            "title": "Into the Woods",
+            "year": 2014,
+            "imdbId": "tt2180411",
+            "tmdbId": 224141,
+            "runtime": 125,
+        }
+
+    def lookup(self, title):
+        self.lookup_title = title
+        return [
+            {
+                "id": 2014,
+                "title": "Into the Woods",
+                "year": 2014,
+                "imdbId": "tt2180411",
+                "tmdbId": 224141,
+                "runtime": 125,
+            },
+            {
+                "id": 1991,
+                "title": "Into the Woods",
+                "year": 1991,
+                "imdbId": "tt0099851",
+                "tmdbId": 23378,
+                "runtime": 153,
+            },
+        ]
+
+    def ensure_movie(self, candidate):
+        self.ensure_calls.append(candidate)
+        return {**candidate, "id": 2014, "hasFile": False}
+
+    def start_manual_import(self, **values):
+        self.start_calls.append(values)
+        return 81
+
+
 class PhysicalMediaTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -109,7 +157,7 @@ class PhysicalMediaTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def delivery(self, *, title="Into the Woods", year=2014, valid=True):
+    def delivery(self, *, title="Into the Woods", year=2014, valid=True, extra=None):
         folder = self.intake_root / "arm-test"
         folder.mkdir(exist_ok=True)
         media = folder / "feature.mkv"
@@ -125,6 +173,8 @@ class PhysicalMediaTests(unittest.TestCase):
             "year": year,
             "imdb_id": "tt2180411",
         }
+        if extra:
+            manifest.update(extra)
         if not valid:
             manifest.pop("year")
         path = folder / "manifest.json"
@@ -137,11 +187,22 @@ class PhysicalMediaTests(unittest.TestCase):
         return events[0]
 
     def test_manifest_validates_identity_mkv_size_and_fingerprint(self):
-        path, manifest = self.delivery()
+        path, manifest = self.delivery(extra={
+            "disc_label": "INTO_THE_WOODS",
+            "dvd_crc64": "889f7ee9e88191f7",
+            "duration_seconds": 9048,
+            "arm_job_id": 7,
+            "arm_title": "Into-the-Woods",
+            "arm_year": 2014,
+            "arm_imdb_id": "tt2180411",
+        })
         parsed = load_delivery_manifest(path, min_size_bytes=4)
         self.assertEqual(parsed["title"], "Into the Woods")
         self.assertEqual(parsed["year"], 2014)
         self.assertEqual(parsed["fingerprint"], manifest["sha256"])
+        self.assertEqual(parsed["disc_label"], "INTO_THE_WOODS")
+        self.assertEqual(parsed["dvd_crc64"], "889f7ee9e88191f7")
+        self.assertEqual(parsed["duration_seconds"], 9048)
         (path.parent / "feature.mkv").write_bytes(b"not-an-mkv")
         with self.assertRaises(PhysicalMediaError):
             load_delivery_manifest(path, min_size_bytes=4)
@@ -186,6 +247,31 @@ class PhysicalMediaTests(unittest.TestCase):
         )
         deterministic = self.intake_root / "arm-test" / "Greedy (1994).mkv"
         self.assertEqual(hashlib.sha256(deterministic.read_bytes()).hexdigest(), manifest["sha256"])
+
+    def test_same_title_runtime_collision_fails_closed_before_radarr_mutation(self):
+        self.delivery(extra={
+            "disc_label": "INTO_THE_WOODS",
+            "dvd_crc64": "889f7ee9e88191f7",
+            "duration_seconds": 9048,
+            "arm_job_id": 7,
+            "arm_title": "Into-the-Woods",
+            "arm_year": 2014,
+            "arm_imdb_id": "tt2180411",
+        })
+        self.intake.radarr = CollisionRadarr()
+
+        self.intake.reconcile()
+
+        event = self.event()
+        self.assertEqual(event["state"], "manual_review")
+        self.assertIn("Physical-disc identity collision", event["error"])
+        self.assertIn("main feature 151 min", event["error"])
+        self.assertIn("Into the Woods (1991)", event["error"])
+        self.assertEqual(self.intake.radarr.ensure_calls, [])
+        self.assertEqual(self.intake.radarr.start_calls, [])
+        deliveries = self.store.pending_notification_deliveries()
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(deliveries[0]["route"], "import-errors")
 
     def test_manual_import_uses_exact_nested_movie_preview_correlation(self):
         source_path = "/downloads/physical-media/incoming/arm-test/movie.mkv"

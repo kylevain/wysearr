@@ -30,13 +30,19 @@ with sqlite3.connect(database) as connection:
     connection.row_factory = sqlite3.Row
     rows = connection.execute(
         """
-        SELECT job_id, title, year, imdb_id, path
-        FROM job
-        WHERE stop_time IS NULL
-          AND video_type IN ('movie', 'unknown')
-          AND disctype IN ('dvd', 'bluray')
-          AND COALESCE(errors, '') = ''
-        ORDER BY job_id DESC
+        SELECT
+            j.job_id, j.title, j.year, j.imdb_id, j.path,
+            j.label, j.crc_id, j.title_auto, j.year_auto, j.imdb_id_auto,
+            t.length AS duration_seconds
+        FROM job j
+        LEFT JOIN track t
+          ON t.job_id = j.job_id
+         AND COALESCE(t.main_feature, 0) = 1
+        WHERE j.stop_time IS NULL
+          AND j.video_type IN ('movie', 'unknown')
+          AND j.disctype IN ('dvd', 'bluray')
+          AND COALESCE(j.errors, '') = ''
+        ORDER BY j.job_id DESC
         """
     ).fetchall()
 
@@ -65,5 +71,12 @@ environment.update({
 arguments = [str(helper), str(mkvs[0]), str(row["title"] or "")]
 arguments.append(str(row["year"] or ""))
 arguments.append(str(row["imdb_id"] or ""))
+arguments.append(str(row["label"] or ""))
+arguments.append(str(row["crc_id"] or ""))
+arguments.append(str(row["duration_seconds"] or ""))
+arguments.append(str(row["job_id"] or ""))
+arguments.append(str(row["title_auto"] or row["title"] or ""))
+arguments.append(str(row["year_auto"] or row["year"] or ""))
+arguments.append(str(row["imdb_id_auto"] or row["imdb_id"] or ""))
 subprocess.run(arguments, check=True, env=environment)
 PY

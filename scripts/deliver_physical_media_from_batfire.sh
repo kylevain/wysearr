@@ -3,10 +3,17 @@ set -euo pipefail
 
 # BatFire-side, manifest-last delivery helper. The MKV is transferred exactly
 # once; the remote rename makes an interrupted rsync invisible to Huey.
-source_mkv="${1:?usage: deliver_physical_media_from_batfire.sh SOURCE_MKV [TITLE YEAR [IMDB_ID]]}"
+source_mkv="${1:?usage: deliver_physical_media_from_batfire.sh SOURCE_MKV [TITLE YEAR [IMDB_ID [DISC_LABEL DVD_CRC64 DURATION_SECONDS ARM_JOB_ID ARM_TITLE ARM_YEAR ARM_IMDB_ID]]]}"
 title="${2:-}"
 year="${3:-}"
 imdb_id="${4:-}"
+disc_label="${5:-}"
+dvd_crc64="${6:-}"
+duration_seconds="${7:-}"
+arm_job_id="${8:-}"
+arm_title="${9:-}"
+arm_year="${10:-}"
+arm_imdb_id="${11:-}"
 remote_host="${WYSEARR_SSH_HOST:-192.168.4.86}"
 remote_user="${WYSEARR_SSH_USER:-wyseadmin}"
 remote_root="${WYSEARR_PHYSICAL_ROOT:-/home/wyseadmin/homelab/state/physical-media/incoming}"
@@ -32,6 +39,10 @@ delivery_id="arm-${sha256:0:20}"
 manifest_tmp="$(mktemp)"
 trap 'rm -f -- "$manifest_tmp"' EXIT
 PHYSICAL_TITLE="$title" PHYSICAL_YEAR="$year" PHYSICAL_IMDB_ID="$imdb_id" \
+PHYSICAL_DISC_LABEL="$disc_label" PHYSICAL_DVD_CRC64="$dvd_crc64" \
+PHYSICAL_DURATION_SECONDS="$duration_seconds" PHYSICAL_ARM_JOB_ID="$arm_job_id" \
+PHYSICAL_ARM_TITLE="$arm_title" PHYSICAL_ARM_YEAR="$arm_year" \
+PHYSICAL_ARM_IMDB_ID="$arm_imdb_id" \
 PHYSICAL_SHA256="$sha256" PHYSICAL_SIZE="$size_bytes" \
 python3 - "$manifest_tmp" <<'PY'
 import json, os, sys
@@ -48,6 +59,20 @@ if os.environ.get("PHYSICAL_YEAR"):
     payload["year"] = os.environ["PHYSICAL_YEAR"]
 if os.environ.get("PHYSICAL_IMDB_ID"):
     payload["imdb_id"] = os.environ["PHYSICAL_IMDB_ID"]
+if os.environ.get("PHYSICAL_DISC_LABEL"):
+    payload["disc_label"] = os.environ["PHYSICAL_DISC_LABEL"]
+if os.environ.get("PHYSICAL_DVD_CRC64"):
+    payload["dvd_crc64"] = os.environ["PHYSICAL_DVD_CRC64"]
+if os.environ.get("PHYSICAL_DURATION_SECONDS"):
+    payload["duration_seconds"] = int(os.environ["PHYSICAL_DURATION_SECONDS"])
+if os.environ.get("PHYSICAL_ARM_JOB_ID"):
+    payload["arm_job_id"] = int(os.environ["PHYSICAL_ARM_JOB_ID"])
+if os.environ.get("PHYSICAL_ARM_TITLE"):
+    payload["arm_title"] = os.environ["PHYSICAL_ARM_TITLE"]
+if os.environ.get("PHYSICAL_ARM_YEAR"):
+    payload["arm_year"] = int(os.environ["PHYSICAL_ARM_YEAR"])
+if os.environ.get("PHYSICAL_ARM_IMDB_ID"):
+    payload["arm_imdb_id"] = os.environ["PHYSICAL_ARM_IMDB_ID"]
 with open(sys.argv[1], "w", encoding="utf-8") as stream:
     json.dump(payload, stream, ensure_ascii=False, sort_keys=True)
     stream.write("\n")
