@@ -241,6 +241,27 @@ class PhysicalMediaTests(unittest.TestCase):
         self.assertEqual(len(self.radarr.start_calls), 1)
         self.assertEqual(len(self.store.pending_notification_deliveries()), 1)
 
+    def test_radarr_move_is_finalized_without_invalid_manifest_quarantine(self):
+        manifest_path, _manifest = self.delivery()
+        self.intake.reconcile()
+        self.intake.reconcile()
+        source = self.intake_root / "arm-test" / "feature.mkv"
+        final = self.media_root / "movies" / "Into the Woods (2014)" / "movie.mkv"
+        final.parent.mkdir(parents=True)
+        source.rename(final)
+        self.radarr.imported = {"path": "/media/movies/Into the Woods (2014)/movie.mkv"}
+
+        self.intake.reconcile()
+
+        events = self.store.trusted_library_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["state"], "completed")
+        self.assertFalse(manifest_path.exists())
+        self.assertFalse(manifest_path.parent.exists())
+        deliveries = self.store.pending_notification_deliveries()
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(deliveries[0]["event_key"], "library_imported")
+
     def test_ambiguous_metadata_routes_once_to_import_errors(self):
         self.delivery(valid=False)
         self.intake.reconcile()

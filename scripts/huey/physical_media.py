@@ -268,6 +268,66 @@ class PhysicalMediaIntake:
         relative = Path(host_path).relative_to(self.intake_root)
         return str(self.radarr_intake_root / relative)
 
+    @staticmethod
+    def _manifest_source(manifest_path: Path) -> tuple[str, str] | None:
+        """Read only the fields needed to recognize an already-owned delivery."""
+
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, Mapping):
+            return None
+        fingerprint = str(raw.get("sha256") or "").casefold()
+        file_name = str(raw.get("file") or "")
+        if (
+            not _SHA256.fullmatch(fingerprint)
+            or not file_name
+            or Path(file_name).name != file_name
+            or Path(file_name).suffix.casefold() != ".mkv"
+        ):
+            return None
+        return fingerprint, str(manifest_path.parent / file_name)
+
+    def _is_owned_moved_delivery(
+        self, manifest_path: Path, events: Mapping[str, Mapping[str, Any]]
+    ) -> bool:
+        manifest_source = self._manifest_source(manifest_path)
+        if manifest_source is None:
+            return False
+        fingerprint, source_path = manifest_source
+        event = events.get(fingerprint)
+        return bool(
+            event
+            and event.get("state") in {"importing", "completed"}
+            and event.get("source_path") == source_path
+            and not Path(source_path).exists()
+        )
+
+    def _cleanup_owned_delivery(self, event: Mapping[str, Any]) -> bool:
+        """Remove only the empty, manifest-only staging directory after import."""
+
+        source_path = Path(str(event["source_path"]))
+        try:
+            source_path.relative_to(self.intake_root)
+        except ValueError:
+            return False
+        directory = source_path.parent
+        if directory.parent != self.intake_root or source_path.exists():
+            return False
+        manifest_path = directory / "manifest.json"
+        manifest_source = self._manifest_source(manifest_path)
+        if manifest_source != (str(event["source_fingerprint"]), str(source_path)):
+            return False
+        try:
+            if {item.name for item in directory.iterdir()} != {"manifest.json"}:
+                return False
+            manifest_path.unlink()
+            directory.rmdir()
+        except OSError:
+            return False
+        return True
+
     def _final_file(self, event: Mapping[str, Any]) -> str | None:
         movie_id = event.get("radarr_movie_id")
         if not movie_id:
@@ -295,7 +355,13 @@ class PhysicalMediaIntake:
 
     def discover(self) -> int:
         discovered = 0
+        owned_events = {
+            str(event["source_fingerprint"]): event
+            for event in self.store.trusted_library_events(limit=1000)
+        }
         for manifest_path in sorted(self.intake_root.glob("*/manifest.json")):
+            if self._is_owned_moved_delivery(manifest_path, owned_events):
+                continue
             try:
                 try:
                     manifest_path.resolve().relative_to(self.intake_root.resolve())
@@ -354,6 +420,7 @@ class PhysicalMediaIntake:
                     self.store.enqueue_trusted_notification(
                         int(event["id"]), plan.event_key, plan.route, plan.message
                     )
+                    self._cleanup_owned_delivery(event)
                     changed += 1
                     continue
 
