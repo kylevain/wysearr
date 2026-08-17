@@ -30,6 +30,7 @@ try:
         terminal_notifications,
     )
     from .orchestrator import RequestProcessor
+    from .physical_media import PhysicalMediaIntake, PhysicalRadarrClient
     from .results import sanitize_display_text
     from .services import ServiceRegistry
 except ImportError:  # Direct execution from /app/scripts/huey/huey.py.
@@ -47,6 +48,7 @@ except ImportError:  # Direct execution from /app/scripts/huey/huey.py.
         terminal_notifications,
     )
     from orchestrator import RequestProcessor
+    from physical_media import PhysicalMediaIntake, PhysicalRadarrClient
     from results import sanitize_display_text
     from services import ServiceRegistry
 
@@ -1652,11 +1654,31 @@ async def unavailable_retry_loop(
         await asyncio.sleep(max(1.0, interval_seconds))
 
 
+async def physical_media_reconciliation_loop(
+    client: Any,
+    intake: PhysicalMediaIntake,
+    interval_seconds: float = 30,
+) -> None:
+    """Advance physical-disc imports independently from request processing."""
+
+    while not client.is_closed():
+        try:
+            await asyncio.to_thread(intake.reconcile)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.error(
+                "Physical-media reconciliation failed (%s)", type(error).__name__
+            )
+        await asyncio.sleep(max(1.0, interval_seconds))
+
+
 def build_client(
     channel_config: ChannelConfig,
     processor: RequestProcessor,
     ready_path: str | Path,
     reconcile_seconds: float = 30,
+    physical_media_intake: PhysicalMediaIntake | None = None,
 ):
     """Create and register the Discord client without connecting it."""
 
@@ -1673,6 +1695,7 @@ def build_client(
     lazylibrarian_task: asyncio.Task | None = None
     abba_task: asyncio.Task | None = None
     unavailable_retry_task: asyncio.Task | None = None
+    physical_media_task: asyncio.Task | None = None
     ebook_recovery = _OneShotAsyncRecovery(
         reconcile_ebook_cascades,
         processor.store,
@@ -1689,7 +1712,7 @@ def build_client(
     @client.event
     async def on_ready():
         nonlocal reconcile_task, shelfarr_task, lazylibrarian_task, abba_task
-        nonlocal unavailable_retry_task
+        nonlocal unavailable_retry_task, physical_media_task
         try:
             await validate_discord_channels(client, channel_config)
         except RuntimeError as error:
@@ -1755,6 +1778,16 @@ def build_client(
             unavailable_retry_task = asyncio.create_task(
                 unavailable_retry_loop(client, processor, reconcile_seconds),
                 name="huey-unavailable-retry-reconciliation",
+            )
+        if (
+            physical_media_intake is not None
+            and (physical_media_task is None or physical_media_task.done())
+        ):
+            physical_media_task = asyncio.create_task(
+                physical_media_reconciliation_loop(
+                    client, physical_media_intake, reconcile_seconds
+                ),
+                name="huey-physical-media-reconciliation",
             )
 
     async def deliver_response(message: Any, media_type: str, response: dict[str, Any]) -> None:
@@ -2020,12 +2053,57 @@ def main() -> None:
         raise SystemExit(
             "HUEY_SELECTION_TTL_SECONDS must be between 1 and 86400"
         )
+    services = ServiceRegistry()
     processor = RequestProcessor(
         store,
-        services=ServiceRegistry(),
+        services=services,
         selection_ttl_seconds=selection_ttl_seconds,
     )
-    client = build_client(channel_config, processor, ready_path, reconcile_seconds)
+    physical_media_intake = None
+    physical_media_enabled = os.environ.get(
+        "PHYSICAL_MEDIA_ENABLED", "false"
+    ).strip()
+    if physical_media_enabled not in {"true", "false"}:
+        raise SystemExit("PHYSICAL_MEDIA_ENABLED must be literal true or false")
+    if physical_media_enabled == "true":
+        radarr_api_key = os.environ.get("RADARR_API_KEY", "").strip()
+        if not radarr_api_key:
+            raise SystemExit("RADARR_API_KEY missing for physical-media intake")
+        try:
+            physical_min_size = int(
+                os.environ.get(
+                    "PHYSICAL_MEDIA_MIN_SIZE_BYTES", str(50 * 1024 * 1024)
+                )
+            )
+        except ValueError as error:
+            raise SystemExit(
+                "PHYSICAL_MEDIA_MIN_SIZE_BYTES must be an integer"
+            ) from error
+        if not 1 <= physical_min_size <= 10**13:
+            raise SystemExit("PHYSICAL_MEDIA_MIN_SIZE_BYTES is outside the safe range")
+        physical_media_intake = PhysicalMediaIntake(
+            store,
+            PhysicalRadarrClient(
+                os.environ.get("RADARR_URL", "http://radarr:7878"),
+                radarr_api_key,
+                root_folder=os.environ.get("RADARR_ROOT_FOLDER") or None,
+            ),
+            os.environ.get(
+                "PHYSICAL_MEDIA_INTAKE_PATH", "/physical-media/incoming"
+            ),
+            radarr_intake_root=os.environ.get(
+                "PHYSICAL_MEDIA_RADARR_PATH", "/downloads/physical-media/incoming"
+            ),
+            media_root=os.environ.get("PHYSICAL_MEDIA_DAS_PATH", "/media"),
+            min_size_bytes=physical_min_size,
+        )
+    client = build_client(
+        channel_config,
+        processor,
+        ready_path,
+        reconcile_seconds,
+        physical_media_intake,
+    )
     try:
         client.run(token)
     finally:

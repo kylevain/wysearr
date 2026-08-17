@@ -2,6 +2,13 @@
 
 ## Recorded decisions
 
+- 2026-08-16: Physical DVD/Blu-ray intake is a trusted library event, not a
+  Discord request. BatFire transfers one MakeMKV main-feature file over SSH to
+  WyseARR local SSD and never mounts the DAS. A SHA-256 manifest gates Huey;
+  Radarr owns the only DAS import; Huey's existing outbox owns the sole
+  `library_imported`/`import_failed` Discord delivery. The worker is feature
+  gated until the live DAS is writable and a deterministic artifact exists.
+
 - 2026-08-09: Rebuild on Debian 13 and keep the service identity
   `wyseadmin@wysearr`.
 - 2026-08-11: Discord channels define media intent. Huey remains a deterministic

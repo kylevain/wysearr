@@ -38,6 +38,47 @@ success by itself. External matches remain content- and provider-dependent.
 Bazarr's native Discord notifier remains disabled, and Bazarr does not emit
 routine subtitle activity.
 
+## Physical DVD/Blu-ray intake
+
+BatFire remains the only optical-drive/ARM host and is not a DAS client. ARM
+keeps MakeMKV's original audio and subtitle tracks and publishes its one
+`MAINFEATURE` MKV over the existing OpenSSH transport:
+
+```text
+BatFire ARM completed MKV
+  -> rsync once as feature.mkv.partial
+  -> WyseARR /home/wyseadmin/homelab/state/physical-media/incoming/arm-<sha-prefix>
+  -> atomic feature.mkv rename
+  -> manifest.json published last
+  -> Huey validates regular-file containment, one MKV, EBML header, size,
+     SHA-256, and exact title/year/provider identity
+  -> Radarr ManualImport (move) from /downloads/physical-media/incoming/...
+  -> /media/movies/<Radarr naming> on the DAS
+  -> Huey verifies the final readable, non-empty, same-size file
+  -> existing library_imported -> #recent-additions route
+```
+
+The receiving host path is
+`/home/wyseadmin/homelab/state/physical-media/incoming`; Radarr sees the same
+bytes at `/downloads/physical-media/incoming`, and Huey sees them at
+`/physical-media/incoming`. There is no BatFire -> WyseARR -> second WyseARR
+staging copy and no direct write into `/mnt/media`. Radarr alone chooses final
+movie naming and moves the validated source into `/media/movies`.
+
+`trusted_library_events` owns physical-disc state independently of `requests`.
+Its durable identity is `physical-disc` plus the full MKV SHA-256. The shared
+`notification_deliveries` outbox accepts exactly one owner: `request_id` or
+`trusted_event_id`. Partial unique indexes deduplicate event/route delivery for
+both owner types. A replay therefore neither creates a Huey request nor starts a
+second import or Discord message.
+
+Missing/ambiguous identity, a rejected/failed Radarr import, a final-file proof
+failure, or a crash across the uncertain Radarr POST boundary moves the event to
+`manual_review`/`failed` and stages the existing `import_failed` route to
+`#import-errors`. A transient Radarr outage leaves the state retryable. Plex
+continues to observe the existing DAS movie library; this path adds no Plex
+mount, library, or notification mechanism.
+
 ## Discord and direct-media flow
 
 ```text

@@ -282,6 +282,7 @@ class RequestStore:
         schema = self.schema_path.read_text(encoding="utf-8")
         with self.connect() as connection:
             connection.executescript(schema)
+            self._migrate_trusted_notification_outbox(connection)
             self._add_missing_columns(connection)
             connection.execute(
                 "UPDATE requests SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)"
@@ -384,6 +385,76 @@ class RequestStore:
                 raise
             else:
                 connection.execute("RELEASE huey_identity_index_migration")
+
+    @staticmethod
+    def _migrate_trusted_notification_outbox(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Make the lifecycle outbox usable by requests and trusted events."""
+
+        columns = {
+            row["name"]: row
+            for row in connection.execute(
+                "PRAGMA table_info(notification_deliveries)"
+            ).fetchall()
+        }
+        if (
+            "trusted_event_id" in columns
+            and int(columns["request_id"]["notnull"]) == 0
+        ):
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS notification_deliveries_request_uq
+                ON notification_deliveries(request_id, event_key, route)
+                WHERE request_id IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS notification_deliveries_trusted_event_uq
+                ON notification_deliveries(trusted_event_id, event_key, route)
+                WHERE trusted_event_id IS NOT NULL
+                """
+            )
+            return
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            DROP INDEX IF EXISTS notification_deliveries_pending_idx;
+            DROP INDEX IF EXISTS notification_deliveries_request_uq;
+            DROP INDEX IF EXISTS notification_deliveries_trusted_event_uq;
+            ALTER TABLE notification_deliveries
+                RENAME TO notification_deliveries_legacy;
+            CREATE TABLE notification_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER,
+                trusted_event_id INTEGER,
+                event_key TEXT NOT NULL,
+                route TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                delivered_at TEXT,
+                FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE,
+                FOREIGN KEY(trusted_event_id) REFERENCES trusted_library_events(id) ON DELETE CASCADE,
+                CHECK ((request_id IS NOT NULL) != (trusted_event_id IS NOT NULL))
+            );
+            INSERT INTO notification_deliveries (
+                id, request_id, event_key, route, message, created_at, delivered_at
+            )
+            SELECT id, request_id, event_key, route, message, created_at, delivered_at
+            FROM notification_deliveries_legacy;
+            DROP TABLE notification_deliveries_legacy;
+            CREATE UNIQUE INDEX notification_deliveries_request_uq
+                ON notification_deliveries(request_id, event_key, route)
+                WHERE request_id IS NOT NULL;
+            CREATE UNIQUE INDEX notification_deliveries_trusted_event_uq
+                ON notification_deliveries(trusted_event_id, event_key, route)
+                WHERE trusted_event_id IS NOT NULL;
+            CREATE INDEX notification_deliveries_pending_idx
+                ON notification_deliveries(delivered_at, id);
+            COMMIT;
+            """
+        )
 
     @staticmethod
     def _release_unowned_ebook_backend_reservations(
@@ -4776,6 +4847,127 @@ class RequestStore:
                 ) VALUES (?, ?, ?, ?)
                 """,
                 (request_id, event_key, route, message.strip()[:2000]),
+            )
+            return cursor.rowcount == 1
+
+    def register_trusted_library_event(
+        self,
+        *,
+        source_fingerprint: str,
+        source_path: str,
+        size_bytes: int,
+        title: str | None = None,
+        year: int | None = None,
+        imdb_id: str | None = None,
+        tmdb_id: int | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist one physical-disc identity without creating a Huey request."""
+
+        fingerprint = str(source_fingerprint or "").casefold()
+        if not _SELECTION_FINGERPRINT.fullmatch(fingerprint):
+            raise ValueError("Trusted event fingerprint must be a SHA-256 value")
+        if not source_path or int(size_bytes) <= 0:
+            raise ValueError("Trusted event requires a non-empty source file")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO trusted_library_events (
+                    source_type, source_fingerprint, source_path, size_bytes,
+                    title, year, imdb_id, tmdb_id
+                ) VALUES ('physical-disc', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fingerprint,
+                    str(source_path),
+                    int(size_bytes),
+                    title,
+                    year,
+                    imdb_id,
+                    tmdb_id,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM trusted_library_events
+                WHERE source_type = 'physical-disc' AND source_fingerprint = ?
+                """,
+                (fingerprint,),
+            ).fetchone()
+        return dict(row), cursor.rowcount == 1
+
+    def trusted_library_events(
+        self, *, states: Sequence[str] | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM trusted_library_events"
+        parameters: list[Any] = []
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            query += f" WHERE state IN ({placeholders})"
+            parameters.extend(states)
+        query += " ORDER BY updated_at, id LIMIT ?"
+        parameters.append(max(1, min(int(limit), 1000)))
+        with self.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def transition_trusted_library_event(
+        self,
+        event_id: int,
+        state: str,
+        *,
+        title: str | None = None,
+        year: int | None = None,
+        imdb_id: str | None = None,
+        tmdb_id: int | None = None,
+        radarr_movie_id: int | None = None,
+        radarr_command_id: int | None = None,
+        final_path: str | None = None,
+        error: str | None = None,
+    ) -> bool:
+        allowed = {
+            "received", "validated", "identity_resolved", "import_submitting",
+            "importing", "completed", "manual_review", "failed",
+        }
+        if state not in allowed:
+            raise ValueError("Invalid trusted library event state")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE trusted_library_events
+                SET state = ?, updated_at = CURRENT_TIMESTAMP,
+                    title = COALESCE(?, title), year = COALESCE(?, year),
+                    imdb_id = COALESCE(?, imdb_id), tmdb_id = COALESCE(?, tmdb_id),
+                    radarr_movie_id = COALESCE(?, radarr_movie_id),
+                    radarr_command_id = COALESCE(?, radarr_command_id),
+                    final_path = COALESCE(?, final_path), error = ?
+                WHERE id = ? AND state != 'completed'
+                """,
+                (
+                    state, title, year, imdb_id, tmdb_id, radarr_movie_id,
+                    radarr_command_id, final_path, error, int(event_id),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def enqueue_trusted_notification(
+        self,
+        trusted_event_id: int,
+        event_key: str,
+        route: str,
+        message: str,
+    ) -> bool:
+        """Stage one trusted-event notification in Huey's shared outbox."""
+
+        if not event_key or not route or not message or not message.strip():
+            raise ValueError("Notification delivery fields cannot be empty")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO notification_deliveries (
+                    trusted_event_id, event_key, route, message
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (int(trusted_event_id), event_key, route, message.strip()[:2000]),
             )
             return cursor.rowcount == 1
 

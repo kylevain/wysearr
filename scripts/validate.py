@@ -404,6 +404,7 @@ def huey_database_check(database: Path) -> Check:
                 "ebook_backend_attempts",
                 "ebook_backend_reservations",
                 "unavailable_retries",
+                "trusted_library_events",
             }
             if not required_tables <= tables:
                 return Check(
@@ -455,6 +456,7 @@ def huey_database_check(database: Path) -> Check:
             attempt_columns = columns("ebook_backend_attempts")
             reservation_columns = columns("ebook_backend_reservations")
             retry_columns = columns("unavailable_retries")
+            trusted_event_columns = columns("trusted_library_events")
             request_indexes = _sqlite_indexes(connection, "requests")
             delivery_indexes = _sqlite_indexes(connection, "notification_deliveries")
             confirmation_indexes = _sqlite_indexes(connection, "candidate_confirmations")
@@ -466,6 +468,9 @@ def huey_database_check(database: Path) -> Check:
                 connection, "ebook_backend_reservations"
             )
             retry_indexes = _sqlite_indexes(connection, "unavailable_retries")
+            trusted_event_indexes = _sqlite_indexes(
+                connection, "trusted_library_events"
+            )
             retry_active_index_row = connection.execute(
                 "SELECT sql FROM sqlite_master "
                 "WHERE type = 'index' "
@@ -615,6 +620,7 @@ def huey_database_check(database: Path) -> Check:
                 "ebook_backend_reservations"
             )
             retry_foreign_keys = foreign_keys("unavailable_retries")
+            delivery_foreign_keys = foreign_keys("notification_deliveries")
 
             retry_rows = connection.execute(
                 """
@@ -968,8 +974,21 @@ def huey_database_check(database: Path) -> Check:
                 "route",
                 "message",
                 "delivered_at",
+                "trusted_event_id",
             }
             <= delivery_columns
+            and {
+                "source_type",
+                "source_fingerprint",
+                "source_path",
+                "state",
+                "radarr_movie_id",
+                "radarr_command_id",
+                "final_path",
+                "size_bytes",
+                "error",
+            }
+            <= trusted_event_columns
             and {
                 "request_id",
                 "shelfarr_correlation",
@@ -1093,6 +1112,12 @@ def huey_database_check(database: Path) -> Check:
                 "cascade",
             )
             in retry_foreign_keys
+            and (
+                "request_id", "requests", "id", "cascade"
+            ) in delivery_foreign_keys
+            and (
+                "trusted_event_id", "trusted_library_events", "id", "cascade"
+            ) in delivery_foreign_keys
             and _has_unique_columns(request_indexes, ("message_id",))
             and _has_unique_columns(request_indexes, ("target_key",))
             and request_indexes.get(
@@ -1119,6 +1144,12 @@ def huey_database_check(database: Path) -> Check:
             == (False, ("canonical_request_id",))
             and _has_unique_columns(
                 delivery_indexes, ("request_id", "event_key", "route")
+            )
+            and _has_unique_columns(
+                delivery_indexes, ("trusted_event_id", "event_key", "route")
+            )
+            and _has_unique_columns(
+                trusted_event_indexes, ("source_type", "source_fingerprint")
             )
             and _has_unique_columns(confirmation_indexes, ("request_id",))
             and _has_unique_columns(

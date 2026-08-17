@@ -308,6 +308,7 @@ services:
     volumes:
       - ./config/radarr:/config
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
+      - ${PHYSICAL_MEDIA_ROOT:-/home/wyseadmin/homelab/state/physical-media}:/downloads/physical-media
       - ${MEDIA_ROOT:-/mnt/media}:/media
     ports:
       - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${RADARR_PORT:-7878}:7878"
@@ -476,8 +477,15 @@ services:
       HUEY_SHELFARR_MINIMUM_CONFIDENCE: ${HUEY_SHELFARR_MINIMUM_CONFIDENCE:-0.80}
       HUEY_SHELFARR_RUNNER_UP_GAP: ${HUEY_SHELFARR_RUNNER_UP_GAP:-0.05}
       HUEY_SELECTION_TTL_SECONDS: ${HUEY_SELECTION_TTL_SECONDS:-900}
+      PHYSICAL_MEDIA_ENABLED: ${PHYSICAL_MEDIA_ENABLED:-false}
+      PHYSICAL_MEDIA_INTAKE_PATH: /physical-media/incoming
+      PHYSICAL_MEDIA_RADARR_PATH: /downloads/physical-media/incoming
+      PHYSICAL_MEDIA_DAS_PATH: /media
+      PHYSICAL_MEDIA_MIN_SIZE_BYTES: ${PHYSICAL_MEDIA_MIN_SIZE_BYTES:-52428800}
     volumes:
       - ./state/huey:/state
+      - ${PHYSICAL_MEDIA_ROOT:-/home/wyseadmin/homelab/state/physical-media}:/physical-media
+      - ${MEDIA_ROOT:-/mnt/media}:/media:ro
     depends_on:
       qbittorrent:
         condition: service_healthy

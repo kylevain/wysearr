@@ -86,6 +86,32 @@ its Web UI because neither has a configured Discord request channel.
 
 ## Operate the stack
 
+### Physical DVD/Blu-ray delivery
+
+WyseARR receives ARM output at
+`/home/wyseadmin/homelab/state/physical-media/incoming`. Install
+`scripts/deliver_physical_media_from_batfire.sh` on BatFire and invoke it only
+after ARM reports a completed MakeMKV main-feature rip:
+
+```bash
+sudo -u arm /opt/arm/scripts/deliver_physical_media_from_batfire.sh \
+  '/home/arm/media/completed/JOB/feature.mkv' 'Movie Title' 2024 tt1234567
+```
+
+Use ARM/OMDb's exact title, year, and IMDb ID when present. Omitting or guessing
+identity does not import: Huey quarantines it to `#import-errors`. Configure an
+SSH key for BatFire's `arm` user to `wyseadmin@192.168.4.86`; the exact network
+target is
+`wyseadmin@192.168.4.86:/home/wyseadmin/homelab/state/physical-media/incoming/arm-<sha-prefix>`.
+The helper resumes an interrupted rsync, renames the MKV atomically, and sends
+the tiny manifest last. It does not mount the DAS and does not transcode.
+
+ARM installations differ in how completed-job extensions are registered. On
+BatFire, attach the command above to its already-installed successful-job hook;
+do not use a generic directory watcher because it cannot prove ARM job success.
+The BatFire host was not reachable by name from WyseARR during implementation,
+so the exact hook filename remains a live-host configuration step.
+
 Run the idempotent production deployment from any working directory:
 
 ```bash

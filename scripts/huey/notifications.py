@@ -63,6 +63,29 @@ def _plan(event_key: str, message: str) -> RoutedNotification:
     return RoutedNotification(event_key, EVENT_ROUTES[event_key], message.strip())
 
 
+def physical_media_notification(
+    event: Mapping[str, Any], *, success: bool
+) -> RoutedNotification:
+    """Route a trusted disc import without inventing a request lifecycle."""
+
+    title = safe_display_title(event.get("title"), "unidentified physical disc")
+    year = event.get("year")
+    label = f"{title} ({year})" if year else title
+    if success:
+        return _plan(
+            "library_imported",
+            f"📚 New library item from physical disc: {label} was imported "
+            "to its DAS library path by Radarr.",
+        )
+    detail = sanitize_display_text(event.get("error"), limit=500)
+    if not detail or _SENSITIVE_DETAIL.search(str(event.get("error") or "")):
+        detail = "The physical-media delivery requires administrator review."
+    return _plan(
+        "import_failed",
+        f"🛠️ Physical-disc import needs review: {label}. {detail}",
+    )
+
+
 def _request_id(request: Mapping[str, Any], response: Mapping[str, Any] | None = None) -> Any:
     if response is not None and response.get("request_id") is not None:
         return response["request_id"]

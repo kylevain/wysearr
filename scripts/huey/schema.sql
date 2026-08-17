@@ -104,14 +104,42 @@ CREATE TABLE IF NOT EXISTS candidate_confirmation_replies (
 
 CREATE TABLE IF NOT EXISTS notification_deliveries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    request_id INTEGER NOT NULL,
+    request_id INTEGER,
+    trusted_event_id INTEGER,
     event_key TEXT NOT NULL,
     route TEXT NOT NULL,
     message TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     delivered_at TEXT,
     FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE,
-    UNIQUE(request_id, event_key, route)
+    FOREIGN KEY(trusted_event_id) REFERENCES trusted_library_events(id) ON DELETE CASCADE,
+    CHECK ((request_id IS NOT NULL) != (trusted_event_id IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS trusted_library_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source_type TEXT NOT NULL CHECK (source_type = 'physical-disc'),
+    source_fingerprint TEXT NOT NULL CHECK (
+        length(source_fingerprint) = 64
+        AND source_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_path TEXT NOT NULL,
+    title TEXT,
+    year INTEGER CHECK (year IS NULL OR year BETWEEN 1878 AND 2200),
+    imdb_id TEXT,
+    tmdb_id INTEGER,
+    state TEXT NOT NULL DEFAULT 'received' CHECK (state IN (
+        'received', 'validated', 'identity_resolved', 'import_submitting',
+        'importing', 'completed', 'manual_review', 'failed'
+    )),
+    radarr_movie_id INTEGER,
+    radarr_command_id INTEGER,
+    final_path TEXT,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+    error TEXT,
+    UNIQUE(source_type, source_fingerprint)
 );
 
 CREATE INDEX IF NOT EXISTS notification_deliveries_pending_idx

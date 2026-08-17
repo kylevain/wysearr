@@ -150,12 +150,16 @@ fi
 
 media_root="${MEDIA_ROOT:-$(env_value MEDIA_ROOT)}"
 torrent_root="${TORRENT_ROOT:-$(env_value TORRENT_ROOT)}"
+physical_media_root="${PHYSICAL_MEDIA_ROOT:-$(env_value PHYSICAL_MEDIA_ROOT)}"
 media_root="${media_root:-/mnt/media}"
 torrent_root="${torrent_root:-$stack_root/state/torrents}"
+physical_media_root="${physical_media_root:-$stack_root/state/physical-media}"
 
 mkdir -p \
     config/{qbittorrent,prowlarr,sonarr,radarr,lidarr,whisparr,bazarr,bookbot,huey,sabnzbd,shelfarr,abba,lazylibrarian} \
     state/huey \
+    "$physical_media_root/incoming" \
+    "$physical_media_root/review" \
     state/shelfarr-evaluation \
     state/shelfarr-staging/ebooks \
     "$torrent_root"/{watch,active,complete,processed-torrents,incomplete,incomplete/usenet,usenet,shelfarr,tv,movies,music,spicy,ebooks,audiobooks,manga-comics,roms,sheet-music}
@@ -175,6 +179,7 @@ mkdir -p \
     "$media_root"/duplicates/{ebooks,audiobooks,manga-comics,roms,sheet-music}
 
 chmod 775 config/bookbot state/huey "$torrent_root" "$torrent_root"/*
+chmod 775 "$physical_media_root" "$physical_media_root/incoming" "$physical_media_root/review"
 # qBittorrent and ARR config trees persist credential material alongside
 # databases and logs. Restrict traversal at the directory boundary even when
 # an application creates a file with a more permissive mode.

@@ -458,6 +458,8 @@ with independent backups.
 - BookBot ledger/logs: `config/bookbot/` and `docker compose logs bookbot`
 - ARR service logs/DBs: `config/<service>/logs` and `config/<service>/*.db`
 - Deployment checkpoints: matching `pre-deploy-<id>` and `post-deploy-<id>`
+- Physical intake: `state/physical-media/incoming` and the
+  `trusted_library_events` rows in `state/huey/huey.db`
 
 Do not print raw ARR logs while investigating a failed Prowlarr consumer test.
 Some Servarr releases preserve the request as an escaped URL that bypasses
@@ -467,3 +469,35 @@ and rescan without displaying matching lines.
 
 Never delete a base-category qBittorrent payload merely to clear an error. Base
 categories indicate acquisition/import has not reached a confirmed safe state.
+
+## Physical-media recovery
+
+The intake directory is payload state and is deliberately not copied into Git.
+Do not delete an MKV in `state/physical-media/incoming` while its trusted event
+is active. Restarting Huey safely resumes `validated`, `identity_resolved`, and
+`importing` rows. It first checks Radarr and the final DAS file, so a completed
+move is recovered without another POST.
+
+`import_submitting` means Huey may have crossed the non-idempotent Radarr POST
+boundary before persisting the command ID. Startup fails that row closed to
+`manual_review` and emits one `#import-errors` event. Inspect Radarr history,
+the movie entity, the source path, and `/mnt/media/movies` before changing that
+state; never replay the delivery blindly. `manual_review` and `failed` are
+terminal until an operator deliberately corrects metadata or imports the file.
+
+Re-sending the identical MKV and manifest is safe: its full SHA-256 resolves to
+the existing event, and the trusted-event outbox unique index prevents another
+Discord delivery. If the manifest is invalid, it receives a deterministic
+quarantine identity and one import-error notification; correct delivery creates
+a new file-derived identity without overwriting the audit row.
+
+Before enabling the worker, require all of the following:
+
+1. `/mnt/media` is mounted read/write and the normal deploy write probe passes.
+2. Radarr reports `/media/movies` accessible.
+3. BatFire has delivered exactly one deterministic MKV plus `manifest.json`.
+4. The manifest title/year and optional IMDb/TMDb ID identify one movie.
+
+Then set `PHYSICAL_MEDIA_ENABLED=true` and recreate only Huey and Radarr (their
+mount specifications changed). If no safe artifact exists, leave the flag false;
+read-only API, schema, and mount validation are the supported stopping boundary.

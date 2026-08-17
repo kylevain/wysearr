@@ -993,6 +993,12 @@ class ValidationTests(unittest.TestCase):
                 """
                 CREATE UNIQUE INDEX requests_message_id_uq
                     ON requests(message_id);
+                CREATE UNIQUE INDEX notification_deliveries_request_uq
+                    ON notification_deliveries(request_id, event_key, route)
+                    WHERE request_id IS NOT NULL;
+                CREATE UNIQUE INDEX notification_deliveries_trusted_event_uq
+                    ON notification_deliveries(trusted_event_id, event_key, route)
+                    WHERE trusted_event_id IS NOT NULL;
                 CREATE UNIQUE INDEX requests_active_target_uq
                     ON requests(target_key)
                     WHERE target_key IS NOT NULL
