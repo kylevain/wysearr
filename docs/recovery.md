@@ -474,14 +474,21 @@ categories indicate acquisition/import has not reached a confirmed safe state.
 
 The intake directory is payload state and is deliberately not copied into Git.
 Do not delete an MKV in `state/physical-media/incoming` while its trusted event
-is active. Restarting Huey safely resumes `validated`, `identity_resolved`, and
-`importing` rows. It first checks Radarr and the final DAS file, so a completed
-move is recovered without another POST.
+is active. Movie deliveries contain one validated MKV and route to Radarr. TV
+deliveries use manifest version 2 with `media_type: tv` and a `files` array;
+Huey imports them through Sonarr only when the series, season, and every
+episode number are explicit and Sonarr knows those episodes. Grouped ambiguous
+or nonstandard physical-video deliveries stay preserved under
+`state/physical-media/incoming` and receive one `#import-errors` review notice.
 
-`import_submitting` means Huey may have crossed the non-idempotent Radarr POST
+Restarting Huey safely resumes `validated`, `identity_resolved`, and
+`importing` rows. It first checks Radarr/Sonarr and the final DAS state, so a
+completed move is recovered without another POST.
+
+`import_submitting` means Huey may have crossed the non-idempotent ARR POST
 boundary before persisting the command ID. Startup fails that row closed to
-`manual_review` and emits one `#import-errors` event. Inspect Radarr history,
-the movie entity, the source path, and `/mnt/media/movies` before changing that
+`manual_review` and emits one `#import-errors` event. Inspect Radarr or Sonarr
+history, the entity, the source path, and `/mnt/media` before changing that
 state; never replay the delivery blindly. `manual_review` and `failed` are
 terminal until an operator deliberately corrects metadata or imports the file.
 
@@ -494,10 +501,21 @@ a new file-derived identity without overwriting the audit row.
 Before enabling the worker, require all of the following:
 
 1. `/mnt/media` is mounted read/write and the normal deploy write probe passes.
-2. Radarr reports `/media/movies` accessible.
-3. BatFire has delivered exactly one deterministic MKV plus `manifest.json`.
-4. The manifest title/year and optional IMDb/TMDb ID identify one movie.
+2. Radarr reports `/media/movies` accessible and Sonarr reports the TV root
+   accessible.
+3. BatFire has delivered either one deterministic movie MKV plus `manifest.json`
+   or a grouped manifest-last delivery.
+4. Movie manifests identify one movie; TV manifests identify one series, one
+   season, and explicit episode numbers.
 
-Then set `PHYSICAL_MEDIA_ENABLED=true` and recreate only Huey and Radarr (their
-mount specifications changed). If no safe artifact exists, leave the flag false;
-read-only API, schema, and mount validation are the supported stopping boundary.
+Then set `PHYSICAL_MEDIA_ENABLED=true` and recreate Huey, Radarr, and Sonarr
+when their mount specifications changed. If no safe artifact exists, leave the
+flag false; read-only API, schema, and mount validation are the supported
+stopping boundary.
+
+BatFire owns the optical-drive trigger outside Docker. Rebuild the host trigger
+from the tracked files in `scripts/batfire/`: install
+`99-arm-physical-media.rules` to `/etc/udev/rules.d/`, install
+`arm-disc-trigger@.service` to `/etc/systemd/system/`, install
+`arm-disc-trigger` to `/usr/local/sbin/`, reload udev/systemd, and keep
+container-local ARM udev rules disabled so only the host starts jobs.

@@ -288,6 +288,7 @@ services:
     volumes:
       - ./config/sonarr:/config
       - ${TORRENT_ROOT:-/home/wyseadmin/homelab/state/torrents}:/downloads
+      - ${PHYSICAL_MEDIA_ROOT:-/home/wyseadmin/homelab/state/physical-media}:/downloads/physical-media
       - ${MEDIA_ROOT:-/mnt/media}:/media
     ports:
       - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${SONARR_PORT:-8989}:8989"
@@ -480,8 +481,10 @@ services:
       PHYSICAL_MEDIA_ENABLED: ${PHYSICAL_MEDIA_ENABLED:-false}
       PHYSICAL_MEDIA_INTAKE_PATH: /physical-media/incoming
       PHYSICAL_MEDIA_RADARR_PATH: /downloads/physical-media/incoming
+      PHYSICAL_MEDIA_SONARR_PATH: /downloads/physical-media/incoming
       PHYSICAL_MEDIA_DAS_PATH: /media
       PHYSICAL_MEDIA_MIN_SIZE_BYTES: ${PHYSICAL_MEDIA_MIN_SIZE_BYTES:-52428800}
+      PHYSICAL_MEDIA_VERIFY_FINAL_HASH: ${PHYSICAL_MEDIA_VERIFY_FINAL_HASH:-false}
     volumes:
       - ./state/huey:/state
       - ${PHYSICAL_MEDIA_ROOT:-/home/wyseadmin/homelab/state/physical-media}:/physical-media

@@ -130,6 +130,13 @@ CREATE TABLE IF NOT EXISTS trusted_library_events (
     year INTEGER CHECK (year IS NULL OR year BETWEEN 1878 AND 2200),
     imdb_id TEXT,
     tmdb_id INTEGER,
+    media_type TEXT NOT NULL DEFAULT 'movie' CHECK (
+        media_type IN ('movie', 'tv', 'nonstandard', 'ambiguous')
+    ),
+    group_key TEXT,
+    sonarr_series_id INTEGER,
+    sonarr_command_id INTEGER,
+    metadata_json TEXT CHECK (metadata_json IS NULL OR length(metadata_json) BETWEEN 2 AND 65536),
     state TEXT NOT NULL DEFAULT 'received' CHECK (state IN (
         'received', 'validated', 'identity_resolved', 'import_submitting',
         'importing', 'completed', 'manual_review', 'failed'

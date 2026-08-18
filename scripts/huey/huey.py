@@ -30,7 +30,7 @@ try:
         terminal_notifications,
     )
     from .orchestrator import RequestProcessor
-    from .physical_media import PhysicalMediaIntake, PhysicalRadarrClient
+    from .physical_media import PhysicalMediaIntake, PhysicalRadarrClient, PhysicalSonarrClient
     from .results import sanitize_display_text
     from .services import ServiceRegistry
 except ImportError:  # Direct execution from /app/scripts/huey/huey.py.
@@ -48,7 +48,7 @@ except ImportError:  # Direct execution from /app/scripts/huey/huey.py.
         terminal_notifications,
     )
     from orchestrator import RequestProcessor
-    from physical_media import PhysicalMediaIntake, PhysicalRadarrClient
+    from physical_media import PhysicalMediaIntake, PhysicalRadarrClient, PhysicalSonarrClient
     from results import sanitize_display_text
     from services import ServiceRegistry
 
@@ -2069,6 +2069,9 @@ def main() -> None:
         radarr_api_key = os.environ.get("RADARR_API_KEY", "").strip()
         if not radarr_api_key:
             raise SystemExit("RADARR_API_KEY missing for physical-media intake")
+        sonarr_api_key = os.environ.get("SONARR_API_KEY", "").strip()
+        if not sonarr_api_key:
+            raise SystemExit("SONARR_API_KEY missing for physical-media intake")
         try:
             physical_min_size = int(
                 os.environ.get(
@@ -2081,6 +2084,11 @@ def main() -> None:
             ) from error
         if not 1 <= physical_min_size <= 10**13:
             raise SystemExit("PHYSICAL_MEDIA_MIN_SIZE_BYTES is outside the safe range")
+        verify_final_hash = os.environ.get(
+            "PHYSICAL_MEDIA_VERIFY_FINAL_HASH", "false"
+        ).strip()
+        if verify_final_hash not in {"true", "false"}:
+            raise SystemExit("PHYSICAL_MEDIA_VERIFY_FINAL_HASH must be literal true or false")
         physical_media_intake = PhysicalMediaIntake(
             store,
             PhysicalRadarrClient(
@@ -2091,11 +2099,20 @@ def main() -> None:
             os.environ.get(
                 "PHYSICAL_MEDIA_INTAKE_PATH", "/physical-media/incoming"
             ),
+            sonarr=PhysicalSonarrClient(
+                os.environ.get("SONARR_URL", "http://sonarr:8989"),
+                sonarr_api_key,
+                root_folder=os.environ.get("SONARR_ROOT_FOLDER") or None,
+            ),
             radarr_intake_root=os.environ.get(
                 "PHYSICAL_MEDIA_RADARR_PATH", "/downloads/physical-media/incoming"
             ),
+            sonarr_intake_root=os.environ.get(
+                "PHYSICAL_MEDIA_SONARR_PATH", "/downloads/physical-media/incoming"
+            ),
             media_root=os.environ.get("PHYSICAL_MEDIA_DAS_PATH", "/media"),
             min_size_bytes=physical_min_size,
+            verify_final_hash=verify_final_hash == "true",
         )
     client = build_client(
         channel_config,

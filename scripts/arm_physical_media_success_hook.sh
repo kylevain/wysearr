@@ -46,7 +46,7 @@ with sqlite3.connect(database) as connection:
             ) AS duration_seconds
         FROM job j
         WHERE j.stop_time IS NULL
-          AND j.video_type IN ('movie', 'unknown')
+          AND j.video_type IN ('movie', 'tv', 'unknown')
           AND j.disctype IN ('dvd', 'bluray')
           AND COALESCE(j.errors, '') = ''
         ORDER BY j.job_id DESC
@@ -62,11 +62,14 @@ job_path = Path(row["path"] or "").resolve()
 if completed_root not in job_path.parents:
     raise SystemExit(f"fail-closed: ARM job path is outside {completed_root}")
 
-mkvs = [path for path in job_path.iterdir() if path.is_file() and path.suffix.lower() == ".mkv"]
-if len(mkvs) != 1:
-    raise SystemExit(f"fail-closed: expected one completed main-feature MKV, found {len(mkvs)}")
-if mkvs[0].stat().st_size < 52_428_800:
-    raise SystemExit("fail-closed: completed main-feature MKV is below the minimum size")
+mkvs = sorted(path for path in job_path.iterdir() if path.is_file() and path.suffix.lower() == ".mkv")
+if not mkvs:
+    raise SystemExit("fail-closed: expected at least one completed MKV")
+substantial = [path for path in mkvs if path.stat().st_size >= 52_428_800]
+if not substantial:
+    raise SystemExit("fail-closed: completed MKVs are below the minimum size")
+media_type = "movie" if len(substantial) == 1 else "ambiguous"
+source = substantial[0] if media_type == "movie" else job_path
 
 environment = os.environ.copy()
 environment.update({
@@ -74,8 +77,9 @@ environment.update({
     "WYSEARR_SSH_USER": "wyseadmin",
     "WYSEARR_SSH_IDENTITY": "/home/arm/.ssh/id_ed25519_wysearr_physical",
     "WYSEARR_PHYSICAL_ROOT": "/home/wyseadmin/homelab/state/physical-media/incoming",
+    "PHYSICAL_MEDIA_TYPE": media_type,
 })
-arguments = [str(helper), str(mkvs[0]), str(row["title"] or "")]
+arguments = [str(helper), str(source), str(row["title"] or "")]
 arguments.append(str(row["year"] or ""))
 arguments.append(str(row["imdb_id"] or ""))
 arguments.append(str(row["label"] or ""))

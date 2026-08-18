@@ -1,4 +1,4 @@
-"""Durable, fail-closed physical DVD/Blu-ray intake for Radarr."""
+"""Durable, fail-closed physical DVD/Blu-ray intake for Radarr and Sonarr."""
 
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .clients import RadarrClient, ServiceError
+    from .clients import RadarrClient, ServiceError, SonarrClient
     from .database import RequestStore
     from .notifications import physical_media_notification
 except ImportError:  # pragma: no cover - direct container entrypoint
-    from clients import RadarrClient, ServiceError
+    from clients import RadarrClient, ServiceError, SonarrClient
     from database import RequestStore
     from notifications import physical_media_notification
 
@@ -33,6 +33,7 @@ _ACTIVE_STATES = (
     "import_submitting",
     "importing",
 )
+_MEDIA_TYPES = frozenset({"movie", "tv", "nonstandard", "ambiguous"})
 
 
 class PhysicalMediaError(ValueError):
@@ -93,6 +94,25 @@ def _deterministic_mkv_name(title: object, year: object) -> str:
     return f"{safe_title} ({parsed_year}).mkv"
 
 
+def _safe_file_basename(value: object) -> str:
+    name = str(value or "")
+    if (
+        not name
+        or Path(name).name != name
+        or Path(name).suffix.casefold() != ".mkv"
+        or any(marker in name for marker in ("\x00", "/", "\\"))
+    ):
+        raise PhysicalMediaError("manifest must name MKV basenames")
+    return name
+
+
+def _safe_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if not 2 <= len(encoded) <= 65536:
+        raise PhysicalMediaError("physical-media evidence is too large")
+    return json.loads(encoded)
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -115,8 +135,14 @@ def load_delivery_manifest(
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PhysicalMediaError("delivery manifest is not valid UTF-8 JSON") from error
-    if not isinstance(raw, Mapping) or raw.get("version") != 1:
+    if not isinstance(raw, Mapping) or raw.get("version") not in {1, 2}:
         raise PhysicalMediaError("delivery manifest version is unsupported")
+    media_type = str(raw.get("media_type") or "movie").casefold()
+    if media_type not in _MEDIA_TYPES:
+        raise PhysicalMediaError("physical-media type is unsupported")
+
+    if media_type != "movie":
+        return load_grouped_delivery_manifest(path, raw, min_size_bytes=min_size_bytes)
 
     omdb = raw.get("omdb") if isinstance(raw.get("omdb"), Mapping) else {}
     title = _clean_title(raw.get("title") or omdb.get("Title"))
@@ -198,6 +224,153 @@ def load_delivery_manifest(
         "arm_title": arm_title,
         "arm_year": arm_year,
         "arm_imdb_id": arm_imdb_id,
+        "media_type": "movie",
+        "group_key": fingerprint,
+        "metadata": {},
+    }
+
+
+def load_grouped_delivery_manifest(
+    path: Path,
+    raw: Mapping[str, Any],
+    *,
+    min_size_bytes: int,
+) -> dict[str, Any]:
+    """Validate grouped physical-video deliveries without assuming one movie."""
+
+    media_type = str(raw.get("media_type") or "").casefold()
+    files = raw.get("files")
+    if not isinstance(files, list) or not files:
+        raise PhysicalMediaError("grouped physical-media manifest requires files")
+    title = _clean_title(raw.get("series_title") or raw.get("title") or "Physical Video")
+    year = _optional_integer(raw.get("year"), label="video year", minimum=1878, maximum=2200)
+    disc_label = _optional_safe_text(raw.get("disc_label"), label="disc label", limit=120)
+    dvd_crc64 = str(raw.get("dvd_crc64") or "").casefold() or None
+    if dvd_crc64 is not None and not _CRC64.fullmatch(dvd_crc64):
+        raise PhysicalMediaError("DVD CRC64 fingerprint is invalid")
+    arm_job_id = _optional_integer(
+        raw.get("arm_job_id"), label="ARM job id", minimum=1, maximum=10**12
+    )
+    total_size = 0
+    group_digest = hashlib.sha256()
+    normalized_files: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    seen_episodes: set[int] = set()
+    for index, item in enumerate(files, start=1):
+        if not isinstance(item, Mapping):
+            raise PhysicalMediaError("grouped physical-media files must be objects")
+        file_name = _safe_file_basename(item.get("file"))
+        if file_name in seen_names:
+            raise PhysicalMediaError("grouped physical-media file names must be unique")
+        seen_names.add(file_name)
+        media_path = path.parent / file_name
+        if media_path.is_symlink() or not media_path.is_file():
+            raise PhysicalMediaError("grouped MKV is missing or is not a regular file")
+        expected_size = _integer(
+            item.get("size_bytes"), "MKV size", min_size_bytes, 10**13
+        )
+        actual_size = media_path.stat().st_size
+        if actual_size != expected_size:
+            raise PhysicalMediaError("grouped MKV size does not match the manifest")
+        with media_path.open("rb") as stream:
+            if stream.read(4) != b"\x1aE\xdf\xa3":
+                raise PhysicalMediaError("grouped file does not have an MKV/EBML header")
+        fingerprint = str(item.get("sha256") or "").casefold()
+        if not _SHA256.fullmatch(fingerprint) or _sha256_file(media_path) != fingerprint:
+            raise PhysicalMediaError("grouped MKV SHA-256 does not match the manifest")
+        duration_seconds = _optional_integer(
+            item.get("duration_seconds"),
+            label="title duration",
+            minimum=60,
+            maximum=24 * 60 * 60,
+        )
+        normalized: dict[str, Any] = {
+            "file": file_name,
+            "sha256": fingerprint,
+            "size_bytes": actual_size,
+            "duration_seconds": duration_seconds,
+            "source_path": str(media_path),
+            "track_number": _optional_integer(
+                item.get("track_number"), label="track number", minimum=1, maximum=9999
+            ) or index,
+            "kind": str(item.get("kind") or "episode").casefold(),
+        }
+        if media_type == "tv":
+            episode_number = _integer(
+                item.get("episode"), "episode number", minimum=1, maximum=2000
+            )
+            if episode_number in seen_episodes:
+                raise PhysicalMediaError("episode mapping contains duplicate episode numbers")
+            seen_episodes.add(episode_number)
+            normalized["episode"] = episode_number
+            normalized["season"] = _integer(
+                item.get("season") or raw.get("season"),
+                "season number",
+                minimum=0,
+                maximum=1000,
+            )
+            normalized["episode_title"] = _optional_safe_text(
+                item.get("episode_title"), label="episode title", limit=200
+            )
+            if normalized["kind"] != "episode":
+                raise PhysicalMediaError("TV automation accepts only explicit episode files")
+        total_size += actual_size
+        group_digest.update(fingerprint.encode("ascii"))
+        group_digest.update(b"\0")
+        normalized_files.append(normalized)
+
+    if media_type == "tv":
+        season = _integer(raw.get("season"), "season number", minimum=0, maximum=1000)
+        if any(int(item["season"]) != season for item in normalized_files):
+            raise PhysicalMediaError("episode mapping crosses seasons")
+        series_title = _clean_title(raw.get("series_title") or raw.get("title"))
+        metadata = _safe_metadata({
+            "series_title": series_title,
+            "season": season,
+            "files": normalized_files,
+            "disc_label": disc_label,
+            "dvd_crc64": dvd_crc64,
+            "arm_job_id": arm_job_id,
+        })
+        return {
+            "title": series_title,
+            "year": year,
+            "imdb_id": None,
+            "tmdb_id": None,
+            "fingerprint": group_digest.hexdigest(),
+            "size_bytes": total_size,
+            "host_path": str(path.parent),
+            "manifest_path": str(path),
+            "disc_label": disc_label,
+            "dvd_crc64": dvd_crc64,
+            "arm_job_id": arm_job_id,
+            "media_type": "tv",
+            "group_key": f"tv:{_title_key(series_title)}:s{season:04d}:{dvd_crc64 or group_digest.hexdigest()[:16]}",
+            "metadata": metadata,
+        }
+
+    metadata = _safe_metadata({
+        "files": normalized_files,
+        "disc_label": disc_label,
+        "dvd_crc64": dvd_crc64,
+        "arm_job_id": arm_job_id,
+        "classification_reason": raw.get("classification_reason"),
+    })
+    return {
+        "title": title,
+        "year": year,
+        "imdb_id": None,
+        "tmdb_id": None,
+        "fingerprint": group_digest.hexdigest(),
+        "size_bytes": total_size,
+        "host_path": str(path.parent),
+        "manifest_path": str(path),
+        "disc_label": disc_label,
+        "dvd_crc64": dvd_crc64,
+        "arm_job_id": arm_job_id,
+        "media_type": media_type,
+        "group_key": f"{media_type}:{group_digest.hexdigest()}",
+        "metadata": metadata,
     }
 
 
@@ -263,6 +436,21 @@ class PhysicalRadarrClient(RadarrClient):
 
         candidate_key = self._movie_key(candidate)
         candidate_runtime = self._runtime_minutes(candidate)
+        manual_resolution = evidence.get("manual_resolution")
+        if (
+            isinstance(manual_resolution, Mapping)
+            and manual_resolution.get("type") == "movie"
+            and (identity.get("tmdb_id") or identity.get("imdb_id"))
+            and (
+                not identity.get("tmdb_id")
+                or int(candidate.get("tmdbId") or 0) == int(identity["tmdb_id"])
+            )
+            and (
+                not identity.get("imdb_id")
+                or str(candidate.get("imdbId") or "") == identity["imdb_id"]
+            )
+        ):
+            return
 
         def runtime_delta(movie: Mapping[str, Any]) -> int | None:
             runtime = self._runtime_minutes(movie)
@@ -434,6 +622,148 @@ class PhysicalRadarrClient(RadarrClient):
         return files[0]
 
 
+class PhysicalSonarrClient(SonarrClient):
+    """Sonarr operations used by the trusted physical-media state machine."""
+
+    def resolve_series(self, identity: Mapping[str, Any]) -> Mapping[str, Any]:
+        title = str(identity.get("title") or "")
+        candidates = self.lookup(title)
+        exact = [
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, Mapping)
+            and _title_key(candidate.get("title")) == _title_key(title)
+        ]
+        if len(exact) != 1:
+            raise PhysicalMediaError("Sonarr did not return one exact series identity")
+        return exact[0]
+
+    def ensure_series(self, candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        if candidate.get("id"):
+            return self._get_entity(int(candidate["id"]))
+        series = self._request("GET", self._api("series"))
+        if not isinstance(series, list):
+            raise ServiceError("sonarr returned an invalid series library")
+        tvdb_id = int(candidate.get("tvdbId") or candidate.get("tvdb_id") or 0)
+        title_slug = str(candidate.get("titleSlug") or "")
+        existing = [
+            item
+            for item in series
+            if isinstance(item, Mapping)
+            and (
+                (tvdb_id and int(item.get("tvdbId") or 0) == tvdb_id)
+                or (title_slug and str(item.get("titleSlug") or "") == title_slug)
+            )
+            and _title_key(item.get("title")) == _title_key(candidate.get("title"))
+        ]
+        if len(existing) == 1:
+            return existing[0]
+        if len(existing) > 1:
+            raise PhysicalMediaError("Sonarr has multiple matching series library entries")
+        payload = self._payload(
+            candidate, self._discover_root_folder(), self._discover_quality_profile()
+        )
+        payload["monitored"] = False
+        payload["seasonFolder"] = True
+        payload["addOptions"] = {"searchForMissingEpisodes": False}
+        added = self._request("POST", self._api("series"), json=payload)
+        if not isinstance(added, Mapping) or not added.get("id"):
+            raise ServiceError("sonarr did not confirm the physical series identity")
+        return added
+
+    def episodes_for_season(self, series_id: int, season: int) -> list[Mapping[str, Any]]:
+        episodes = self._request(
+            "GET",
+            self._api("episode"),
+            params={"seriesId": int(series_id), "seasonNumber": int(season)},
+        )
+        if not isinstance(episodes, list):
+            raise ServiceError("sonarr returned invalid episode metadata")
+        return [item for item in episodes if isinstance(item, Mapping)]
+
+    def start_manual_import(
+        self,
+        *,
+        series_id: int,
+        source_dir: str,
+        files: list[Mapping[str, Any]],
+        fingerprint: str,
+    ) -> int:
+        previews = self._request(
+            "GET",
+            self._api("manualimport"),
+            params={
+                "folder": source_dir,
+                "filterExistingFiles": "true",
+                "seriesId": int(series_id),
+            },
+        )
+        if not isinstance(previews, list):
+            raise ServiceError("sonarr returned an invalid manual-import preview")
+        by_path = {
+            str(item.get("path")): item
+            for item in previews
+            if isinstance(item, Mapping) and item.get("path")
+        }
+        payload_files: list[dict[str, Any]] = []
+        for file_item in files:
+            path = str(file_item["sonarr_path"])
+            preview = by_path.get(path)
+            if not preview or preview.get("rejections"):
+                raise PhysicalMediaError("Sonarr manual-import preview rejected or could not correlate an episode MKV")
+            episode_ids = preview.get("episodeIds")
+            if not isinstance(episode_ids, list) or len(episode_ids) != 1:
+                raise PhysicalMediaError("Sonarr manual-import preview did not resolve one episode")
+            file_payload = {
+                key: preview.get(key)
+                for key in (
+                    "path", "seriesId", "episodeIds", "quality", "languages",
+                    "releaseGroup", "customFormats", "customFormatScore",
+                    "indexerFlags",
+                )
+                if preview.get(key) is not None
+            }
+            file_payload["seriesId"] = int(series_id)
+            file_payload["downloadId"] = f"physical-disc:{fingerprint}"
+            payload_files.append(file_payload)
+        command = self._request(
+            "POST",
+            self._api("command"),
+            json={"name": "ManualImport", "files": payload_files, "importMode": "move"},
+        )
+        if not isinstance(command, Mapping) or not command.get("id"):
+            raise ServiceError("sonarr did not confirm the manual-import command")
+        return int(command["id"])
+
+    def command_state(self, command_id: int) -> str:
+        command = self._request("GET", self._api(f"command/{int(command_id)}"))
+        if not isinstance(command, Mapping):
+            raise ServiceError("sonarr returned an invalid command state")
+        return str(command.get("status") or "").casefold()
+
+    def imported_episode_paths(
+        self, series_id: int, season: int, episodes: list[int]
+    ) -> list[str] | None:
+        expected = set(int(item) for item in episodes)
+        records = self.episodes_for_season(series_id, season)
+        paths: list[str] = []
+        for record in records:
+            number = int(record.get("episodeNumber") or 0)
+            if number not in expected:
+                continue
+            file_id = int(record.get("episodeFileId") or 0)
+            if file_id <= 0:
+                return None
+            episode_file = record.get("episodeFile")
+            path = (
+                episode_file.get("path")
+                if isinstance(episode_file, Mapping)
+                else record.get("path")
+            )
+            paths.append(str(path or f"episodeFileId:{file_id}"))
+        return paths if len(paths) == len(expected) else None
+
+
 class PhysicalMediaIntake:
     """Advance trusted deliveries one durable, replay-safe transition at a time."""
 
@@ -443,20 +773,30 @@ class PhysicalMediaIntake:
         radarr: PhysicalRadarrClient,
         intake_root: str | Path,
         *,
+        sonarr: PhysicalSonarrClient | None = None,
         radarr_intake_root: str = "/downloads/physical-media/incoming",
+        sonarr_intake_root: str = "/downloads/physical-media/incoming",
         media_root: str | Path = "/media",
         min_size_bytes: int = 50 * 1024 * 1024,
+        verify_final_hash: bool = True,
     ):
         self.store = store
         self.radarr = radarr
+        self.sonarr = sonarr
         self.intake_root = Path(intake_root)
         self.radarr_intake_root = Path(radarr_intake_root)
+        self.sonarr_intake_root = Path(sonarr_intake_root)
         self.media_root = Path(media_root)
         self.min_size_bytes = int(min_size_bytes)
+        self.verify_final_hash = bool(verify_final_hash)
 
     def _radarr_source_path(self, host_path: str) -> str:
         relative = Path(host_path).relative_to(self.intake_root)
         return str(self.radarr_intake_root / relative)
+
+    def _sonarr_source_path(self, host_path: str) -> str:
+        relative = Path(host_path).relative_to(self.intake_root)
+        return str(self.sonarr_intake_root / relative)
 
     @staticmethod
     def _manifest_source(manifest_path: Path) -> tuple[str, str] | None:
@@ -526,6 +866,17 @@ class PhysicalMediaIntake:
         if _sha256_file(path) != str(event["source_fingerprint"]):
             raise PhysicalMediaError("trusted physical-media MKV checksum changed before import")
 
+    def _verify_staged_source_metadata(
+        self, path: Path, event: Mapping[str, Any]
+    ) -> None:
+        if path.is_symlink() or not path.is_file():
+            raise PhysicalMediaError("trusted physical-media MKV is missing")
+        if path.stat().st_size != int(event["size_bytes"]):
+            raise PhysicalMediaError("trusted physical-media MKV size changed before import")
+        manifest_source = self._manifest_source(path.parent / "manifest.json")
+        if manifest_source != (str(event["source_fingerprint"]), str(path)):
+            raise PhysicalMediaError("trusted physical-media manifest no longer matches the staged MKV")
+
     def _rewrite_manifest_file(self, manifest_path: Path, file_name: str) -> None:
         try:
             raw = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -546,7 +897,11 @@ class PhysicalMediaIntake:
 
     def _identity_evidence(self, event: Mapping[str, Any]) -> dict[str, Any]:
         source_path = Path(str(event["source_path"]))
-        manifest_path = source_path.parent / "manifest.json"
+        manifest_path = (
+            source_path / "manifest.json"
+            if str(event.get("media_type") or "movie") != "movie"
+            else source_path.parent / "manifest.json"
+        )
         try:
             raw = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
@@ -566,9 +921,19 @@ class PhysicalMediaIntake:
         ):
             if raw.get(key) not in (None, ""):
                 evidence[key] = raw[key]
+        if isinstance(raw.get("manual_resolution"), Mapping):
+            evidence["manual_resolution"] = dict(raw["manual_resolution"])
         if "duration_seconds" not in evidence and "main_feature_seconds" in evidence:
             evidence["duration_seconds"] = evidence["main_feature_seconds"]
         return evidence
+
+    @staticmethod
+    def _event_metadata(event: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            value = json.loads(str(event.get("metadata_json") or "{}"))
+        except json.JSONDecodeError:
+            return {}
+        return value if isinstance(value, dict) else {}
 
     def _prepare_import_source(self, event: Mapping[str, Any]) -> Path:
         source_path = Path(str(event["source_path"]))
@@ -598,7 +963,7 @@ class PhysicalMediaIntake:
                 raise PhysicalMediaError("trusted physical-media MKV is missing")
             source = matches[0]
 
-        self._verify_staged_source(source, event)
+        self._verify_staged_source_metadata(source, event)
         if source != desired:
             if desired.exists() and desired != source:
                 self._verify_staged_source(desired, event)
@@ -609,6 +974,102 @@ class PhysicalMediaIntake:
         self._rewrite_manifest_file(source.parent / "manifest.json", source.name)
         self.store.update_trusted_library_event_source_path(int(event["id"]), str(source))
         return source
+
+    def _rewrite_grouped_manifest_files(
+        self, manifest_path: Path, replacements: Mapping[str, str]
+    ) -> None:
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise PhysicalMediaError("delivery manifest is not valid UTF-8 JSON") from error
+        if not isinstance(raw, dict) or not isinstance(raw.get("files"), list):
+            raise PhysicalMediaError("grouped delivery manifest is invalid")
+        for item in raw["files"]:
+            if isinstance(item, dict) and item.get("file") in replacements:
+                item["file"] = replacements[str(item["file"])]
+        temporary = manifest_path.with_name(f"{manifest_path.name}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(raw, sort_keys=True, separators=(",", ": ")) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(manifest_path)
+        except OSError as error:
+            raise PhysicalMediaError("failed to update deterministic import manifest") from error
+
+    def _prepare_tv_sources(self, event: Mapping[str, Any]) -> tuple[Path, list[dict[str, Any]]]:
+        if self.sonarr is None:
+            raise PhysicalMediaError("TV physical-media intake requires Sonarr configuration")
+        source_dir = Path(str(event["source_path"]))
+        try:
+            source_dir.relative_to(self.intake_root)
+        except ValueError as error:
+            raise PhysicalMediaError("delivery resolves outside the physical-media intake") from error
+        if source_dir.is_symlink() or source_dir.parent != self.intake_root:
+            raise PhysicalMediaError("TV delivery directory cannot be a symlink")
+        metadata = self._event_metadata(event)
+        files = metadata.get("files")
+        if not isinstance(files, list) or not files:
+            raise PhysicalMediaError("TV delivery is missing episode mapping evidence")
+        series_title = _clean_title(metadata.get("series_title") or event.get("title"))
+        season = _integer(metadata.get("season"), "season number", 0, 1000)
+        replacements: dict[str, str] = {}
+        prepared: list[dict[str, Any]] = []
+        for item in sorted(files, key=lambda value: int(value.get("episode") or 0)):
+            if not isinstance(item, Mapping):
+                raise PhysicalMediaError("TV episode mapping is invalid")
+            episode = _integer(item.get("episode"), "episode number", 1, 2000)
+            episode_title = item.get("episode_title")
+            suffix = f" - {_SAFE_FILENAME_CHAR.sub(' ', str(episode_title)).strip(' .')}" if episode_title else ""
+            desired_name = f"{_SAFE_FILENAME_CHAR.sub(' ', series_title).strip(' .')} - S{season:02d}E{episode:02d}{suffix}.mkv"
+            current_name = _safe_file_basename(item.get("file"))
+            current_path = source_dir / current_name
+            desired_path = source_dir / desired_name
+            expected_size = int(item["size_bytes"])
+            fingerprint = str(item["sha256"])
+            source = current_path if current_path.exists() else desired_path
+            if source.is_symlink() or not source.is_file():
+                raise PhysicalMediaError("trusted TV episode MKV is missing")
+            if source.stat().st_size != expected_size or _sha256_file(source) != fingerprint:
+                raise PhysicalMediaError("trusted TV episode MKV changed before import")
+            if source != desired_path:
+                if desired_path.exists():
+                    if desired_path.stat().st_size != expected_size or _sha256_file(desired_path) != fingerprint:
+                        raise PhysicalMediaError("deterministic TV filename collides with different media")
+                    source.unlink()
+                else:
+                    source.rename(desired_path)
+            replacements[current_name] = desired_name
+            prepared.append({
+                **dict(item),
+                "source_path": str(desired_path),
+                "sonarr_path": self._sonarr_source_path(str(desired_path)),
+            })
+        if replacements:
+            self._rewrite_grouped_manifest_files(source_dir / "manifest.json", replacements)
+        return source_dir, prepared
+
+    def _validate_tv_episode_mapping(self, event: Mapping[str, Any], series_id: int) -> None:
+        if self.sonarr is None:
+            raise PhysicalMediaError("TV physical-media intake requires Sonarr configuration")
+        metadata = self._event_metadata(event)
+        files = metadata.get("files")
+        season = _integer(metadata.get("season"), "season number", 0, 1000)
+        expected = self.sonarr.episodes_for_season(series_id, season)
+        by_number = {
+            int(item.get("episodeNumber") or 0): item
+            for item in expected
+            if int(item.get("episodeNumber") or 0) > 0
+        }
+        if not isinstance(files, list):
+            raise PhysicalMediaError("TV delivery is missing episode mapping evidence")
+        missing = [
+            int(item.get("episode") or 0)
+            for item in files
+            if int(item.get("episode") or 0) not in by_number
+        ]
+        if missing:
+            raise PhysicalMediaError("TV episode mapping references episodes Sonarr does not know")
 
     def _final_file(self, event: Mapping[str, Any]) -> str | None:
         movie_id = event.get("radarr_movie_id")
@@ -625,9 +1086,25 @@ class PhysicalMediaIntake:
             raise PhysicalMediaError("Radarr final file is not a readable regular DAS file")
         if local.stat().st_size != int(event["size_bytes"]):
             raise PhysicalMediaError("Radarr final DAS file size differs from the validated MKV")
-        if _sha256_file(local) != str(event["source_fingerprint"]):
+        if self.verify_final_hash and _sha256_file(local) != str(event["source_fingerprint"]):
             raise PhysicalMediaError("Radarr final DAS file checksum differs from the validated MKV")
         return str(path)
+
+    def _final_tv_files(self, event: Mapping[str, Any]) -> str | None:
+        if self.sonarr is None or not event.get("sonarr_series_id"):
+            return None
+        metadata = self._event_metadata(event)
+        files = metadata.get("files")
+        if not isinstance(files, list) or not files:
+            return None
+        season = _integer(metadata.get("season"), "season number", 0, 1000)
+        episodes = [_integer(item.get("episode"), "episode number", 1, 2000) for item in files if isinstance(item, Mapping)]
+        paths = self.sonarr.imported_episode_paths(
+            int(event["sonarr_series_id"]), season, episodes
+        )
+        if not paths:
+            return None
+        return json.dumps(paths, sort_keys=True, separators=(",", ":"))
 
     def _attention(self, event: Mapping[str, Any], detail: str, *, failed: bool = False) -> None:
         state = "failed" if failed else "manual_review"
@@ -646,6 +1123,12 @@ class PhysicalMediaIntake:
         for manifest_path in sorted(self.intake_root.glob("*/manifest.json")):
             if self._is_owned_moved_delivery(manifest_path, owned_events):
                 continue
+            manifest_source = self._manifest_source(manifest_path)
+            if manifest_source is not None:
+                fingerprint, source_path = manifest_source
+                event = owned_events.get(fingerprint)
+                if event and event.get("source_path") == source_path:
+                    continue
             try:
                 try:
                     manifest_path.resolve().relative_to(self.intake_root.resolve())
@@ -683,6 +1166,9 @@ class PhysicalMediaIntake:
                 year=identity["year"],
                 imdb_id=identity["imdb_id"],
                 tmdb_id=identity["tmdb_id"],
+                media_type=identity["media_type"],
+                group_key=identity["group_key"],
+                metadata=identity["metadata"],
             )
             if created:
                 self.store.transition_trusted_library_event(int(event["id"]), "validated")
@@ -693,7 +1179,14 @@ class PhysicalMediaIntake:
         changed = self.discover()
         for event in self.store.trusted_library_events(states=_ACTIVE_STATES):
             try:
-                final_path = self._final_file(event)
+                media_type = str(event.get("media_type") or "movie")
+                final_path = (
+                    self._final_tv_files(event)
+                    if media_type == "tv"
+                    else self._final_file(event)
+                    if media_type == "movie"
+                    else None
+                )
                 if final_path:
                     self.store.transition_trusted_library_event(
                         int(event["id"]), "completed", final_path=final_path
@@ -709,28 +1202,67 @@ class PhysicalMediaIntake:
                     continue
 
                 state = str(event["state"])
-                if state in {"received", "validated"}:
-                    candidate = self.radarr.resolve_movie(event)
-                    self.radarr.validate_physical_identity(
-                        event, candidate, self._identity_evidence(event)
-                    )
-                    movie = self.radarr.ensure_movie(candidate)
-                    if movie.get("hasFile") is True:
-                        raise PhysicalMediaError(
-                            "Radarr already has a different file for this movie"
-                        )
-                    self.store.transition_trusted_library_event(
-                        int(event["id"]),
-                        "identity_resolved",
-                        title=str(candidate.get("title") or event["title"]),
-                        year=int(candidate.get("year") or event["year"]),
-                        imdb_id=str(candidate.get("imdbId") or event.get("imdb_id") or "") or None,
-                        tmdb_id=int(candidate.get("tmdbId") or event.get("tmdb_id") or 0) or None,
-                        radarr_movie_id=int(movie["id"]),
+                if media_type in {"ambiguous", "nonstandard"}:
+                    self._attention(
+                        event,
+                        "Physical video is preserved and requires manual classification before library placement.",
                     )
                     changed += 1
                     continue
+                if state in {"received", "validated"}:
+                    if media_type == "tv":
+                        if self.sonarr is None:
+                            raise PhysicalMediaError("TV physical-media intake requires Sonarr configuration")
+                        candidate = self.sonarr.resolve_series(event)
+                        series = self.sonarr.ensure_series(candidate)
+                        self._validate_tv_episode_mapping(event, int(series["id"]))
+                        self.store.transition_trusted_library_event(
+                            int(event["id"]),
+                            "identity_resolved",
+                            title=str(candidate.get("title") or event["title"]),
+                            year=int(candidate.get("year") or event.get("year") or 0) or None,
+                            sonarr_series_id=int(series["id"]),
+                        )
+                    else:
+                        candidate = self.radarr.resolve_movie(event)
+                        self.radarr.validate_physical_identity(
+                            event, candidate, self._identity_evidence(event)
+                        )
+                        movie = self.radarr.ensure_movie(candidate)
+                        if movie.get("hasFile") is True:
+                            raise PhysicalMediaError(
+                                "Radarr already has a different file for this movie"
+                            )
+                        self.store.transition_trusted_library_event(
+                            int(event["id"]),
+                            "identity_resolved",
+                            title=str(candidate.get("title") or event["title"]),
+                            year=int(candidate.get("year") or event["year"]),
+                            imdb_id=str(candidate.get("imdbId") or event.get("imdb_id") or "") or None,
+                            tmdb_id=int(candidate.get("tmdbId") or event.get("tmdb_id") or 0) or None,
+                            radarr_movie_id=int(movie["id"]),
+                        )
+                    changed += 1
+                    continue
                 if state == "identity_resolved":
+                    if media_type == "tv":
+                        if self.sonarr is None:
+                            raise PhysicalMediaError("TV physical-media intake requires Sonarr configuration")
+                        source_dir, files = self._prepare_tv_sources(event)
+                        self.store.transition_trusted_library_event(
+                            int(event["id"]), "import_submitting"
+                        )
+                        command_id = self.sonarr.start_manual_import(
+                            series_id=int(event["sonarr_series_id"]),
+                            source_dir=self._sonarr_source_path(str(source_dir)),
+                            files=files,
+                            fingerprint=str(event["source_fingerprint"]),
+                        )
+                        self.store.transition_trusted_library_event(
+                            int(event["id"]), "importing", sonarr_command_id=command_id
+                        )
+                        changed += 1
+                        continue
                     source_path = self._prepare_import_source(event)
                     self.store.transition_trusted_library_event(
                         int(event["id"]), "import_submitting"
@@ -753,14 +1285,37 @@ class PhysicalMediaIntake:
                     changed += 1
                     continue
                 if state == "importing":
-                    command_state = self.radarr.command_state(int(event["radarr_command_id"]))
+                    command_state = (
+                        self.sonarr.command_state(int(event["sonarr_command_id"]))
+                        if media_type == "tv"
+                        else self.radarr.command_state(int(event["radarr_command_id"]))
+                    )
                     if command_state in {"failed", "aborted", "cancelled"}:
-                        self._attention(event, "Radarr reported that physical-media import failed.", failed=True)
+                        owner = "Sonarr" if media_type == "tv" else "Radarr"
+                        self._attention(event, f"{owner} reported that physical-media import failed.", failed=True)
                         changed += 1
                     elif command_state == "completed":
+                        final_path = (
+                            self._final_tv_files(event)
+                            if media_type == "tv"
+                            else self._final_file(event)
+                        )
+                        if final_path:
+                            self.store.transition_trusted_library_event(
+                                int(event["id"]), "completed", final_path=final_path
+                            )
+                            plan = physical_media_notification(
+                                {**dict(event), "final_path": final_path}, success=True
+                            )
+                            self.store.enqueue_trusted_notification(
+                                int(event["id"]), plan.event_key, plan.route, plan.message
+                            )
+                            changed += 1
+                            continue
+                        owner = "Sonarr" if media_type == "tv" else "Radarr"
                         self._attention(
                             event,
-                            "Radarr completed the import command but no readable final DAS file was found.",
+                            f"{owner} completed the import command but no readable final DAS file was found.",
                             failed=True,
                         )
                         changed += 1

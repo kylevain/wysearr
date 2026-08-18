@@ -85,6 +85,13 @@ _CANDIDATE_CONFIRMATION_COLUMNS = {
 _UNAVAILABLE_RETRY_COLUMNS = {
     "last_proof_check_at": "TEXT",
 }
+_TRUSTED_LIBRARY_EVENT_COLUMNS = {
+    "media_type": "TEXT NOT NULL DEFAULT 'movie'",
+    "group_key": "TEXT",
+    "sonarr_series_id": "INTEGER",
+    "sonarr_command_id": "INTEGER",
+    "metadata_json": "TEXT",
+}
 
 SHELFARR_STATUSES = frozenset(
     {
@@ -1026,6 +1033,23 @@ class RequestStore:
                 if name not in retry_columns:
                     connection.execute(
                         f"ALTER TABLE unavailable_retries "
+                        f"ADD COLUMN {name} {definition}"
+                    )
+        trusted_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'trusted_library_events'"
+        ).fetchone()
+        if trusted_table is not None:
+            trusted_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(trusted_library_events)"
+                ).fetchall()
+            }
+            for name, definition in _TRUSTED_LIBRARY_EVENT_COLUMNS.items():
+                if name not in trusted_columns:
+                    connection.execute(
+                        f"ALTER TABLE trusted_library_events "
                         f"ADD COLUMN {name} {definition}"
                     )
 
@@ -4860,6 +4884,9 @@ class RequestStore:
         year: int | None = None,
         imdb_id: str | None = None,
         tmdb_id: int | None = None,
+        media_type: str = "movie",
+        group_key: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Persist one physical-disc identity without creating a Huey request."""
 
@@ -4868,13 +4895,20 @@ class RequestStore:
             raise ValueError("Trusted event fingerprint must be a SHA-256 value")
         if not source_path or int(size_bytes) <= 0:
             raise ValueError("Trusted event requires a non-empty source file")
+        if media_type not in {"movie", "tv", "nonstandard", "ambiguous"}:
+            raise ValueError("Trusted event media type is invalid")
+        metadata_json = None
+        if metadata is not None:
+            metadata_json = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+            if not 2 <= len(metadata_json) <= 65536:
+                raise ValueError("Trusted event metadata is too large")
         with self.connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO trusted_library_events (
                     source_type, source_fingerprint, source_path, size_bytes,
-                    title, year, imdb_id, tmdb_id
-                ) VALUES ('physical-disc', ?, ?, ?, ?, ?, ?, ?)
+                    title, year, imdb_id, tmdb_id, media_type, group_key, metadata_json
+                ) VALUES ('physical-disc', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fingerprint,
@@ -4884,6 +4918,9 @@ class RequestStore:
                     year,
                     imdb_id,
                     tmdb_id,
+                    media_type,
+                    group_key,
+                    metadata_json,
                 ),
             )
             row = connection.execute(
@@ -4937,6 +4974,8 @@ class RequestStore:
         tmdb_id: int | None = None,
         radarr_movie_id: int | None = None,
         radarr_command_id: int | None = None,
+        sonarr_series_id: int | None = None,
+        sonarr_command_id: int | None = None,
         final_path: str | None = None,
         error: str | None = None,
     ) -> bool:
@@ -4955,12 +4994,15 @@ class RequestStore:
                     imdb_id = COALESCE(?, imdb_id), tmdb_id = COALESCE(?, tmdb_id),
                     radarr_movie_id = COALESCE(?, radarr_movie_id),
                     radarr_command_id = COALESCE(?, radarr_command_id),
+                    sonarr_series_id = COALESCE(?, sonarr_series_id),
+                    sonarr_command_id = COALESCE(?, sonarr_command_id),
                     final_path = COALESCE(?, final_path), error = ?
                 WHERE id = ? AND state != 'completed'
                 """,
                 (
                     state, title, year, imdb_id, tmdb_id, radarr_movie_id,
-                    radarr_command_id, final_path, error, int(event_id),
+                    radarr_command_id, sonarr_series_id, sonarr_command_id,
+                    final_path, error, int(event_id),
                 ),
             )
             return cursor.rowcount == 1

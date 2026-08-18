@@ -71,11 +71,13 @@ def physical_media_notification(
     title = safe_display_title(event.get("title"), "unidentified physical disc")
     year = event.get("year")
     label = f"{title} ({year})" if year else title
+    media_type = str(event.get("media_type") or "movie").casefold()
+    owner = "Sonarr" if media_type == "tv" else "the physical-video library" if media_type == "nonstandard" else "Radarr"
     if success:
         return _plan(
             "library_imported",
             f"📚 New library item from physical disc: {label} was imported "
-            "to its DAS library path by Radarr.",
+            f"to its DAS library path by {owner}.",
         )
     detail = sanitize_display_text(event.get("error"), limit=500)
     if not detail or _SENSITIVE_DETAIL.search(str(event.get("error") or "")):

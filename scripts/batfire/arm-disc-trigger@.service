@@ -1,0 +1,10 @@
+[Unit]
+Description=Trigger ARM for optical disc %I
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/arm-disc-trigger /dev/%I
+TimeoutStartSec=120
+Nice=5

@@ -14,7 +14,7 @@ Host: `wysearr` (`192.168.4.86`) on Debian 13. Docker Compose project: `wysearr`
 | ABBA | Compose-only `http://abba:5078` | Feature-gated AudioBookBay search and qBittorrent submission | `config/abba/abba.db` |
 | Sonarr | `http://192.168.4.86:8989` | TV acquisition/import | `config/sonarr` |
 | Radarr | `http://192.168.4.86:7878` | Movie acquisition/import | `config/radarr` |
-| Physical-media intake | no port; Huey worker | Validated ARM MKV handoff to Radarr | `state/physical-media/incoming`, `state/huey/huey.db` |
+| Physical-media intake | no port; Huey worker | Validated ARM MKV/group handoff to Radarr, Sonarr, or physical-video review | `state/physical-media/incoming`, `state/huey/huey.db` |
 | Lidarr | `http://192.168.4.86:8686` | Music acquisition/import | `config/lidarr` |
 | Bazarr | `http://192.168.4.86:6767` | Sonarr/Radarr subtitles | `config/bazarr` |
 | Whisparr | `http://192.168.4.86:6969` | Adult-library acquisition/import | `config/whisparr` |

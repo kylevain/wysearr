@@ -17,6 +17,7 @@ from physical_media import (
     PhysicalMediaError,
     PhysicalMediaIntake,
     PhysicalRadarrClient,
+    PhysicalSonarrClient,
     load_delivery_manifest,
 )
 from huey import reconcile_notifications
@@ -135,6 +136,59 @@ class CollisionRadarr(PhysicalRadarrClient):
         return 81
 
 
+class FakeSonarr:
+    def __init__(self):
+        self.imported = False
+        self.command = "started"
+        self.start_calls = []
+
+    def resolve_series(self, identity):
+        return {"id": 55, "title": identity["title"], "tvdbId": 1234}
+
+    def ensure_series(self, candidate):
+        return {**candidate, "id": 55, "statistics": {"episodeFileCount": 0}}
+
+    def episodes_for_season(self, series_id, season):
+        return [
+            {"id": 101, "episodeNumber": 1, "episodeFileId": 1001 if self.imported else 0, "episodeFile": {"path": "/media/tv/Upload/Season 01/Upload - S01E01.mkv"}},
+            {"id": 102, "episodeNumber": 2, "episodeFileId": 1002 if self.imported else 0, "episodeFile": {"path": "/media/tv/Upload/Season 01/Upload - S01E02.mkv"}},
+            {"id": 103, "episodeNumber": 3, "episodeFileId": 0},
+        ]
+
+    def start_manual_import(self, **values):
+        self.start_calls.append(values)
+        return 91
+
+    def command_state(self, command_id):
+        self.last_command_id = command_id
+        return self.command
+
+    def imported_episode_paths(self, series_id, season, episodes):
+        if not self.imported:
+            return None
+        return [
+            f"/media/tv/Upload/Season 01/Upload - S01E{episode:02d}.mkv"
+            for episode in episodes
+        ]
+
+
+class PreviewSonarr(PhysicalSonarrClient):
+    def __init__(self, preview):
+        self.preview = preview
+        self.calls = []
+
+    def _api(self, endpoint):
+        return endpoint
+
+    def _request(self, method, endpoint, **kwargs):
+        self.calls.append((method, endpoint, kwargs))
+        if method == "GET" and endpoint == "manualimport":
+            return self.preview
+        if method == "POST" and endpoint == "command":
+            return {"id": 91}
+        raise AssertionError(f"unexpected request: {method} {endpoint}")
+
+
 class PhysicalMediaTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -150,6 +204,7 @@ class PhysicalMediaTests(unittest.TestCase):
             self.store,
             self.radarr,
             self.intake_root,
+            sonarr=FakeSonarr(),
             media_root=self.media_root,
             min_size_bytes=4,
         )
@@ -177,6 +232,39 @@ class PhysicalMediaTests(unittest.TestCase):
             manifest.update(extra)
         if not valid:
             manifest.pop("year")
+        path = folder / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path, manifest
+
+    def tv_delivery(self):
+        folder = self.intake_root / "arm-tv"
+        folder.mkdir(exist_ok=True)
+        files = []
+        for episode in (1, 2):
+            media = folder / f"title{episode:02d}.mkv"
+            payload = b"\x1aE\xdf\xa3" + f"episode-{episode}".encode()
+            media.write_bytes(payload)
+            files.append({
+                "file": media.name,
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "duration_seconds": 1500,
+                "track_number": episode,
+                "season": 1,
+                "episode": episode,
+                "episode_title": f"Episode {episode}",
+                "kind": "episode",
+            })
+        manifest = {
+            "version": 2,
+            "source": "arm",
+            "media_type": "tv",
+            "series_title": "Upload",
+            "season": 1,
+            "disc_label": "UPLOAD_S1_D1",
+            "dvd_crc64": "0123456789abcdef",
+            "files": files,
+        }
         path = folder / "manifest.json"
         path.write_text(json.dumps(manifest), encoding="utf-8")
         return path, manifest
@@ -429,6 +517,105 @@ class PhysicalMediaTests(unittest.TestCase):
         self.assertEqual(deliveries[0]["event_key"], "import_failed")
         self.intake.reconcile()
         self.assertEqual(len(self.store.pending_notification_deliveries()), 1)
+
+    def test_tv_disc_with_explicit_episode_mapping_imports_through_sonarr(self):
+        self.tv_delivery()
+        sonarr = self.intake.sonarr
+        self.intake.reconcile()
+        event = self.event()
+        self.assertEqual(event["state"], "identity_resolved")
+        self.assertEqual(event["media_type"], "tv")
+        self.assertEqual(event["sonarr_series_id"], 55)
+
+        self.intake.reconcile()
+        event = self.event()
+        self.assertEqual(event["state"], "importing")
+        self.assertEqual(event["sonarr_command_id"], 91)
+        self.assertEqual(len(sonarr.start_calls), 1)
+        call = sonarr.start_calls[0]
+        self.assertEqual(call["source_dir"], "/downloads/physical-media/incoming/arm-tv")
+        self.assertEqual(
+            [Path(item["sonarr_path"]).name for item in call["files"]],
+            ["Upload - S01E01 - Episode 1.mkv", "Upload - S01E02 - Episode 2.mkv"],
+        )
+
+        sonarr.command = "completed"
+        sonarr.imported = True
+        self.intake.reconcile()
+        event = self.event()
+        self.assertEqual(event["state"], "completed")
+        self.assertIn("S01E01", event["final_path"])
+        deliveries = self.store.pending_notification_deliveries()
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(deliveries[0]["route"], "recent-additions")
+
+    def test_tv_episode_mapping_rejects_unknown_episode_without_sonarr_post(self):
+        path, manifest = self.tv_delivery()
+        manifest["files"][1]["episode"] = 99
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.intake.reconcile()
+        event = self.event()
+        self.assertEqual(event["state"], "manual_review")
+        self.assertIn("episodes Sonarr does not know", event["error"])
+        self.assertEqual(self.intake.sonarr.start_calls, [])
+
+    def test_grouped_ambiguous_video_preserves_artifacts_for_review(self):
+        folder = self.intake_root / "arm-ambiguous"
+        folder.mkdir(exist_ok=True)
+        media = folder / "title01.mkv"
+        payload = b"\x1aE\xdf\xa3" + b"ambiguous"
+        media.write_bytes(payload)
+        manifest = {
+            "version": 2,
+            "source": "arm",
+            "media_type": "ambiguous",
+            "title": "Mystery Disc",
+            "files": [{
+                "file": media.name,
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "duration_seconds": 1200,
+            }],
+        }
+        (folder / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        self.intake.reconcile()
+        event = self.event()
+        self.assertEqual(event["state"], "manual_review")
+        self.assertEqual(event["media_type"], "ambiguous")
+        self.assertTrue(media.exists())
+
+    def test_sonarr_manual_import_uses_exact_episode_preview_paths(self):
+        source = "/downloads/physical-media/incoming/arm-tv/Upload - S01E01.mkv"
+        sonarr = PreviewSonarr([
+            {
+                "path": source,
+                "seriesId": 55,
+                "episodeIds": [101],
+                "quality": {"quality": {"id": 8}},
+                "languages": [{"id": 1, "name": "English"}],
+                "rejections": [],
+            }
+        ])
+        command_id = sonarr.start_manual_import(
+            series_id=55,
+            source_dir="/downloads/physical-media/incoming/arm-tv",
+            files=[{"sonarr_path": source}],
+            fingerprint="b" * 64,
+        )
+        self.assertEqual(command_id, 91)
+        self.assertEqual(sonarr.calls[1][2]["json"]["files"][0]["episodeIds"], [101])
+
+    def test_sonarr_manual_import_rejects_preview_without_episode(self):
+        source = "/downloads/physical-media/incoming/arm-tv/Upload - S01E01.mkv"
+        sonarr = PreviewSonarr([{"path": source, "seriesId": 55, "episodeIds": [], "rejections": []}])
+        with self.assertRaises(PhysicalMediaError):
+            sonarr.start_manual_import(
+                series_id=55,
+                source_dir="/downloads/physical-media/incoming/arm-tv",
+                files=[{"sonarr_path": source}],
+                fingerprint="b" * 64,
+            )
+        self.assertEqual(len(sonarr.calls), 1)
 
     def test_radarr_failure_routes_to_import_errors(self):
         self.delivery()
