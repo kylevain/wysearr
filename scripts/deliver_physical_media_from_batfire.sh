@@ -85,17 +85,18 @@ payload = {
     "sha256": os.environ["PHYSICAL_SHA256"],
 }
 source = Path(os.environ["PHYSICAL_SOURCE"])
-if source.is_file():
+if source.is_file() and os.environ["PHYSICAL_MEDIA_TYPE"] == "movie":
     payload["file"] = "feature.mkv"
 else:
     files = []
-    for index, path in enumerate(sorted(source.glob("*.mkv")), start=1):
+    source_files = [source] if source.is_file() else sorted(source.glob("*.mkv"))
+    for index, path in enumerate(source_files, start=1):
         digest = hashlib.sha256()
         with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
                 digest.update(chunk)
         files.append({
-            "file": path.name,
+            "file": "feature.mkv" if source.is_file() else path.name,
             "size_bytes": path.stat().st_size,
             "sha256": digest.hexdigest(),
             "track_number": index,

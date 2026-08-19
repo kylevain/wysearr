@@ -584,6 +584,26 @@ class PhysicalMediaTests(unittest.TestCase):
         self.assertEqual(event["media_type"], "ambiguous")
         self.assertTrue(media.exists())
 
+    def test_yearless_unidentified_arm_delivery_becomes_ambiguous_video_review(self):
+        path, manifest = self.delivery(title="not identified", year=2014)
+        manifest.pop("year")
+        manifest.pop("imdb_id")
+        manifest.update({
+            "disc_label": "not identified",
+            "dvd_crc64": "07e812f33f894c6b",
+            "duration_seconds": 7722,
+            "arm_job_id": 9,
+            "arm_title": "not identified",
+        })
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.intake.reconcile()
+        event = self.event()
+        self.assertEqual(event["state"], "manual_review")
+        self.assertEqual(event["media_type"], "ambiguous")
+        self.assertEqual(event["source_fingerprint"], manifest["sha256"])
+        self.assertIn("Physical video is preserved", event["error"])
+        self.assertTrue((path.parent / "feature.mkv").exists())
+
     def test_sonarr_manual_import_uses_exact_episode_preview_paths(self):
         source = "/downloads/physical-media/incoming/arm-tv/Upload - S01E01.mkv"
         sonarr = PreviewSonarr([

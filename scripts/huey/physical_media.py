@@ -121,6 +121,91 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validated_manifest_file(
+    path: Path,
+    file_name: str,
+    *,
+    expected_size: object,
+    expected_sha256: object,
+    min_size_bytes: int,
+) -> tuple[Path, int, str]:
+    file_name = _safe_file_basename(file_name)
+    media_path = path.parent / file_name
+    if media_path.is_symlink() or not media_path.is_file():
+        raise PhysicalMediaError("manifest MKV is missing or is not a regular file")
+    parsed_size = _integer(expected_size, "MKV size", min_size_bytes, 10**13)
+    actual_size = media_path.stat().st_size
+    if actual_size != parsed_size:
+        raise PhysicalMediaError("MKV size does not match the completed delivery manifest")
+    with media_path.open("rb") as stream:
+        if stream.read(4) != b"\x1aE\xdf\xa3":
+            raise PhysicalMediaError("delivered file does not have an MKV/EBML header")
+    fingerprint = str(expected_sha256 or "").casefold()
+    if not _SHA256.fullmatch(fingerprint) or _sha256_file(media_path) != fingerprint:
+        raise PhysicalMediaError("MKV SHA-256 does not match the completed delivery manifest")
+    return media_path, actual_size, fingerprint
+
+
+def load_single_ambiguous_delivery_manifest(
+    path: Path,
+    raw: Mapping[str, Any],
+    *,
+    reason: str,
+    min_size_bytes: int,
+) -> dict[str, Any]:
+    file_name = str(raw.get("file") or "")
+    media_path, actual_size, fingerprint = _validated_manifest_file(
+        path,
+        file_name,
+        expected_size=raw.get("size_bytes"),
+        expected_sha256=raw.get("sha256"),
+        min_size_bytes=min_size_bytes,
+    )
+    duration_seconds = _optional_integer(
+        raw.get("duration_seconds") or raw.get("main_feature_seconds"),
+        label="main-feature duration",
+        minimum=60,
+        maximum=24 * 60 * 60,
+    )
+    dvd_crc64 = str(raw.get("dvd_crc64") or "").casefold() or None
+    if dvd_crc64 is not None and not _CRC64.fullmatch(dvd_crc64):
+        raise PhysicalMediaError("DVD CRC64 fingerprint is invalid")
+    metadata = _safe_metadata({
+        "classification_reason": reason,
+        "files": [{
+            "file": file_name,
+            "sha256": fingerprint,
+            "size_bytes": actual_size,
+            "duration_seconds": duration_seconds,
+            "source_path": str(media_path),
+            "kind": "unknown",
+        }],
+        "disc_label": _optional_safe_text(raw.get("disc_label"), label="disc label", limit=120),
+        "dvd_crc64": dvd_crc64,
+        "arm_job_id": _optional_integer(
+            raw.get("arm_job_id"), label="ARM job id", minimum=1, maximum=10**12
+        ),
+        "arm_title": _optional_safe_text(raw.get("arm_title") or raw.get("title"), label="ARM title", limit=160),
+    })
+    return {
+        "title": None,
+        "year": None,
+        "imdb_id": None,
+        "tmdb_id": None,
+        "fingerprint": fingerprint,
+        "size_bytes": actual_size,
+        "host_path": str(path.parent),
+        "manifest_path": str(path),
+        "duration_seconds": duration_seconds,
+        "dvd_crc64": dvd_crc64,
+        "arm_job_id": metadata.get("arm_job_id"),
+        "disc_label": metadata.get("disc_label"),
+        "media_type": "ambiguous",
+        "group_key": f"ambiguous:{fingerprint}",
+        "metadata": metadata,
+    }
+
+
 def load_delivery_manifest(
     manifest_path: str | Path, *, min_size_bytes: int = 50 * 1024 * 1024
 ) -> dict[str, Any]:
@@ -145,7 +230,18 @@ def load_delivery_manifest(
         return load_grouped_delivery_manifest(path, raw, min_size_bytes=min_size_bytes)
 
     omdb = raw.get("omdb") if isinstance(raw.get("omdb"), Mapping) else {}
-    title = _clean_title(raw.get("title") or omdb.get("Title"))
+    raw_title = raw.get("title") or omdb.get("Title")
+    raw_title_key = _title_key(raw_title)
+    if raw_title_key in {"", "not identified", "unknown", "no label"} and not (
+        raw.get("year") or omdb.get("Year") or raw.get("imdb_id") or omdb.get("imdbID") or raw.get("tmdb_id")
+    ):
+        return load_single_ambiguous_delivery_manifest(
+            path,
+            raw,
+            reason="ARM completed a yearless unidentified physical-video delivery.",
+            min_size_bytes=min_size_bytes,
+        )
+    title = _clean_title(raw_title)
     year_text = str(raw.get("year") or omdb.get("Year") or "")
     year_match = re.match(r"\A([0-9]{4})", year_text)
     if not year_match:

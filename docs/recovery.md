@@ -519,3 +519,10 @@ from the tracked files in `scripts/batfire/`: install
 `arm-disc-trigger@.service` to `/etc/systemd/system/`, install
 `arm-disc-trigger` to `/usr/local/sbin/`, reload udev/systemd, and keep
 container-local ARM udev rules disabled so only the host starts jobs.
+
+The trigger signature intentionally includes sampled disc content as well as
+kernel/blkid metadata. Unlabeled TV-set discs can share `no-uuid`, `no-label`,
+drive serial, and size; those fields alone are not a safe suppression identity.
+Same-signature media-ready events are suppressed only inside the short duplicate
+window while ARM is starting. A later same-signature event is allowed so an
+intentional retry is possible even if the drive missed the no-media rearm event.

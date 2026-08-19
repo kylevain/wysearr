@@ -18,6 +18,7 @@ dev_path="/dev/$dev"
 lock_path="/run/lock/arm-disc-trigger.lock"
 state_dir="/run/arm-physical-media"
 last_sig_path="$state_dir/last-triggered-signature"
+duplicate_window_seconds="${ARM_DISC_TRIGGER_DUPLICATE_WINDOW_SECONDS:-180}"
 
 log() {
   logger -t arm-disc-trigger -- "$*"
@@ -25,6 +26,24 @@ log() {
 
 prop_from() {
   printf '%s\n' "$1" | awk -F= -v key="$2" '$1==key {print substr($0, index($0, "=") + 1); exit}'
+}
+
+disc_sample_signature() {
+  local blocks last_block quarter half
+  blocks=$((size_bytes / 2048))
+  if [[ "$blocks" -le 0 ]]; then
+    printf 'no-sample'
+    return 0
+  fi
+  last_block=$((blocks > 96 ? blocks - 96 : 0))
+  quarter=$((blocks / 4))
+  half=$((blocks / 2))
+  {
+    for block in 0 16 "$quarter" "$half" "$last_block"; do
+      [[ "$block" -ge 0 ]] || block=0
+      dd if="$dev_path" bs=2048 skip="$block" count=32 status=none 2>/dev/null || true
+    done
+  } | sha256sum | awk '{print $1}'
 }
 
 exec 9>"$lock_path"
@@ -77,11 +96,18 @@ label="$(prop_from "$blkid_props" LABEL)"
 fs_type="$(prop_from "$blkid_props" TYPE)"
 diskseq="$(prop_from "$props" DISKSEQ)"
 serial="$(prop_from "$props" ID_SERIAL_SHORT)"
-signature="$dev:${diskseq:-no-diskseq}:${uuid:-no-uuid}:${label:-no-label}:${serial:-no-serial}:$size_bytes"
+sample_signature="$(disc_sample_signature)"
+signature="$dev:${diskseq:-no-diskseq}:${uuid:-no-uuid}:${label:-no-label}:${serial:-no-serial}:$size_bytes:${sample_signature:-no-sample}"
 
 if [[ -f "$last_sig_path" ]] && [[ "$(cat "$last_sig_path")" == "$signature" ]]; then
-  log "ignoring duplicate media-ready event for $dev_path signature=$signature"
-  exit 0
+  now="$(date +%s)"
+  last_changed="$(stat -c %Y "$last_sig_path" 2>/dev/null || printf 0)"
+  age=$((now - last_changed))
+  if [[ "$age" -lt "$duplicate_window_seconds" ]]; then
+    log "ignoring duplicate media-ready event for $dev_path signature=$signature age=${age}s"
+    exit 0
+  fi
+  log "same media signature for $dev_path is older than duplicate window; allowing retrigger signature=$signature age=${age}s"
 fi
 
 if ! docker inspect --format '{{.State.Running}}' arm-rippers 2>/dev/null | grep -qx true; then
