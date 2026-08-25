@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+cat <<'EOF'
+Louie status: run /home/wyseadmin/homelab/scripts/louie-status
+EOF

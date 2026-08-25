@@ -507,5 +507,100 @@ services:
       retries: 3
       start_period: 90s
 
+  louie:
+    <<: *common
+    build:
+      context: .
+      dockerfile: louie/Dockerfile
+    container_name: louie
+    user: "${PUID:-1000}:${PGID:-1000}"
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      TZ: ${TZ:-Pacific/Honolulu}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      LOUIE_PORT: "8090"
+      LOUIE_POLL_SECONDS: ${LOUIE_POLL_SECONDS:-60}
+      LOUIE_STALLED_AFTER_SECONDS: ${LOUIE_STALLED_AFTER_SECONDS}
+      LOUIE_DB_PATH: /state/louie.db
+      HUEY_DB_PATH: /huey-state/huey.db
+      RADARR_URL: http://radarr:7878
+      RADARR_API_KEY: ${RADARR_API_KEY}
+      SONARR_URL: http://sonarr:8989
+      SONARR_API_KEY: ${SONARR_API_KEY}
+      LIDARR_URL: http://lidarr:8686
+      LIDARR_API_KEY: ${LIDARR_API_KEY}
+      QBITTORRENT_URL: http://gluetun:8080
+      QBITTORRENT_USERNAME: ${QBITTORRENT_USERNAME:-admin}
+      QBITTORRENT_PASSWORD: ${QBITTORRENT_PASSWORD}
+      SABNZBD_URL: http://sabnzbd:8080
+      SABNZBD_API_KEY: ${SABNZBD_API_KEY:-}
+      SHELFARR_URL: http://shelfarr
+      SHELFARR_API_TOKEN: ${SHELFARR_API_TOKEN}
+    volumes:
+      - ./louie:/app/louie:ro
+      - ./state/louie:/state
+      - ./state/huey:/huey-state:ro
+    depends_on:
+      radarr:
+        condition: service_healthy
+      sonarr:
+        condition: service_healthy
+      lidarr:
+        condition: service_healthy
+      qbittorrent:
+        condition: service_healthy
+      shelfarr:
+        condition: service_healthy
+    ports:
+      - "${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${LOUIE_PORT:-8090}:8090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/api/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  bitbot:
+    <<: *common
+    build:
+      context: .
+      dockerfile: docker/bitbot/Dockerfile
+    container_name: bitbot
+    user: "${PUID:-1000}:${PGID:-1000}"
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      TZ: ${TZ:-Pacific/Honolulu}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      BITBOT_BTC_ADDRESS: ${BITBOT_BTC_ADDRESS}
+      BITBOT_DISCORD_WEBHOOK: ${BITBOT_DISCORD_WEBHOOK}
+      BITBOT_POLL_SECONDS: ${BITBOT_POLL_SECONDS:-300}
+      BITBOT_POOL_POLL_SECONDS: ${BITBOT_POOL_POLL_SECONDS:-120}
+      BITBOT_PRIMARY_POOL_API: ${BITBOT_PRIMARY_POOL_API:-https://solobtc.nmminer.com/api/client}
+      BITBOT_FALLBACK_POOL_API: ${BITBOT_FALLBACK_POOL_API:-https://au.solobtc.nmminer.com/api/client}
+      BITBOT_STATE_PATH: /state/state.json
+      BITBOT_HEALTH_PATH: /state/health.json
+      BITBOT_HEALTH_MAX_AGE_SECONDS: "900"
+      BITBOT_MEMPOOL_BASE: https://mempool.space/api
+    volumes:
+      - ./state/bitbot:/state
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
 volumes:
   gluetun-data:

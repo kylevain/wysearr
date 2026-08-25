@@ -157,7 +157,7 @@ physical_media_root="${physical_media_root:-$stack_root/state/physical-media}"
 
 mkdir -p \
     config/{qbittorrent,prowlarr,sonarr,radarr,lidarr,whisparr,bazarr,bookbot,huey,sabnzbd,shelfarr,abba,lazylibrarian} \
-    state/huey \
+    state/huey state/louie \
     "$physical_media_root/incoming" \
     "$physical_media_root/review" \
     state/shelfarr-evaluation \
@@ -439,6 +439,12 @@ fi
 
 if ! grep -Eq '^DISCORD_BOT_TOKEN=.{20,}$' .env; then
     fail "DISCORD_BOT_TOKEN is missing from .env"
+fi
+
+if [ -d /etc/update-motd.d ] && [ -w /etc/update-motd.d ]; then
+    install -m 755 scripts/motd/90-louie-status /etc/update-motd.d/90-louie-status
+else
+    echo "WARN: install scripts/motd/90-louie-status as /etc/update-motd.d/90-louie-status for the login MOTD"
 fi
 
 # Required dependencies and every enabled optional acquisition service are

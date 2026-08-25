@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+docker compose -f /home/wyseadmin/homelab/docker-compose.yml ps louie
+curl -fsS "http://${WYSEARR_BIND_ADDRESS:-192.168.4.86}:${LOUIE_PORT:-8090}/api/health"
+printf '\n'
