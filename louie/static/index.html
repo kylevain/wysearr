@@ -4,14 +4,169 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Louie status</title>
 <style>
-:root{font-family:ui-sans-serif,system-ui,sans-serif;color:#17212b;background:#eef1ed;--ink:#17212b;--muted:#66716e;--line:#d3dad4;--paper:#fbfcf8;--accent:#bc4b35;--green:#3d765b}
-*{box-sizing:border-box}body{margin:0}header{padding:28px 4vw 22px;background:#17212b;color:#f5f7f1;display:flex;justify-content:space-between;align-items:end;gap:20px}h1{margin:0;font:700 38px Georgia,serif;letter-spacing:0}header p{margin:6px 0 0;color:#b9c7c0}main{padding:24px 4vw;overflow-x:auto}.toolbar{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}select{border:1px solid var(--line);background:var(--paper);padding:9px 12px;color:var(--ink);font-size:14px}.board{display:grid;grid-template-columns:repeat(6,minmax(230px,1fr));gap:12px;min-width:1450px}.column{background:#e1e7e1;border-top:4px solid var(--green);min-height:190px}.column[data-status=failed],.column[data-status=ambiguous],.column[data-status=unparsed]{border-color:var(--accent)}.column h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;margin:0;padding:13px 13px 7px}.count{color:var(--muted);font-weight:400}.items{padding:0 9px 12px}.item{background:var(--paper);border:1px solid var(--line);padding:11px;margin-top:8px;box-shadow:0 2px 0 rgba(23,33,43,.05)}.title{font-weight:700;line-height:1.25}.meta{font-size:12px;color:var(--muted);margin-top:7px;line-height:1.4}.bar{height:5px;background:#d8dfd9;margin-top:9px}.bar i{display:block;height:100%;background:var(--green)}.empty{font-size:13px;color:var(--muted);padding:8px 4px}.error{color:var(--accent)}
-</style></head>
-<body><header><div><h1>Louie</h1><p>One view of every acquisition in motion.</p></div><div id="checked">checking...</div></header><main><div class="toolbar"><select id="media"><option value="">All media</option><option>movies-tv</option><option>ebooks</option><option>audiobooks</option><option>music</option></select><select id="origin"><option value="">All origins</option><option value="discord">Discord</option><option value="physical_disc">Physical disc</option><option value="manual">Manual</option></select></div><div class="board" id="board"></div></main>
+/* Light is the base palette. Dark redefines only these tokens, so every rule
+   below stays theme-agnostic -- no colour is defined solely inside a media
+   query or a [data-theme] block. */
+:root{
+  /* --muted was #66716e, which fell to 4.03:1 against the column background. */
+  --ink:#17212b; --muted:#5c6764; --line:#d3dad4; --paper:#fbfcf8;
+  --accent:#bc4b35; --green:#3d765b; --bg:#eef1ed; --column:#e1e7e1;
+  --header-bg:#17212b; --header-ink:#f5f7f1; --header-muted:#b9c7c0;
+  --bar-track:#d8dfd9; --card-shadow:rgba(23,33,43,.05); --control:#fbfcf8;
+}
+/* Genuinely dark, not a grey wash: near-black ground, cards barely lifted
+   off it, accents brightened so they still carry on a dark field. */
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme=light]){
+    --ink:#e6ece7; --muted:#8b9a93; --line:#253038; --paper:#161e21;
+    --accent:#e8735a; --green:#5fae86; --bg:#0b1113; --column:#111a1d;
+    --header-bg:#080d0f; --header-ink:#e6ece7; --header-muted:#8b9a93;
+    --bar-track:#1e282c; --card-shadow:rgba(0,0,0,.4); --control:#161e21;
+  }
+}
+:root[data-theme=dark]{
+  --ink:#e6ece7; --muted:#8b9a93; --line:#253038; --paper:#161e21;
+  --accent:#e8735a; --green:#5fae86; --bg:#0b1113; --column:#111a1d;
+  --header-bg:#080d0f; --header-ink:#e6ece7; --header-muted:#8b9a93;
+  --bar-track:#1e282c; --card-shadow:rgba(0,0,0,.4); --control:#161e21;
+}
+:root{font-family:ui-sans-serif,system-ui,sans-serif;color:var(--ink);background:var(--bg)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink)}
+header{padding:28px 4vw 22px;background:var(--header-bg);color:var(--header-ink);display:flex;justify-content:space-between;align-items:end;gap:20px}
+h1{margin:0;font:700 38px Georgia,serif;letter-spacing:0}
+header p{margin:6px 0 0;color:var(--header-muted)}
+.status{display:flex;align-items:center;gap:12px;color:var(--header-muted);font-size:14px}
+#theme{background:transparent;border:1px solid var(--header-muted);color:var(--header-ink);padding:6px 11px;font:inherit;font-size:13px;cursor:pointer;border-radius:2px}
+#theme:hover{border-color:var(--header-ink)}
+main{padding:24px 4vw;overflow-x:auto}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}
+select{border:1px solid var(--line);background:var(--control);padding:9px 12px;color:var(--ink);font-size:14px}
+.board{display:grid;grid-template-columns:repeat(6,minmax(230px,1fr));gap:12px;min-width:1450px}
+.column{background:var(--column);border-top:4px solid var(--green);min-height:190px}
+.column[data-status=failed],.column[data-status=ambiguous],.column[data-status=unparsed]{border-color:var(--accent)}
+.column h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;margin:0;padding:13px 13px 7px}
+.count{color:var(--muted);font-weight:400}
+.items{padding:0 9px 12px}
+.item{background:var(--paper);border:1px solid var(--line);padding:11px;margin-top:8px;box-shadow:0 2px 0 var(--card-shadow)}
+.title{font-weight:700;line-height:1.25}
+.meta{font-size:12px;color:var(--muted);margin-top:7px;line-height:1.4}
+.bar{height:5px;background:var(--bar-track);margin-top:9px}
+.bar i{display:block;height:100%;background:var(--green)}
+.bar.idle i{background:var(--muted)}
+.empty{font-size:13px;color:var(--muted);padding:8px 4px}
+.error{color:var(--accent)}
+</style>
+<script>
+// Applied before first paint so a dark-mode reload never flashes cream.
+try{const saved=localStorage.getItem('louie-theme');if(saved==='dark'||saved==='light')document.documentElement.dataset.theme=saved}catch(e){}
+</script>
+</head>
+<body>
+<header>
+  <div><h1>Louie</h1><p>One view of every acquisition in motion.</p></div>
+  <div class="status"><span id="checked">checking...</span><button id="theme" type="button">Auto</button></div>
+</header>
+<main>
+  <div class="toolbar">
+    <select id="media"><option value="">All media</option><option>movies-tv</option><option>ebooks</option><option>audiobooks</option><option>music</option></select>
+    <select id="origin"><option value="">All origins</option><option value="discord">Discord</option><option value="physical_disc">Physical disc</option><option value="manual">Manual</option></select>
+  </div>
+  <div class="board" id="board"></div>
+</main>
 <script>
 const statuses=['submitted','searching','downloading','importing','stalled','seeding','completed','failed','ambiguous','unparsed','manual_review'];
 const labels={submitted:'Submitted',searching:'Searching',downloading:'Downloading',importing:'Importing',stalled:'Stalled',seeding:'Seeding',completed:'Completed',failed:'Failed',ambiguous:'Needs clarification',unparsed:'Unparsed',manual_review:'Manual review'};
-async function refresh(){const q=new URLSearchParams();if(media.value)q.set('media_type',media.value);if(origin.value)q.set('origin',origin.value);const [items,health]=await Promise.all([fetch('/api/requests?'+q).then(r=>r.json()),fetch('/api/health').then(r=>r.json())]);board.innerHTML='';for(const status of statuses){const list=items.filter(x=>x.status===status);const col=document.createElement('section');col.className='column';col.dataset.status=status;col.innerHTML=`<h2>${labels[status]} <span class="count">${list.length}</span></h2><div class="items">${list.length?list.map(card).join(''):'<div class="empty">Nothing here</div>'}</div>`;board.append(col)}checked.textContent='checked '+new Date(health.last_checked).toLocaleTimeString()}
-function card(x){const pct=Number.isFinite(x.progress_pct)?Math.max(0,Math.min(100,x.progress_pct)):null;return `<article class="item"><div class="title">${esc(x.title||'Untitled')}</div><div class="meta">#${esc(x.request_id)} · ${esc(x.media_type||'unknown')} · ${esc(x.origin)}${x.service?' · '+esc(x.service):''}${x.requested_by?' · '+esc(x.requested_by):''}</div>${pct===null?'':`<div class="bar"><i style="width:${pct}%"></i></div><div class="meta">${pct.toFixed(1)}%</div>`}${x.error?`<div class="meta error">${esc(x.error)}</div>`:''}</article>`}
-function esc(v){return String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}media.onchange=origin.onchange=refresh;refresh();setInterval(refresh,30000);
-</script></body></html>
+
+// --- theme -----------------------------------------------------------------
+// Three states so there is a way back to following the OS, which a plain
+// light/dark toggle takes away once it has been touched.
+const THEMES=['auto','light','dark'];
+function storedTheme(){try{const v=localStorage.getItem('louie-theme');return THEMES.includes(v)?v:'auto'}catch(e){return 'auto'}}
+function applyTheme(value){
+  if(value==='auto')delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme=value;
+  theme.textContent=value[0].toUpperCase()+value.slice(1);
+  try{value==='auto'?localStorage.removeItem('louie-theme'):localStorage.setItem('louie-theme',value)}catch(e){}
+}
+theme.onclick=()=>applyTheme(THEMES[(THEMES.indexOf(storedTheme())+1)%THEMES.length]);
+applyTheme(storedTheme());
+
+// --- freshness -------------------------------------------------------------
+// poll_age_seconds is the server's own measurement, so the label never drifts
+// with client clock skew. Anchoring it to Date.now() once per fetch lets the
+// counter tick between the 30s refreshes.
+let polledAt=null;
+function relative(seconds){
+  if(!Number.isFinite(seconds)||seconds<0)return null;
+  if(seconds<45)return Math.round(seconds)+'s ago';
+  const m=Math.round(seconds/60);
+  if(m<60)return m+'m ago';
+  const h=Math.round(m/60);
+  if(h<24)return h+'h ago';
+  return Math.round(h/24)+'d ago';
+}
+function renderChecked(){
+  if(polledAt===null){checked.textContent='never checked';return}
+  const label=relative((Date.now()-polledAt)/1000);
+  checked.textContent=label?'checked '+label:'checking...';
+}
+function noteHealth(health){
+  // The health payload exposes last_successful_poll and poll_age_seconds.
+  // It has no last_checked -- reading that is what produced "Invalid Date".
+  const age=health&&health.poll_age_seconds;
+  if(Number.isFinite(age)){polledAt=Date.now()-age*1000;return}
+  const stamp=health&&health.last_successful_poll?Date.parse(health.last_successful_poll):NaN;
+  polledAt=Number.isFinite(stamp)?stamp:null;
+}
+
+// --- board -----------------------------------------------------------------
+// qBittorrent parks queued torrents at 0.0% indefinitely, so percentage alone
+// cannot separate "downloading slowly" from "never started". Group on the
+// download state first, then sort by progress within each group.
+const QUEUED_STATES=new Set(['queuedDL','queuedUP','pausedDL','pausedUP','stoppedDL','stoppedUP']);
+function isMoving(x){
+  if(x.download_state)return !QUEUED_STATES.has(x.download_state);
+  // No state recorded (usenet, or an unmatched hash): fall back to progress.
+  return Number.isFinite(x.progress_pct)&&x.progress_pct>0;
+}
+function byProgressDescending(a,b){
+  if(isMoving(a)!==isMoving(b))return isMoving(a)?-1:1;
+  // Null progress sorts below a real 0.0 so unknowns never crowd the top.
+  const left=Number.isFinite(a.progress_pct)?a.progress_pct:-1;
+  const right=Number.isFinite(b.progress_pct)?b.progress_pct:-1;
+  return right-left;
+}
+async function refresh(){
+  const q=new URLSearchParams();
+  if(media.value)q.set('media_type',media.value);
+  if(origin.value)q.set('origin',origin.value);
+  const [items,health]=await Promise.all([
+    fetch('/api/requests?'+q).then(r=>r.json()),
+    fetch('/api/health').then(r=>r.json())
+  ]);
+  board.innerHTML='';
+  for(const status of statuses){
+    const list=items.filter(x=>x.status===status);
+    if(status==='downloading')list.sort(byProgressDescending);
+    const col=document.createElement('section');
+    col.className='column';
+    col.dataset.status=status;
+    col.innerHTML=`<h2>${labels[status]} <span class="count">${list.length}</span></h2><div class="items">${list.length?list.map(card).join(''):'<div class="empty">Nothing here</div>'}</div>`;
+    board.append(col);
+  }
+  noteHealth(health);
+  renderChecked();
+}
+function card(x){
+  const pct=Number.isFinite(x.progress_pct)?Math.max(0,Math.min(100,x.progress_pct)):null;
+  const queued=x.download_state&&QUEUED_STATES.has(x.download_state);
+  return `<article class="item"><div class="title">${esc(x.title||'Untitled')}</div><div class="meta">#${esc(x.request_id)} · ${esc(x.media_type||'unknown')} · ${esc(x.origin)}${x.service?' · '+esc(x.service):''}${x.requested_by?' · '+esc(x.requested_by):''}</div>${pct===null?'':`<div class="bar${queued?' idle':''}"><i style="width:${pct}%"></i></div><div class="meta">${pct.toFixed(1)}%${queued?' · queued':''}</div>`}${x.error?`<div class="meta error">${esc(x.error)}</div>`:''}</article>`;
+}
+function esc(v){return String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+media.onchange=origin.onchange=refresh;
+refresh();
+setInterval(refresh,30000);
+setInterval(renderChecked,5000);
+</script>
+</body></html>

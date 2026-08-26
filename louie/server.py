@@ -55,7 +55,7 @@ def init_db() -> None:
             external_id TEXT, service TEXT, requested_by TEXT, requested_at TEXT, title TEXT, year INTEGER,
             media_type TEXT, status TEXT NOT NULL, progress_pct REAL, file_name TEXT, download_client TEXT,
             indexer TEXT, protocol TEXT, size INTEGER, eta INTEGER, searching_since TEXT, last_checked TEXT,
-            source_updated_at TEXT NOT NULL, raw_json TEXT NOT NULL
+            download_state TEXT, source_updated_at TEXT NOT NULL, raw_json TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS item_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, status TEXT NOT NULL,
@@ -69,6 +69,8 @@ def init_db() -> None:
         );
         """)
         columns = {row[1] for row in db.execute("PRAGMA table_info(items)")}
+        if "download_state" not in columns:
+            db.execute("ALTER TABLE items ADD COLUMN download_state TEXT")
         if "routing_state" not in columns:
             db.execute("ALTER TABLE items ADD COLUMN routing_state TEXT NOT NULL DEFAULT 'live'")
         db.commit()
@@ -103,6 +105,7 @@ def huey_items() -> list[dict]:
             "progress_pct": None, "file_name": value.get("external_title"), "download_client": None,
             "indexer": None, "protocol": None, "size": None, "eta": None,
             "searching_since": value.get("dispatch_started_at"), "last_checked": None,
+            "download_state": None,
             "source_updated_at": value.get("updated_at") or value.get("created_at"), "error": error,
         })
     return result
@@ -126,6 +129,7 @@ def disc_items() -> list[dict]:
             "media_type": value.get("media_type"), "status": status, "progress_pct": 100 if status == "completed" else None,
             "file_name": value.get("final_path"), "download_client": None, "indexer": None, "protocol": None,
             "size": value.get("size_bytes"), "eta": None, "searching_since": None, "last_checked": value.get("updated_at"),
+            "download_state": None,
             "source_updated_at": value.get("updated_at") or value.get("created_at"), "error": value.get("error"),
         })
     return result
@@ -234,6 +238,50 @@ def shelfarr_snapshot() -> tuple[dict[str, dict], dict[str, int]]:
     return result, counts
 
 
+def _ratio_pct(total: object, remaining: object) -> float | None:
+    """Percent complete from a total/remaining byte pair, or None if unusable."""
+
+    try:
+        size = float(total)
+        left = float(remaining)
+    except (TypeError, ValueError):
+        return None
+    if size <= 0 or left < 0 or left > size:
+        return None
+    return round((size - left) / size * 100, 2)
+
+
+def queue_progress(record: dict) -> float | None:
+    """Progress from an ARR queue record's own byte counts.
+
+    ARR already tracks size and sizeleft for every queued item, so progress
+    does not depend on reaching the download client at all. Previously it did:
+    a hash that did not match left progress permanently null.
+    """
+
+    return _ratio_pct(record.get("size"), record.get("sizeleft"))
+
+
+def torrent_progress(torrent: dict) -> float | None:
+    """Progress from a qBittorrent torrent's 0..1 fraction."""
+
+    try:
+        fraction = float(torrent.get("progress"))
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= fraction <= 1:
+        return None
+    return round(fraction * 100, 2)
+
+
+def sab_progress(slot: dict) -> float | None:
+    """Progress for one SABnzbd slot; history slots are finished by definition."""
+
+    if str(slot.get("_mode")) == "history":
+        return 100.0
+    return _ratio_pct(slot.get("mb"), slot.get("mbleft"))
+
+
 def enrich(items: list[dict]) -> dict[str, int]:
     arr = {service: arr_snapshot(service) for service in ("radarr", "sonarr", "lidarr")}
     torrents, sab = download_snapshot()
@@ -258,14 +306,29 @@ def enrich(items: list[dict]) -> dict[str, int]:
             item["size"] = queue.get("size")
             item["eta"] = queue.get("timeleft")
             item["external_id"] = external_id
-            download_id = str(queue.get("downloadId") or "").lower()
-            torrent = torrents.get(download_id)
+            # ARR's own byte counts are the baseline. The download client can
+            # refine them, but must not be the only thing that can produce a
+            # number -- an unreachable client or an unmatched ID used to leave
+            # every card without any progress at all.
+            item["progress_pct"] = queue_progress(queue)
+            download_id = str(queue.get("downloadId") or "")
+            torrent = torrents.get(download_id.lower())
             if torrent:
-                item["progress_pct"] = round(float(torrent.get("progress", 0)) * 100, 2)
+                progress = torrent_progress(torrent)
+                if progress is not None:
+                    item["progress_pct"] = progress
                 item["file_name"] = torrent.get("name")
                 item["eta"] = torrent.get("eta")
+                item["download_state"] = torrent.get("state")
             elif queue.get("protocol") == "usenet":
                 item["download_client"] = "sabnzbd"
+                # nzo_id is case-sensitive, so this cannot reuse the lowercased
+                # hash lookup above.
+                slot = sab.get(download_id) or sab.get(str(queue.get("title") or ""))
+                if slot:
+                    progress = sab_progress(slot)
+                    if progress is not None:
+                        item["progress_pct"] = progress
         elif wanted:
             item["status"] = "searching"
         elif history and str(history.get("eventType", "")).casefold() in {"grabbed", "importfailed", "downloadfailed"}:
@@ -293,8 +356,8 @@ def poll() -> None:
             db.execute("""INSERT INTO items (
                 request_id, origin, content_class, routing_state, external_id, service, requested_by,
                 requested_at, title, year, media_type, status, progress_pct, file_name, download_client,
-                indexer, protocol, size, eta, searching_since, last_checked, source_updated_at, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                indexer, protocol, size, eta, searching_since, last_checked, download_state, source_updated_at, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(request_id) DO UPDATE SET origin=excluded.origin, content_class=excluded.content_class,
                 routing_state=excluded.routing_state,
                 external_id=excluded.external_id, service=excluded.service, requested_by=excluded.requested_by,
@@ -302,8 +365,9 @@ def poll() -> None:
                 status=excluded.status, progress_pct=excluded.progress_pct, file_name=excluded.file_name,
                 download_client=excluded.download_client, indexer=excluded.indexer, protocol=excluded.protocol,
                 size=excluded.size, eta=excluded.eta, searching_since=excluded.searching_since,
-                last_checked=excluded.last_checked, source_updated_at=excluded.source_updated_at, raw_json=excluded.raw_json""",
-                (item["request_id"], item["origin"], item["content_class"], item["routing_state"], item["external_id"], item["service"], item["requested_by"], item["requested_at"], item["title"], item["year"], item["media_type"], item["status"], item["progress_pct"], item["file_name"], item["download_client"], item["indexer"], item["protocol"], item["size"], item["eta"], item["searching_since"], item["last_checked"], item["source_updated_at"], encoded))
+                last_checked=excluded.last_checked, download_state=excluded.download_state,
+                source_updated_at=excluded.source_updated_at, raw_json=excluded.raw_json""",
+                (item["request_id"], item["origin"], item["content_class"], item["routing_state"], item["external_id"], item["service"], item["requested_by"], item["requested_at"], item["title"], item["year"], item["media_type"], item["status"], item["progress_pct"], item["file_name"], item["download_client"], item["indexer"], item["protocol"], item["size"], item["eta"], item["searching_since"], item["last_checked"], item.get("download_state"), item["source_updated_at"], encoded))
             if not old or old[0] != item["status"]:
                 db.execute("INSERT INTO item_history(request_id, status, observed_at, detail_json) VALUES (?, ?, ?, ?)", (item["request_id"], item["status"], item["last_checked"], encoded))
         db.commit()

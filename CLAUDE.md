@@ -21,6 +21,27 @@
 - **When Kyle raises a concern, change approach** — do not restate the same
   approach in new words.
 
+## Decide rather than ask
+
+Kyle is not reviewing your reasoning step by step. When a choice is
+reversible, make it, state what you chose in one line, and continue. Only
+stop when the choice is irreversible — destroying data, touching production,
+spending money — or when you cannot proceed without information only he has.
+Sort orders, colours, thresholds and filenames are not worth asking about.
+
+**But own the choice.** Deciding without asking means checking the decision
+against the real data, not picking a default and moving on. A sort order that
+buries the useful rows, a threshold that never fires, a colour scheme that is
+unreadable at night — those are yours to catch, not his to report back to
+you. If there is a number involved, compute it. If there is a distribution,
+run the decision against it.
+
+## Handoff format
+
+When Kyle needs to relay findings to someone else, end the response with a
+short block under a `--- HANDOFF ---` line: what changed, what you found,
+what decision is needed. Plain prose, no code, no tool output.
+
 ## Verify, don't assume
 
 Several tools in this lab accept a value silently and do nothing. Config is
