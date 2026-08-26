@@ -552,6 +552,12 @@ class ServiceRegistry:
                 selected_candidate,
                 before_create=before_create,
             )
+        if service in {"radarr", "sonarr"}:
+            return self.arr(service).submit_selected(
+                str(selected_candidate.get("work_id") or ""),
+                fallback_title=str(request.get("title") or ""),
+                before_create=before_create,
+            )
         raise RuntimeError("Candidate confirmation has no supported acquisition owner.")
 
     def direct(self) -> DirectAcquirer:

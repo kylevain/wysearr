@@ -15,7 +15,7 @@ try:
         RequestStore,
     )
     from .handlers import dispatch
-    from .matching import request_target_key
+    from .matching import identifies_a_work, request_target_key
     from .notifications import response_notifications
     from .parser import RequestParseError, parse_request
     from .results import normalize_result, result
@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - direct container entrypoint
         RequestStore,
     )
     from handlers import dispatch
-    from matching import request_target_key
+    from matching import identifies_a_work, request_target_key
     from notifications import response_notifications
     from parser import RequestParseError, parse_request
     from results import normalize_result, result
@@ -859,6 +859,42 @@ class RequestProcessor:
             )
             return value
 
+        if not identifies_a_work(parsed.get("title"), parsed.get("author")):
+            # A bare format token matches any release whose filename contains
+            # it, so this must fail before any acquisition service sees it. It
+            # is almost always a picker reply Huey read as a new request.
+            message = (
+                "That is a format, not a title. If you were answering a Huey "
+                "prompt, use Discord's Reply action on the prompt itself and "
+                "send one listed number. Otherwise send the full title."
+            )
+            record, created = self.store.create_request(
+                discord_user_id=delivery["discord_user_id"],
+                discord_username=str(delivery["discord_username"]),
+                channel_id=delivery["channel_id"],
+                message_id=message_id,
+                media_type=media_type,
+                raw_request=content,
+                title=parsed["title"],
+                author=parsed["author"],
+            )
+            if not created:
+                return self._duplicate_result(record, message_id)
+            value = result("needs_selection", message)
+            value.update({"request_id": record["id"], "duplicate": False})
+            plans = response_notifications(media_type, value, record)
+            self.store.transition(
+                record["id"],
+                "needs_selection",
+                message,
+                event_type="unidentifying_request_rejected",
+                error=message,
+                notifications=tuple(
+                    (plan.event_key, plan.route, plan.message) for plan in plans
+                ),
+            )
+            return value
+
         configured_backends = tuple(
             getattr(self.services, "ebook_acquisition_backends", ()) or ()
         )
@@ -889,7 +925,13 @@ class RequestProcessor:
             return self._run_ebook_cascade(request)
 
         intended_service = None
-        if media_type == "audiobooks" and getattr(
+        if media_type == "movies-tv":
+            # Naming the owning ARR before dispatch lets an ambiguous lookup
+            # persist a candidate prompt, which requires a supported service.
+            intended_service = {"movie": "radarr", "tv": "sonarr"}.get(
+                str(parsed.get("kind") or "")
+            )
+        elif media_type == "audiobooks" and getattr(
             self.services, "abba_enabled", False
         ):
             intended_service = "abba"

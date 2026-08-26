@@ -54,8 +54,18 @@ _SELECTION_FINGERPRINT = re.compile(r"\A[0-9a-f]{64}\Z")
 _SELECTION_WORK_ID = re.compile(
     r"\A(?:(?:hardcover|google_books|openlibrary):"
     r"[A-Za-z0-9][A-Za-z0-9._:-]{0,230}|"
-    r"(?:abba|lazylibrarian):[0-9a-f]{64})\Z"
+    r"(?:abba|lazylibrarian):[0-9a-f]{64}|"
+    r"radarr:tmdb:[0-9]{1,12}|sonarr:tvdb:[0-9]{1,12})\Z"
 )
+# The persisted option contract is shared by every picker.  A candidate is
+# valid only when its media type, option kind, and content kind agree, so a
+# book identity can never be stored against a movies-tv request or vice versa.
+SELECTION_OPTION_KINDS = {
+    ("ebooks", "ebook"): "book",
+    ("audiobooks", "audiobook"): "book",
+    ("movies-tv", "movie"): "video",
+    ("movies-tv", "tv"): "video",
+}
 _SENSITIVE_SELECTION_IDENTITY = re.compile(
     r"(?:api[_-]?key|token|password|secret|authorization)", re.IGNORECASE
 )
@@ -104,9 +114,10 @@ def _normalize_selection_proposal(value: object) -> tuple[dict[str, Any], ...]:
                 or _SENSITIVE_SELECTION_IDENTITY.search(str(source_id or ""))
                 for source_id in source_work_ids
             )
-            or item.get("media_type") not in {"ebooks", "audiobooks"}
-            or item.get("book_type") not in {"ebook", "audiobook"}
-            or item.get("content_kind") != "book"
+            or SELECTION_OPTION_KINDS.get(
+                (str(item.get("media_type") or ""), str(item.get("book_type") or ""))
+            )
+            != item.get("content_kind")
             or isinstance(year, bool)
         ):
             raise ValueError("Selection proposals contain an invalid candidate")
@@ -121,7 +132,7 @@ def _normalize_selection_proposal(value: object) -> tuple[dict[str, Any], ...]:
                 "title": title,
                 "author": author,
                 "year": year,
-                "content_kind": "book",
+                "content_kind": item["content_kind"],
                 "media_type": item["media_type"],
                 "book_type": item["book_type"],
             }

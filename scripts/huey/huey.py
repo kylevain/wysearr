@@ -61,6 +61,9 @@ _SHELFARR_IMPORT_FAILURE = re.compile(
 )
 _SELECTION_ORDINAL = re.compile(r"^[1-9][0-9]*$")
 _DEWEY_TRUSTED_NONCE = re.compile(r"\Adewey:v1:[A-Za-z0-9_-]{16}\Z")
+# Channels whose ambiguity is resolved by a numbered candidate prompt. A bare
+# number in one of these is a selection token rather than a standalone title.
+_SELECTION_MEDIA_TYPES = frozenset({"ebooks", "audiobooks", "movies-tv"})
 
 
 def write_ready_marker(path: str | Path) -> None:
@@ -146,11 +149,13 @@ def format_candidate_prompt(
             raise ValueError("Candidate prompt contains an invalid label")
         lines.append(f"{ordinal}. {label}")
     minutes = max(1, (int(ttl_seconds) + 59) // 60)
-    choice_kind = (
-        "audiobook choice"
-        if str(response.get("service") or "").casefold() == "abba"
-        else "metadata choice"
-    )
+    service = str(response.get("service") or "").casefold()
+    if service in {"radarr", "sonarr"}:
+        choice_kind = "title choice"
+    elif service == "abba":
+        choice_kind = "audiobook choice"
+    else:
+        choice_kind = "metadata choice"
     return (
         f"⚠️ Request #{response['request_id']} needs one {choice_kind}\n"
         f"Type: {media_type}\n"
@@ -219,6 +224,7 @@ async def _reply_targets_huey_candidate_prompt(
         and (
             " needs one metadata choice\n" in content
             or " needs one audiobook choice\n" in content
+            or " needs one title choice\n" in content
         )
         and (
             "\nUse Discord's Reply action on this message, then send one number within "
@@ -1919,7 +1925,7 @@ def build_client(
                 )
                 if targets_huey_prompt is True or (
                     targets_huey_prompt is None
-                    and media_type in {"ebooks", "audiobooks"}
+                    and media_type in _SELECTION_MEDIA_TYPES
                 ):
                     try:
                         await message.reply(selection_correction("inactive"))
@@ -1932,14 +1938,14 @@ def build_client(
             # A reply to any message other than a live persisted Huey prompt is
             # ordinary request-channel input and follows the unchanged parser.
 
-        # A bare integer is a selection token, not a safe standalone book
-        # request. This also closes the failover edge where Discord redelivers a
+        # A bare integer is a selection token, not a safe standalone request.
+        # This also closes the failover edge where Discord redelivers a
         # recorded choice without its message reference: the durable reply-ID
         # lookup above normally coalesces it, and this guard prevents a race from
         # ever dispatching a separate request whose title is merely "1".
         if (
             prompt_message_id is None
-            and media_type in {"ebooks", "audiobooks"}
+            and media_type in _SELECTION_MEDIA_TYPES
             and _selection_ordinal(message.content) in {1, 2, 3}
         ):
             try:

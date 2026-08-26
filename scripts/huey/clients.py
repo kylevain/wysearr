@@ -17,10 +17,12 @@ import requests
 
 try:  # Support both package imports and direct container script execution.
     from .matching import (
+        ArrCandidate,
         RankedCandidate,
         Selection,
         normalize_text,
         normalize_identity_text,
+        rank_arr_candidates,
         select_arr_candidate,
         select_shelfarr_candidate,
         title_similarity,
@@ -28,10 +30,12 @@ try:  # Support both package imports and direct container script execution.
     from .results import result, safe_display_title, sanitize_display_text
 except ImportError:  # pragma: no cover - exercised by the container entrypoint
     from matching import (
+        ArrCandidate,
         RankedCandidate,
         Selection,
         normalize_identity_text,
         normalize_text,
+        rank_arr_candidates,
         select_arr_candidate,
         select_shelfarr_candidate,
         title_similarity,
@@ -438,16 +442,139 @@ class ArrClient(JsonClient):
 
         return self._entity_has_imported_media(self._get_entity(internal_id))
 
+    # Only Radarr and Sonarr offer a requester-facing picker. Lidarr keeps the
+    # unchanged needs_selection behavior for the music channel.
+    _PICKER_PROVIDER = {"radarr": "tmdb", "sonarr": "tvdb"}
+    _PICKER_OPTION_KIND = {"radarr": "movie", "sonarr": "tv"}
+    # Display-only floor. A candidate below this is too weak to be worth
+    # showing; it has no bearing on what select_arr_candidate auto-accepts.
+    _PICKER_MIN_SIMILARITY = 0.45
+
+    def _candidate_work_id(self, candidate: Mapping[str, Any]) -> str | None:
+        """Return the stable provider identity used to re-resolve a choice."""
+
+        provider = self._PICKER_PROVIDER.get(self.service)
+        if provider is None:
+            return None
+        text = str(candidate.get(self.spec.external_id_field) or "").strip()
+        if not text.isdigit() or len(text) > 12 or int(text) <= 0:
+            return None
+        return f"{self.service}:{provider}:{int(text)}"
+
+    def _selection_proposal(
+        self, ranked: Iterable[ArrCandidate]
+    ) -> tuple[dict[str, Any], ...]:
+        """Offer the ranked results the automatic gate declined.
+
+        The persisted option carries only the provider identity and inert
+        display text. The full ARR payload is deliberately not stored: the
+        selection is re-resolved from its provider ID at dispatch time.
+        """
+
+        option_kind = self._PICKER_OPTION_KIND.get(self.service)
+        if option_kind is None:
+            return ()
+        options: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in ranked:
+            if candidate.score < self._PICKER_MIN_SIMILARITY:
+                break
+            work_id = self._candidate_work_id(candidate.item)
+            if work_id is None or work_id in seen:
+                continue
+            title = sanitize_display_text(candidate.title, limit=160)
+            if title is None:
+                continue
+            year = (
+                candidate.year
+                if isinstance(candidate.year, int)
+                and not isinstance(candidate.year, bool)
+                and 0 <= candidate.year <= 9999
+                else None
+            )
+            label = sanitize_display_text(
+                f"{title} ({year})" if year is not None else title, limit=300
+            )
+            if label is None:
+                continue
+            seen.add(work_id)
+            options.append(
+                {
+                    "fingerprint": hashlib.sha256(work_id.encode("utf-8")).hexdigest(),
+                    "label": label,
+                    "work_id": work_id,
+                    "source_work_ids": (work_id,),
+                    "title": title,
+                    "author": None,
+                    "year": year,
+                    "content_kind": "video",
+                    "media_type": "movies-tv",
+                    "book_type": option_kind,
+                }
+            )
+            if len(options) == 3:
+                break
+        # The persisted contract requires at least two distinct options; a
+        # single plausible result is not a choice worth asking about.
+        return tuple(options) if len(options) >= 2 else ()
+
     def submit(self, title: str) -> dict[str, str | None]:
         candidates = self.lookup(title)
         selected = select_arr_candidate(title, candidates)
         if selected is None:
+            proposal = self._selection_proposal(rank_arr_candidates(title, candidates))
+            if proposal:
+                return result(
+                    "awaiting_selection",
+                    f"{self.service.title()} found more than one possible match.",
+                    service=self.service,
+                    selection_proposal=proposal,
+                )
             return result(
                 "needs_selection",
                 f"{self.service.title()} could not identify one safe match. Add a year or a more exact title.",
                 service=self.service,
             )
+        return self._add_and_search(selected, title)
 
+    def submit_selected(
+        self,
+        work_id: str,
+        *,
+        fallback_title: str = "",
+        before_create: Callable[..., None] | None = None,
+    ) -> dict[str, str | None]:
+        """Add the exact provider identity the requester confirmed."""
+
+        provider = self._PICKER_PROVIDER.get(self.service)
+        if provider is None:
+            raise ServiceError(f"{self.service} does not support candidate selection.")
+        prefix = f"{self.service}:{provider}:"
+        text = str(work_id or "")
+        if not text.startswith(prefix) or not text[len(prefix) :].isdigit():
+            raise ServiceError(f"{self.service} received an invalid selected identity.")
+        provider_id = int(text[len(prefix) :])
+        matches = [
+            item
+            for item in self.lookup(f"{provider}:{provider_id}")
+            if isinstance(item, Mapping)
+            and str(item.get(self.spec.external_id_field) or "") == str(provider_id)
+        ]
+        if len(matches) != 1:
+            raise ServiceError(
+                f"{self.service} could not resolve the confirmed title to one exact entry."
+            )
+        return self._add_and_search(
+            matches[0], fallback_title, before_create=before_create
+        )
+
+    def _add_and_search(
+        self,
+        selected: Mapping[str, Any],
+        title: str,
+        *,
+        before_create: Callable[..., None] | None = None,
+    ) -> dict[str, str | None]:
         selected_title = safe_display_title(selected.get(self.spec.title_field), title)
         existing_id = selected.get("id")
         existing_state = "new"
@@ -474,6 +601,10 @@ class ArrClient(JsonClient):
             else:
                 monitored = dict(existing)
                 monitored["monitored"] = True
+                # Cross the durable dispatch boundary before the first mutation
+                # so a restart can tell a confirmed choice from a submitted one.
+                if before_create is not None:
+                    before_create()
                 self._request(
                     "PUT",
                     self._api(f"{self.spec.entity}/{entity_id}"),
@@ -486,6 +617,8 @@ class ArrClient(JsonClient):
             metadata_profile_id = (
                 self._discover_metadata_profile() if self.service == "lidarr" else None
             )
+            if before_create is not None:
+                before_create()
             added = self._request(
                 "POST",
                 self._api(self.spec.entity),

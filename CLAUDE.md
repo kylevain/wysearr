@@ -41,6 +41,57 @@ wysearr. Do not assume edits here are live.
 wysearr is a 2011 AMD G-T48E and cannot run Claude Code (no SSE4.2/AVX —
 SIGILL). That is why this clone exists on batfire.
 
+## Permission boundaries
+
+**This repo is a disposable clone on batfire. Nothing here reaches production;
+worst case is a re-clone. Production is `~/homelab` on wysearr, reachable only
+by ssh and only with Kyle's approval. Work freely in the clone — the gate is
+on anything that leaves it.**
+
+Encoded in `.claude/settings.local.json` (gitignored — recreate it on a new
+machine). Note the permission system appends its own narrow rules to that file
+when a prompt is approved, which can overwrite hand-written entries; check it
+still holds the broad rules if prompts reappear.
+
+Pre-approved, no prompt: `python`/`python3` (including heredocs), `pytest`,
+`unittest`, `cd`, `mkdir`, `cp`, `mv`, `sed`, all read-only inspection, and
+`git add`/`commit`/`checkout`/`stash`/`status`/`diff`/`log`/`show`. Edits and
+writes anywhere under `/home/batadmin/wysearr`.
+
+Always ask first — and these are the only ones that matter:
+`ssh`, `scp`, `rsync`, `git push`, `sudo`, `docker`, `systemctl`.
+
+Also ask before restarting or stopping Huey. It is live; a restart drops the
+Discord gateway and runs whatever SQLite migrations are pending in
+`initialize()`.
+
+Run tests freely and report real output. Never claim a suite passed without
+running it.
+
+## Known data issues
+
+**Request #126 needs manual cleanup.** It is `audiobooks`, `raw_request` and
+`title` both `"m4b"`, status `queued`, service `abba`, and its
+`external_title` is `An Abundance Of Katherines - M4B - Clean Source - John
+Green`. A bare reply of `"m4b"` was parsed as a new request, ABBA matched a
+filename containing `M4B`, and it queued a book nobody asked for. **The book
+is being kept.**
+
+Two fields still need correcting:
+- `title`, so Louie stops displaying the row as `"m4b"` (Louie shows
+  `title or raw_request`, and it is read-only, so the fix must be in Huey's
+  table).
+- `target_key`, currently `v1:["audiobooks","","m4b",""]`. While that value
+  stands and the row is `queued`, `create_request` collapses every future
+  `m4b`/`mp3`/`epub` reply in `#audiobooks` onto #126.
+
+The underlying bug is fixed — `request_target_key` now returns `None` for text
+that cannot identify a work, and such a request never reaches an acquisition
+service. **#126 predates the fix and is not corrected retroactively.** The fix
+is also what makes clearing its key durable: `_backfill_target_keys` re-keys
+`NULL` rows in `queued`/`complete`/`completed` at every start, and only skips
+#126 because the guard now returns `None` for `"m4b"`.
+
 ## Current state
 
 Louie is built, deployed and healthy — a read-only status aggregator over

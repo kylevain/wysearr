@@ -24,6 +24,55 @@ def normalize_identity_text(value: Any) -> str:
     return " ".join(text.split())
 
 
+FORMAT_HINTS = {
+    "ebooks": ("epub", "pdf", "mobi", "azw", "azw3"),
+    "audiobooks": ("m4b", "mp3", "aac", "flac", "audiobook"),
+    "manga-comics": ("cbz", "cbr", "pdf", "comic", "manga"),
+    "roms": ("rom", "iso", "chd", "zip", "7z"),
+    "sheet-music": ("pdf", "musicxml", "mxl", "sheet music", "score"),
+}
+
+# Tokens naming a file format or edition qualifier rather than a work. Derived
+# from FORMAT_HINTS so the two cannot drift apart, plus the spellings people
+# actually type that the ranker has no hint for.
+FORMAT_ONLY_TOKENS = frozenset(
+    token
+    for hints in FORMAT_HINTS.values()
+    for hint in hints
+    for token in normalize_text(hint).split()
+) | {"m4a", "ogg", "opus", "wav", "djvu", "cb7", "ebook", "book", "audio"}
+
+# Real requested titles reach two characters -- "It", "Us", "Up" are all
+# genuine works. Anything above two would reject those, and length cannot
+# catch the actual problem anyway: "m4b" (3) and "epub" (4) are both LONGER
+# than "It". The format-token check is what does the real work here; this
+# bound only rejects a single stray character.
+MINIMUM_IDENTIFYING_TITLE = 2
+
+
+def identifies_a_work(title: Any, author: Any = None) -> bool:
+    """Report whether this text could name a work at all.
+
+    A reply that Huey mis-read as a new request is usually a bare format token
+    or a single character. Such input cannot identify anything, so it must not
+    reserve a dedup target and must not reach an acquisition service, which
+    would otherwise match it against any release whose filename contains it.
+    """
+
+    # Length is measured on identity text, not on normalize_text output:
+    # normalize_text keeps only [a-z0-9], so a CJK title normalizes to the
+    # empty string and would otherwise be rejected outright.
+    identity = normalize_identity_text(title).replace(" ", "")
+    if not identity:
+        return False
+    tokens = normalize_text(title).split()
+    if tokens and all(token in FORMAT_ONLY_TOKENS for token in tokens):
+        return False
+    if normalize_identity_text(author):
+        return True
+    return len(identity) >= MINIMUM_IDENTIFYING_TITLE
+
+
 def request_target_key(media_type: str, parsed: Mapping[str, Any]) -> str | None:
     """Return a conservative exact request identity, never a fuzzy match.
 
@@ -31,10 +80,16 @@ def request_target_key(media_type: str, parsed: Mapping[str, Any]) -> str | None
     Normalization removes only superficial case and whitespace differences.
     Punctuation, accents, kind, author, and edition/year terms are retained to
     avoid merging titles which merely look similar.
+
+    Text which cannot identify a work reserves no target at all. Keying a bare
+    format token made one accidental request the canonical owner of every later
+    reply carrying the same word.
     """
 
     normalized_title = normalize_identity_text(parsed.get("title"))
     if not normalized_title:
+        return None
+    if not identifies_a_work(parsed.get("title"), parsed.get("author")):
         return None
     return "v1:" + json.dumps(
         [
@@ -77,15 +132,6 @@ class RankedCandidate:
     score: float
     seeders: int
     stable_key: str
-
-
-FORMAT_HINTS = {
-    "ebooks": ("epub", "pdf", "mobi", "azw", "azw3"),
-    "audiobooks": ("m4b", "mp3", "aac", "flac", "audiobook"),
-    "manga-comics": ("cbz", "cbr", "pdf", "comic", "manga"),
-    "roms": ("rom", "iso", "chd", "zip", "7z"),
-    "sheet-music": ("pdf", "musicxml", "mxl", "sheet music", "score"),
-}
 
 
 def score_release(
@@ -180,7 +226,26 @@ def select_release(
     return Selection(ranked[0].item, "selected", tuple(ranked))
 
 
-def select_arr_candidate(title: str, items: Iterable[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+@dataclass(frozen=True)
+class ArrCandidate:
+    item: Mapping[str, Any]
+    score: float
+    title: str
+    year: int | None
+    provider_id: str
+
+
+def rank_arr_candidates(
+    title: str, items: Iterable[Mapping[str, Any]]
+) -> list[ArrCandidate]:
+    """Rank ARR lookup results deterministically without applying any gate.
+
+    ``select_arr_candidate`` applies the automatic-match thresholds on top of
+    this ordering.  Splitting the ranking out lets an ambiguous lookup offer the
+    same ordered candidates to the requester instead of discarding them, without
+    changing what qualifies as an automatic match.
+    """
+
     def candidate_title(item: Mapping[str, Any]) -> str:
         return str(
             item.get("title")
@@ -213,6 +278,8 @@ def select_arr_candidate(title: str, items: Iterable[Mapping[str, Any]]) -> Mapp
 
     scored = []
     for item in items:
+        if not isinstance(item, Mapping):
+            continue
         item_year = candidate_year(item)
         similarity = title_similarity(wanted_title, candidate_title(item))
         if wanted_year is not None:
@@ -235,12 +302,31 @@ def select_arr_candidate(title: str, items: Iterable[Mapping[str, Any]]) -> Mapp
                 item,
             )
         )
-    scored.sort(key=lambda value: (-value[0], value[1], value[2], value[3]))
-    if not scored or scored[0][0] < 0.62:
+    # Ties break toward the most recent release. A request that names no year
+    # usually means the current one, and when more candidates tie than the
+    # picker can show, the oldest are the safest to drop. The year is only ever
+    # consulted when score and normalized title are already equal, which makes
+    # the runner-up gap zero, so this cannot change an automatic match.
+    scored.sort(key=lambda value: (-value[0], value[1], -value[2], value[3]))
+    return [
+        ArrCandidate(
+            item=value[4],
+            score=value[0],
+            title=candidate_title(value[4]),
+            year=candidate_year(value[4]),
+            provider_id=value[3],
+        )
+        for value in scored
+    ]
+
+
+def select_arr_candidate(title: str, items: Iterable[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    ranked = rank_arr_candidates(title, items)
+    if not ranked or ranked[0].score < 0.62:
         return None
-    if len(scored) > 1 and scored[0][0] - scored[1][0] < 0.05:
+    if len(ranked) > 1 and ranked[0].score - ranked[1].score < 0.05:
         return None
-    return scored[0][4]
+    return ranked[0].item
 
 
 def select_shelfarr_candidate(

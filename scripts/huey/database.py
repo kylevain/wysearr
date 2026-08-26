@@ -11,6 +11,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from .results import SELECTION_OPTION_KINDS
+except ImportError:  # pragma: no cover - direct container entrypoint
+    from results import SELECTION_OPTION_KINDS
+
 
 REQUEST_STATUSES = frozenset(
     {
@@ -40,8 +45,14 @@ _DOWNLOAD_ID = re.compile(r"\A(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 _SELECTION_WORK_ID = re.compile(
     r"\A(?:(?:hardcover|google_books|openlibrary):"
     r"[A-Za-z0-9][A-Za-z0-9._:-]{0,230}|"
-    r"(?:abba|lazylibrarian):[0-9a-f]{64})\Z"
+    r"(?:abba|lazylibrarian):[0-9a-f]{64}|"
+    r"radarr:tmdb:[0-9]{1,12}|sonarr:tvdb:[0-9]{1,12})\Z"
 )
+# Services permitted to own a persisted candidate prompt.  Radarr and Sonarr
+# join the book services so an ambiguous ARR lookup can be resolved by the
+# requester instead of terminating in needs_selection.
+_SELECTION_SERVICES = ("shelfarr", "abba", "lazylibrarian", "radarr", "sonarr")
+_SELECTION_SERVICE_SQL = ", ".join(f"'{service}'" for service in _SELECTION_SERVICES)
 _SENSITIVE_SELECTION_TEXT = re.compile(
     r"(?:https?://|ftp://|www\.|magnet:|"
     r"(?:api[\s_-]*key|token|password|secret|authorization)\s*[:=]|"
@@ -194,9 +205,7 @@ def _normalize_candidate_snapshot(
         or len({str(source_id) for source_id in raw_source_ids}) != len(raw_source_ids)
         or str(raw_source_ids[0]) != work_id
         or media_type != request_media_type
-        or media_type not in {"ebooks", "audiobooks"}
-        or book_type != {"ebooks": "ebook", "audiobooks": "audiobook"}.get(media_type)
-        or content_kind != "book"
+        or SELECTION_OPTION_KINDS.get((media_type, book_type)) != content_kind
         or isinstance(year, bool)
         or (year is not None and (not isinstance(year, int) or not 0 <= year <= 9999))
     ):
@@ -210,7 +219,7 @@ def _normalize_candidate_snapshot(
         "title": _safe_selection_text(value.get("title"), limit=160),
         "author": _safe_selection_text(value.get("author"), limit=160, optional=True),
         "year": year,
-        "content_kind": "book",
+        "content_kind": content_kind,
         "media_type": media_type,
         "book_type": book_type,
     }
@@ -290,6 +299,7 @@ class RequestStore:
         with self.connect() as connection:
             connection.executescript(schema)
             self._migrate_trusted_notification_outbox(connection)
+            self._migrate_candidate_option_kinds(connection)
             self._add_missing_columns(connection)
             connection.execute(
                 "UPDATE requests SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)"
@@ -725,14 +735,14 @@ class RequestStore:
             WHERE candidate_confirmations.status = 'claimed'
               AND candidate_confirmations.dispatch_started_at IS NULL
               AND requests.status = 'processing'
-              AND requests.service IN ('shelfarr', 'abba', 'lazylibrarian')
+              AND requests.service IN (%s)
               AND requests.external_id IS NULL
               AND NOT EXISTS (
                   SELECT 1 FROM ebook_cascades
                   WHERE ebook_cascades.request_id = requests.id
               )
             ORDER BY candidate_confirmations.id
-            """
+            """ % _SELECTION_SERVICE_SQL
         ).fetchall()
         for row in rows:
             connection.execute(
@@ -751,9 +761,9 @@ class RequestStore:
                 SET status = 'needs_selection', updated_at = CURRENT_TIMESTAMP,
                     error = ?
                 WHERE id = ? AND status = 'processing'
-                  AND service IN ('shelfarr', 'abba', 'lazylibrarian')
+                  AND service IN (%s)
                   AND external_id IS NULL
-                """,
+                """ % _SELECTION_SERVICE_SQL,
                 (message, row["request_id"]),
             )
             connection.execute(
@@ -992,6 +1002,76 @@ class RequestStore:
                 (max(1, min(int(limit), 1000)),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _migrate_candidate_option_kinds(connection: sqlite3.Connection) -> None:
+        """Widen ``candidate_options.book_type`` to accept movie/tv options.
+
+        SQLite cannot alter a CHECK constraint in place, so the narrow
+        book-only table is rebuilt once.  ``candidate_options`` is a leaf: no
+        table, index, or trigger references it, so the rebuild cannot cascade.
+        Every existing row is copied unchanged and the ordinal bound stays 1-3.
+        """
+
+        existing = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'candidate_options'"
+        ).fetchone()
+        if existing is None or "'movie'" in str(existing["sql"] or ""):
+            return
+
+        connection.execute("SAVEPOINT huey_candidate_option_kind_migration")
+        try:
+            connection.execute(
+                """
+                CREATE TABLE candidate_options_migrated (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    confirmation_id INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 1 AND 3),
+                    fingerprint TEXT NOT NULL
+                        CHECK (
+                            length(fingerprint) = 64
+                            AND fingerprint NOT GLOB '*[^0-9a-f]*'
+                        ),
+                    label TEXT NOT NULL CHECK (length(label) BETWEEN 1 AND 300),
+                    title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 160),
+                    author TEXT CHECK (author IS NULL OR length(author) BETWEEN 1 AND 160),
+                    year INTEGER CHECK (year IS NULL OR year BETWEEN 0 AND 9999),
+                    book_type TEXT NOT NULL
+                        CHECK (book_type IN ('ebook', 'audiobook', 'movie', 'tv')),
+                    candidate_json TEXT NOT NULL
+                        CHECK (length(candidate_json) BETWEEN 2 AND 4096),
+                    FOREIGN KEY(confirmation_id)
+                        REFERENCES candidate_confirmations(id) ON DELETE CASCADE,
+                    UNIQUE(confirmation_id, ordinal),
+                    UNIQUE(confirmation_id, fingerprint)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO candidate_options_migrated (
+                    id, confirmation_id, ordinal, fingerprint, label, title,
+                    author, year, book_type, candidate_json
+                )
+                SELECT id, confirmation_id, ordinal, fingerprint, label, title,
+                       author, year, book_type, candidate_json
+                FROM candidate_options
+                """
+            )
+            connection.execute("DROP TABLE candidate_options")
+            connection.execute(
+                "ALTER TABLE candidate_options_migrated RENAME TO candidate_options"
+            )
+        except Exception:
+            connection.execute(
+                "ROLLBACK TO huey_candidate_option_kind_migration"
+            )
+            raise
+        finally:
+            connection.execute(
+                "RELEASE huey_candidate_option_kind_migration"
+            )
 
     @staticmethod
     def _add_missing_columns(connection: sqlite3.Connection) -> None:
@@ -3691,11 +3771,10 @@ class RequestStore:
                 if existing["status"] == "pending" and request["status"] == "awaiting_selection":
                     return existing
                 raise ValueError("Request already has a candidate confirmation")
-            if request["status"] != "processing" or request["service"] not in {
-                "shelfarr",
-                "abba",
-                "lazylibrarian",
-            }:
+            if (
+                request["status"] != "processing"
+                or request["service"] not in _SELECTION_SERVICES
+            ):
                 raise ValueError(
                     "Candidate confirmations require a supported processing request"
                 )
@@ -3757,8 +3836,8 @@ class RequestStore:
                 UPDATE requests
                 SET status = 'awaiting_selection', updated_at = ?, error = NULL
                 WHERE id = ? AND status = 'processing'
-                  AND service IN ('shelfarr', 'abba', 'lazylibrarian')
-                """,
+                  AND service IN (%s)
+                """ % _SELECTION_SERVICE_SQL,
                 (created_at, int(request_id)),
             )
             if request_cursor.rowcount != 1:
@@ -4137,8 +4216,8 @@ class RequestStore:
                 UPDATE requests
                 SET status = 'processing', updated_at = ?, error = NULL
                 WHERE id = ? AND status = 'awaiting_selection'
-                  AND service IN ('shelfarr', 'abba', 'lazylibrarian')
-                """,
+                  AND service IN (%s)
+                """ % _SELECTION_SERVICE_SQL,
                 (observed_at, request["id"]),
             )
             connection.execute(
@@ -4177,9 +4256,9 @@ class RequestStore:
                 WHERE candidate_confirmations.request_id = ?
                   AND candidate_confirmations.status = 'claimed'
                   AND requests.status = 'processing'
-                  AND requests.service IN ('shelfarr', 'abba', 'lazylibrarian')
+                  AND requests.service IN (%s)
                   AND requests.external_id IS NULL
-                """,
+                """ % _SELECTION_SERVICE_SQL,
                 (int(request_id),),
             ).fetchone()
             if row is None:

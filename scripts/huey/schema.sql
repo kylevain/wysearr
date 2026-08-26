@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS candidate_options (
     title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 160),
     author TEXT CHECK (author IS NULL OR length(author) BETWEEN 1 AND 160),
     year INTEGER CHECK (year IS NULL OR year BETWEEN 0 AND 9999),
-    book_type TEXT NOT NULL CHECK (book_type IN ('ebook', 'audiobook')),
+    book_type TEXT NOT NULL CHECK (book_type IN ('ebook', 'audiobook', 'movie', 'tv')),
     candidate_json TEXT NOT NULL CHECK (length(candidate_json) BETWEEN 2 AND 4096),
     FOREIGN KEY(confirmation_id) REFERENCES candidate_confirmations(id) ON DELETE CASCADE,
     UNIQUE(confirmation_id, ordinal),
