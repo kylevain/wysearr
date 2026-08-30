@@ -44,7 +44,7 @@ main{padding:24px 4vw;overflow-x:auto}
 select{border:1px solid var(--line);background:var(--control);padding:9px 12px;color:var(--ink);font-size:14px}
 .board{display:grid;grid-template-columns:repeat(6,minmax(230px,1fr));gap:12px;min-width:1450px}
 .column{background:var(--column);border-top:4px solid var(--green);min-height:190px}
-.column[data-status=failed],.column[data-status=ambiguous],.column[data-status=unparsed]{border-color:var(--accent)}
+.column[data-status=failed],.column[data-status=ambiguous],.column[data-status=no_results],.column[data-status=unparsed]{border-color:var(--accent)}
 .column h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;margin:0;padding:13px 13px 7px}
 .count{color:var(--muted);font-weight:400}
 .items{padding:0 9px 12px}
@@ -75,8 +75,8 @@ try{const saved=localStorage.getItem('louie-theme');if(saved==='dark'||saved==='
   <div class="board" id="board"></div>
 </main>
 <script>
-const statuses=['submitted','searching','downloading','importing','stalled','seeding','completed','failed','ambiguous','unparsed','manual_review'];
-const labels={submitted:'Submitted',searching:'Searching',downloading:'Downloading',importing:'Importing',stalled:'Stalled',seeding:'Seeding',completed:'Completed',failed:'Failed',ambiguous:'Needs clarification',unparsed:'Unparsed',manual_review:'Manual review'};
+const statuses=['submitted','searching','downloading','importing','stalled','seeding','completed','failed','ambiguous','no_results','unparsed','manual_review'];
+const labels={submitted:'Submitted',searching:'Searching',downloading:'Downloading',importing:'Importing',stalled:'Stalled',seeding:'Seeding',completed:'Completed',failed:'Failed',ambiguous:'Needs clarification',no_results:'No results',unparsed:'Unparsed',manual_review:'Manual review'};
 
 // --- theme -----------------------------------------------------------------
 // Three states so there is a way back to following the OS, which a plain

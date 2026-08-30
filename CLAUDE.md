@@ -128,3 +128,19 @@ Next work is in **Huey**, not Louie:
   needs investigation before building on it.
 - A numbered picker is the intended fix — post candidates, accept a numeric
   reply. Applies to every channel.
+
+## Known limitation: the parser keeps the author inside the title
+
+`parse_request` only splits an author off when the text contains ` by `.
+`leaders eat last by Simon sinek` parses as title + author;
+`Leaders eat Last simon sinek` parses as a five-word *title*. Everything
+downstream then scores against a title that contains an author, so any release
+whose name does not also repeat the author is penalised — the correct book
+scores 0.401 where the same book scores 0.484 when the author is parsed out.
+
+`AbbaClient.PICKER_MIN_TITLE_SCORE` is 0.40 rather than ARR's 0.45 to
+accommodate exactly that, and `PICKER_MIN_TITLE_RECALL` exists because the same
+unparsed author lets an unrelated book by that author score 0.57. **Both
+numbers are compensating for the parser, not for anything about ABBA.** Fix the
+parser — recognise a trailing name without `by` — and the floor should go back
+to ARR's value rather than drifting further down each time a phrasing misses.

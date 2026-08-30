@@ -12,9 +12,17 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 try:
-    from .results import safe_display_title, sanitize_display_text
+    from .results import (
+        SELECTION_DECLINE_STATUSES,
+        safe_display_title,
+        sanitize_display_text,
+    )
 except ImportError:  # pragma: no cover - direct container entrypoint
-    from results import safe_display_title, sanitize_display_text
+    from results import (
+        SELECTION_DECLINE_STATUSES,
+        safe_display_title,
+        sanitize_display_text,
+    )
 
 
 EVENT_ROUTES = {
@@ -372,7 +380,7 @@ def response_notifications(
             ),
         }.get(status, response_detail)
     elif media_type == "audiobooks":
-        response_detail = {
+        neutral = {
             "queued": "Huey found a usable audiobook release and queued it safely.",
             "needs_selection": (
                 "Huey could not prove one exact audiobook identity; add an author, "
@@ -382,7 +390,17 @@ def response_notifications(
                 "Huey could not complete the audiobook acquisition; an "
                 "administrator can review the saved workflow."
             ),
-        }.get(status, response_detail)
+        }
+        if (
+            status == "needs_selection"
+            and str(response.get("external_status") or "")
+            in SELECTION_DECLINE_STATUSES
+        ):
+            # The intake result already carries a backend-neutral sentence that
+            # names the decline reason. Flattening it here is what made all
+            # three reasons read identically in the lifecycle channel.
+            neutral.pop("needs_selection")
+        response_detail = neutral.get(status, response_detail)
 
     if status == "awaiting_selection":
         # This is an intake conversation, not an accepted, rejected, or queued

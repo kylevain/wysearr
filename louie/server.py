@@ -35,7 +35,12 @@ POLL_STATE = {
 }
 POLL_STATE_LOCK = threading.Lock()
 
-STATUS_ORDER = ("submitted", "searching", "downloading", "importing", "stalled", "seeding", "completed", "failed", "ambiguous", "unparsed", "manual_review")
+STATUS_ORDER = ("submitted", "searching", "downloading", "importing", "stalled", "seeding", "completed", "failed", "ambiguous", "no_results", "unparsed", "manual_review")
+# Huey records why an acquisition backend declined to choose. "Nothing was
+# found" is not a clarification problem -- there is nothing for the requester
+# to clarify -- so it gets its own column instead of sharing "ambiguous" with
+# the two reasons a reply can actually resolve.
+NO_RESULT_DECLINE = "selection_no_results"
 
 
 def now() -> str:
@@ -90,7 +95,12 @@ def huey_items() -> list[dict]:
         if status in {"complete", "completed"}:
             status = "completed"
         elif status == "needs_selection":
-            status = "unparsed" if error and "Start the request with" in error else "ambiguous"
+            if error and "Start the request with" in error:
+                status = "unparsed"
+            elif value.get("external_status") == NO_RESULT_DECLINE:
+                status = "no_results"
+            else:
+                status = "ambiguous"
         elif status in {"new", "processing"}:
             status = "submitted"
         elif status == "queued":

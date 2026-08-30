@@ -465,6 +465,159 @@ class AbbaClientTests(unittest.TestCase):
                     )
 
 
+LEADERS = "Leaders Eat Last: Why Some Teams Pull Together and Others Don't"
+
+
+def release(index, title):
+    """A scraped AudioBookBay listing: a post title and nothing structured.
+
+    ABB posts frequently carry no parsed author, narrator, or year, which is
+    what leaves the release title as the only evidence Huey can rank on.
+    """
+
+    return candidate(
+        "abba:" + f"{index:064x}",
+        title=title,
+        author=None,
+        narrator=None,
+        year=None,
+        format=None,
+        edition=None,
+        size_bytes=None,
+    )
+
+
+class AbbaPickerTests(unittest.TestCase):
+    """Requests #279-#281: a real title that bailed instead of asking.
+
+    Every listing for this work carries its subtitle, so nothing reached the
+    0.82 automatic-match floor. The releases were ranked, in hand, and thrown
+    away.
+    """
+
+    SUBTITLED = (
+        f"Simon Sinek - {LEADERS}",
+        LEADERS,
+        "Leaders Eat Last Deluxe: Why Some Teams Pull Together and Others Don't",
+    )
+
+    def submit(self, *titles, title="Leaders Eat Last", author=None):
+        self.session = ScriptedSession(
+            search_response(*(release(i + 1, value) for i, value in enumerate(titles)))
+        )
+        return AbbaClient("http://abba:8080", session=self.session).submit(
+            "audiobooks", title, author, 42
+        )
+
+    def labels(self, response):
+        return [option["label"] for option in response["selection_proposal"]]
+
+    def test_low_confidence_offers_the_ranked_releases_instead_of_bailing(self):
+        response = self.submit(*self.SUBTITLED)
+
+        self.assertEqual(response["status"], "awaiting_selection")
+        self.assertEqual(len(response["selection_proposal"]), 3)
+        # Offering is not accepting: no grab may follow, and the scripted
+        # session would raise on any second call.
+        self.assertEqual(len(self.session.calls), 1)
+
+    def test_supplied_author_still_offers_releases_that_never_name_it(self):
+        # The blended score docks a correct release 22% for not repeating the
+        # author in its release name. A floor on the blend would drop exactly
+        # the releases the requester asked for by name.
+        response = self.submit(*self.SUBTITLED, author="Simon Sinek")
+
+        self.assertEqual(response["status"], "awaiting_selection")
+        self.assertIn(LEADERS, self.labels(response))
+
+    def test_other_books_by_the_same_author_are_never_offered(self):
+        # "Leaders eat Last simon sinek" has no "by", so the parser leaves the
+        # author inside the title. ABBA ranks release-title variants, so the
+        # bare "Simon Sinek" half of an unrelated listing scores 0.57 against
+        # that query -- high enough to take a picker slot with the wrong book.
+        response = self.submit(
+            f"Simon Sinek - {LEADERS}",
+            "Start With Why - Simon Sinek",
+            "The Infinite Game - Simon Sinek",
+            title="Leaders eat Last simon sinek",
+        )
+
+        for wrong in ("Start With Why", "The Infinite Game"):
+            self.assertNotIn(wrong, repr(self.labels(response)))
+
+    def test_the_author_typed_into_the_title_still_gets_a_choice(self):
+        # Request #280's shape. The parser has no "by" to split on, so every
+        # release that does not repeat "simon sinek" in its own name scores
+        # 0.401 against the query -- the right book, just under ARR's 0.45.
+        response = self.submit(
+            *self.SUBTITLED,
+            "Start With Why - Simon Sinek",
+            "The Infinite Game - Simon Sinek",
+            title="Leaders eat Last simon sinek",
+        )
+
+        self.assertEqual(response["status"], "awaiting_selection")
+        labels = self.labels(response)
+        self.assertEqual(len(labels), 2)
+        for label in labels:
+            self.assertIn("Leaders Eat Last", label)
+
+    def test_a_duplicate_listing_no_longer_discards_the_whole_proposal(self):
+        # Two ABB posts of the same release render one identical label. The
+        # old gate abandoned the entire proposal; keeping the higher-ranked one
+        # still leaves a real choice.
+        response = self.submit(
+            "Leaders Eat Last",
+            "Leaders Eat Last",
+            f"Simon Sinek - {LEADERS}",
+        )
+
+        self.assertEqual(response["status"], "awaiting_selection")
+        labels = self.labels(response)
+        self.assertEqual(len(labels), 2)
+        self.assertEqual(len(set(labels)), 2)
+
+    def test_weak_and_unrelated_releases_stay_out_of_the_picker(self):
+        response = self.submit(
+            "Eat That Frog! - Brian Tracy",
+            "The Last Lecture - Randy Pausch",
+            "Extreme Ownership - Jocko Willink",
+        )
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["selection_proposal"], ())
+
+    def test_one_plausible_release_is_not_a_choice(self):
+        response = self.submit(LEADERS, "Eat That Frog! - Brian Tracy")
+
+        self.assertEqual(response["status"], "needs_selection")
+
+    def test_automatic_matching_is_unchanged(self):
+        # An exact release still auto-accepts, and the display floor never
+        # promotes a release the confidence gate declined into a grab.
+        session = ScriptedSession(
+            search_response(candidate()), status_missing(), grab_response()
+        )
+        queued = AbbaClient("http://abba:8080", session=session).submit(
+            "audiobooks", "Dune", "Frank Herbert", 42
+        )
+
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(self.submit(*self.SUBTITLED)["status"], "awaiting_selection")
+
+    def test_each_decline_reason_is_recorded_on_the_result(self):
+        cases = (
+            ((), "selection_no_results"),
+            (("Something Entirely Different",), "selection_low_confidence"),
+            (("Leaders Eat Last", "Leaders Eat Last"), "selection_ambiguous"),
+        )
+        for titles, expected in cases:
+            with self.subTest(expected=expected):
+                response = self.submit(*titles)
+                self.assertEqual(response["status"], "needs_selection")
+                self.assertEqual(response["external_status"], expected)
+
+
 class AbbaPersistenceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -1030,6 +1183,76 @@ class AbbaRoutingAndRecoveryTests(unittest.TestCase):
         ).casefold()
         for backend in ("abba", "qbittorrent", "prowlarr", "bookbot"):
             self.assertNotIn(backend, requester_text)
+
+    def abba_processor(self, session):
+        registry = ServiceRegistry({"ABBA_ENABLED": "true"})
+        registry._clients["abba"] = AbbaClient("http://abba:8080", session=session)
+        return RequestProcessor(self.store, services=registry)
+
+    def lifecycle_text(self, request_id):
+        return " ".join(
+            item["message"]
+            for item in self.store.pending_notification_deliveries()
+            if item["request_id"] == request_id
+        )
+
+    def test_decline_reasons_are_distinguishable_everywhere_they_are_read(self):
+        # One generic sentence for all three outcomes meant neither the
+        # requester nor anything reading the request afterwards could tell
+        # "nothing was found" from "found, but too alike to choose".
+        cases = (
+            ("The Missing Book", (), "selection_no_results"),
+            (
+                "The Weak Book",
+                (release(1, "Something Entirely Different"),),
+                "selection_low_confidence",
+            ),
+            (
+                "The Twin Book",
+                (release(1, "The Twin Book"), release(2, "The Twin Book")),
+                "selection_ambiguous",
+            ),
+        )
+        messages = {}
+        for index, (title, results, expected) in enumerate(cases):
+            with self.subTest(expected=expected):
+                processor = self.abba_processor(ScriptedSession(search_response(*results)))
+                response = processor.process(
+                    {**self.delivery, "message_id": f"20{index}", "content": title}
+                )
+                saved = self.store.get_request(response["request_id"])
+
+                self.assertEqual(response["status"], "needs_selection")
+                self.assertEqual(saved["external_status"], expected)
+                # The reason is readable off the request itself, which is all
+                # Louie gets to see.
+                self.assertEqual(saved["error"], response["message"])
+                # The lifecycle channel repeats the same specific sentence
+                # rather than the flattened one.
+                self.assertIn(
+                    response["message"], self.lifecycle_text(response["request_id"])
+                )
+                self.assertNotIn("abba", response["message"].casefold())
+                messages[expected] = response["message"]
+
+        self.assertEqual(len(set(messages.values())), 3, messages)
+
+    def test_low_confidence_intake_persists_a_candidate_prompt(self):
+        session = ScriptedSession(
+            search_response(
+                *(release(i + 1, value) for i, value in enumerate(AbbaPickerTests.SUBTITLED))
+            )
+        )
+        response = self.abba_processor(session).process(
+            {**self.delivery, "message_id": "300", "content": "Leaders Eat Last"}
+        )
+        saved = self.store.get_request(response["request_id"])
+
+        self.assertEqual(response["status"], "awaiting_selection")
+        self.assertEqual(len(response["selection_proposal"]), 3)
+        self.assertEqual(saved["status"], "awaiting_selection")
+        # An intake conversation is not a lifecycle event.
+        self.assertEqual(self.lifecycle_text(response["request_id"]), "")
 
     def test_failed_post_mutation_owner_coalesces_later_hash_without_retry(self):
         owner = self.dispatched_request(message_id="prior")

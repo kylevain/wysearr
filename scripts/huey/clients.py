@@ -2328,6 +2328,31 @@ class AbbaClient(JsonClient):
     """Strict AudioBookBay search/grab client with Huey-owned selection."""
 
     MAX_PROPOSAL_CANDIDATES = 3
+    # Display-only gates, mirroring the ARR picker and having no bearing on what
+    # ``_selection`` auto-accepts: that still requires ``minimum_confidence``
+    # and a clear runner-up gap. Separating the two is the point -- every
+    # declined reason leaves ranked releases in hand, and discarding them turned
+    # a question the requester can answer into a dead end.
+    #
+    # ARR's floor is a plain title similarity. ABBA's ranking score is not the
+    # same quantity: supplying an author rescales it (0.78 x title + 0.22 x
+    # author evidence), which pushes a correct release that simply does not
+    # repeat the author in its release name below any floor set on the blend.
+    # So the floor is applied to the title score, and author evidence stays what
+    # it already was: ranking order and auto-accept input.
+    #
+    # The value is 0.40 rather than ARR's 0.45 for the same reason the quantity
+    # differs. A request that names the author without "by" keeps it in the
+    # title, and every release that does not repeat the author scores 0.401
+    # against it -- the correct book, five hundredths under ARR's number. The
+    # recall gate below, not the floor, is what keeps the wrong books out.
+    PICKER_MIN_TITLE_SCORE = 0.40
+    # ABBA also evaluates release-title variants, so "Author - Some Other Book"
+    # scores on its bare author half whenever the requester typed the author
+    # into the title itself (no "by" for the parser to split on). Requiring most
+    # of the typed words to survive in the release name keeps other books by the
+    # right author out of the picker.
+    PICKER_MIN_TITLE_RECALL = 0.6
     _CANDIDATE_ID = re.compile(r"\Aabba:[0-9a-f]{64}\Z")
     _INFO_HASH = re.compile(r"\A[0-9a-fA-F]{40}\Z")
     _FINGERPRINT = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -2669,21 +2694,49 @@ class AbbaClient(JsonClient):
             return Selection(None, "ambiguous", tuple(ranked))
         return Selection(ranked[0].item, "selected", tuple(ranked))
 
-    def _selection_proposal(self, selection: Any) -> tuple[dict[str, Any], ...]:
-        if selection.reason != "ambiguous" or not selection.ranked:
+    def _selection_proposal(
+        self,
+        title: str,
+        author: str | None,
+        selection: Any,
+    ) -> tuple[dict[str, Any], ...]:
+        """Offer the ranked releases the automatic gate declined.
+
+        Every decline that produced ranked releases can be offered, not just an
+        ambiguous one: a title that matched too weakly to accept is exactly the
+        case a requester can settle and Huey cannot.
+        """
+
+        if selection.selected is not None or not selection.ranked:
             return ()
-        top_score = selection.ranked[0].score
+        wanted = set(normalize_text(title).split())
         values: list[dict[str, Any]] = []
         labels: set[str] = set()
         for ranked in selection.ranked:
-            if ranked.score < self.minimum_confidence:
+            if (
+                self._release_title_score(title, ranked.item, author)
+                < self.PICKER_MIN_TITLE_SCORE
+            ):
                 continue
-            if top_score - ranked.score >= self.runner_up_gap:
+            if wanted:
+                present = wanted & set(
+                    normalize_text(ranked.item.get("title")).split()
+                )
+                if len(present) / len(wanted) < self.PICKER_MIN_TITLE_RECALL:
+                    continue
+            try:
+                snapshot = self._candidate_snapshot(ranked.item)
+            except ServiceError:
+                # A release that cannot be rendered safely is skipped rather
+                # than fatal. It is only ever an option to display.
                 continue
-            snapshot = self._candidate_snapshot(ranked.item)
-            if snapshot["label"] in labels:
-                return ()
-            labels.add(str(snapshot["label"]))
+            label = str(snapshot["label"])
+            if label in labels:
+                # Two releases the requester cannot tell apart are not a
+                # choice. Keep the higher-ranked one and carry on, instead of
+                # discarding the whole proposal over a duplicate listing.
+                continue
+            labels.add(label)
             values.append(snapshot)
             if len(values) == self.MAX_PROPOSAL_CANDIDATES:
                 break
@@ -2956,7 +3009,7 @@ class AbbaClient(JsonClient):
         candidates = self.search(title, author)
         selection = self._selection(title, author, candidates)
         if selection.selected is None:
-            proposal = self._selection_proposal(selection)
+            proposal = self._selection_proposal(title, author, selection)
             if proposal:
                 return result(
                     "awaiting_selection",
@@ -2966,17 +3019,24 @@ class AbbaClient(JsonClient):
                 )
             if selection.reason == "no_results":
                 message = "ABBA found no matching audiobook. Check the title and author."
+                decline = "selection_no_results"
             elif selection.reason == "ambiguous":
                 message = (
                     "ABBA found close audiobook matches that could not be distinguished "
                     "safely. Add an author, narrator, year, format, or edition."
                 )
+                decline = "selection_ambiguous"
             else:
                 message = (
                     "ABBA found no audiobook with enough confidence. "
                     "Add an author, narrator, year, format, or edition."
                 )
-            return result("needs_selection", message, service="abba")
+                decline = "selection_low_confidence"
+            # The reason travels as state, not as text: the requester-facing
+            # sentence is rewritten backend-neutrally further up.
+            return result(
+                "needs_selection", message, service="abba", external_status=decline
+            )
         snapshot = self._candidate_snapshot(selection.selected)
         return self._grab_candidate(
             snapshot, int(request_id), before_create=before_create

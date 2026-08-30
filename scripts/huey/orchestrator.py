@@ -18,7 +18,7 @@ try:
     from .matching import identifies_a_work, request_target_key
     from .notifications import response_notifications
     from .parser import RequestParseError, parse_request
-    from .results import normalize_result, result
+    from .results import SELECTION_DECLINE_STATUSES, normalize_result, result
     from .services import ServiceRegistry
 except ImportError:  # pragma: no cover - direct container entrypoint
     from clients import CanonicalAcquisition, ServiceError, SubmissionUncertain
@@ -32,11 +32,33 @@ except ImportError:  # pragma: no cover - direct container entrypoint
     from matching import identifies_a_work, request_target_key
     from notifications import response_notifications
     from parser import RequestParseError, parse_request
-    from results import normalize_result, result
+    from results import SELECTION_DECLINE_STATUSES, normalize_result, result
     from services import ServiceRegistry
 
 
 LOGGER = logging.getLogger("huey.orchestrator")
+
+# One requester-facing sentence per decline reason. Collapsing them into a
+# single generic line made "nothing was found" indistinguishable from "found,
+# but too close to tell apart" -- to the requester, to the lifecycle channels,
+# and to Louie. The acquisition backend is still never named here: the reason
+# travels as state on the request, not as text.
+_AUDIOBOOK_DECLINE_MESSAGES = {
+    "selection_no_results": (
+        "Huey found no audiobook matching that title. Check the spelling, or "
+        "try again later if it is a new release."
+    ),
+    "selection_low_confidence": (
+        "Huey found audiobook releases but none close enough to that title to "
+        "offer safely. Add the author, narrator, year, or edition."
+    ),
+    "selection_ambiguous": (
+        "Huey found audiobook releases it could not tell apart. Add the "
+        "narrator, year, format, or edition."
+    ),
+}
+if set(_AUDIOBOOK_DECLINE_MESSAGES) != SELECTION_DECLINE_STATUSES:  # pragma: no cover
+    raise RuntimeError("Audiobook decline messages must cover every decline reason")
 
 
 def _safe_service_message(error: ServiceError) -> str:
@@ -198,8 +220,14 @@ class RequestProcessor:
             )
             return None
 
+        # A ``needs_selection`` row already carries its reason in ``error`` when
+        # a candidate prompt expires or a confirmation fails. Recording it for
+        # an intake decline too is what lets a reader see why a request is
+        # sitting in clarification without replaying the Discord channel.
         error_message = (
-            handler_result["message"] if handler_result["status"] == "failed" else None
+            handler_result["message"]
+            if handler_result["status"] in {"failed", "needs_selection"}
+            else None
         )
         event_type = (
             f"{handler_result['service'] or 'acquisition'}_submission_uncertain"
@@ -278,9 +306,10 @@ class RequestProcessor:
         elif status == "completed":
             message = "This exact audiobook is already available in the library workflow."
         elif status == "needs_selection":
-            message = (
+            message = _AUDIOBOOK_DECLINE_MESSAGES.get(
+                str(normalized.get("external_status") or ""),
                 "Huey could not prove one exact audiobook identity. Add the author, "
-                "narrator, year, or edition and try again."
+                "narrator, year, or edition and try again.",
             )
         else:
             message = (

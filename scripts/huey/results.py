@@ -69,6 +69,19 @@ SELECTION_OPTION_KINDS = {
 _SENSITIVE_SELECTION_IDENTITY = re.compile(
     r"(?:api[_-]?key|token|password|secret|authorization)", re.IGNORECASE
 )
+# Why an acquisition backend declined to choose, recorded on the request so a
+# reader can tell "nothing was found" from "found, but not confidently" from
+# "found, but indistinguishable".  These are Huey-owned external_status values
+# like ``canonical_duplicate``; no upstream service ever reports them.  Keeping
+# the reason in a field rather than in the sentence lets the requester-facing
+# message stay backend neutral while remaining distinguishable per reason.
+SELECTION_DECLINE_STATUSES = frozenset(
+    {
+        "selection_no_results",
+        "selection_low_confidence",
+        "selection_ambiguous",
+    }
+)
 
 
 def _normalize_selection_proposal(value: object) -> tuple[dict[str, Any], ...]:

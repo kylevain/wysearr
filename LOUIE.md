@@ -10,7 +10,7 @@ The `homelab-dewey-trusted-self-intake` and `homelab-dewey-abba-trusted-self-int
 
 ## Data model
 
-Louie unions Huey's `requests` and `trusted_library_events`. Discord rows use `origin=discord`; physical-disc rows use `origin=physical_disc` and IDs such as `physical-17`. Physical events are not converted into fake request rows. `complete` and `completed` normalize to `completed`. `needs_selection` with Huey's parser error becomes `unparsed`; other `needs_selection` rows become `ambiguous`.
+Louie unions Huey's `requests` and `trusted_library_events`. Discord rows use `origin=discord`; physical-disc rows use `origin=physical_disc` and IDs such as `physical-17`. Physical events are not converted into fake request rows. `complete` and `completed` normalize to `completed`. `needs_selection` with Huey's parser error becomes `unparsed`; a row Huey marked `external_status=selection_no_results` becomes `no_results`; every other `needs_selection` row becomes `ambiguous`. Huey now also records the decline sentence in `error`, so an `ambiguous` card shows whether the releases were too weak or too alike.
 
 Every row has `content_class=general` by default. API responses exclude other classes unless `content_class=all` is explicitly requested. The filter is enforced in the query layer, not only in the dashboard.
 
