@@ -52,6 +52,10 @@ _SELECTION_WORK_ID = re.compile(
 # join the book services so an ambiguous ARR lookup can be resolved by the
 # requester instead of terminating in needs_selection.
 _SELECTION_SERVICES = ("shelfarr", "abba", "lazylibrarian", "radarr", "sonarr")
+# A prompt that expired, or was failed by startup recovery, is finished: it
+# must not block the request being offered a choice again. Only a live prompt
+# ('pending') or one already answered and being acted on ('claimed') does.
+_TERMINAL_CONFIRMATION_STATUSES = frozenset({"expired", "failed"})
 _SELECTION_SERVICE_SQL = ", ".join(f"'{service}'" for service in _SELECTION_SERVICES)
 _SENSITIVE_SELECTION_TEXT = re.compile(
     r"(?:https?://|ftp://|www\.|magnet:|"
@@ -3770,7 +3774,8 @@ class RequestStore:
             if existing is not None:
                 if existing["status"] == "pending" and request["status"] == "awaiting_selection":
                     return existing
-                raise ValueError("Request already has a candidate confirmation")
+                if existing["status"] not in _TERMINAL_CONFIRMATION_STATUSES:
+                    raise ValueError("Request already has a candidate confirmation")
             if (
                 request["status"] != "processing"
                 or request["service"] not in _SELECTION_SERVICES
@@ -3790,22 +3795,48 @@ class RequestStore:
             ):
                 raise ValueError("Candidate confirmations require distinct fingerprints")
 
-            cursor = connection.execute(
-                """
-                INSERT INTO candidate_confirmations (
-                    request_id, shelfarr_correlation, created_at, updated_at,
-                    expires_at, status
-                ) VALUES (?, ?, ?, ?, ?, 'pending')
-                """,
-                (
-                    int(request_id),
-                    f"huey:{int(request_id)}",
-                    created_at,
-                    created_at,
-                    expires_at,
-                ),
-            )
-            confirmation_id = int(cursor.lastrowid)
+            if existing is not None:
+                # A finished prompt is reset rather than replaced. One row per
+                # request is a schema invariant -- request_id and
+                # shelfarr_correlation are both UNIQUE, and the correlation is
+                # a pure function of the request ID -- so a second attempt
+                # cannot add a row, and every query keyed on request_id keeps
+                # its single-row assumption. The old prompt message ID is
+                # released, which correctly makes a stale Discord prompt
+                # unanswerable; the reply history stays for audit.
+                confirmation_id = int(existing["id"])
+                connection.execute(
+                    """
+                    UPDATE candidate_confirmations
+                    SET created_at = ?, updated_at = ?, expires_at = ?,
+                        status = 'pending', prompt_message_id = NULL,
+                        selected_ordinal = NULL, dispatch_started_at = NULL,
+                        failure_message = NULL
+                    WHERE id = ?
+                    """,
+                    (created_at, created_at, expires_at, confirmation_id),
+                )
+                connection.execute(
+                    "DELETE FROM candidate_options WHERE confirmation_id = ?",
+                    (confirmation_id,),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO candidate_confirmations (
+                        request_id, shelfarr_correlation, created_at, updated_at,
+                        expires_at, status
+                    ) VALUES (?, ?, ?, ?, ?, 'pending')
+                    """,
+                    (
+                        int(request_id),
+                        f"huey:{int(request_id)}",
+                        created_at,
+                        created_at,
+                        expires_at,
+                    ),
+                )
+                confirmation_id = int(cursor.lastrowid)
             for ordinal, candidate in enumerate(normalized, start=1):
                 connection.execute(
                     """

@@ -1,6 +1,7 @@
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -46,6 +47,133 @@ CREATE TABLE events (
     FOREIGN KEY(request_id) REFERENCES requests(id)
 );
 """
+
+
+class ConfirmationReuseTests(unittest.TestCase):
+    """A finished prompt must not block the request being asked again.
+
+    Expiry hands the request back to needs_selection, and startup recovery
+    fails prompts Discord never bound. Both used to leave a row that refused
+    every later confirmation, so one unanswered prompt made a request
+    permanently unaskable.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.store = RequestStore(Path(self.temporary.name) / "huey.db")
+        self.store.initialize()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def options(self):
+        return DatabaseTests.selection_candidates()
+
+    def prompt(self, *, ttl_seconds=900, message_id="100"):
+        request, _ = self.store.create_request(
+            **DatabaseTests.request_values(message_id=message_id),
+            target_key=f"v1:key-{message_id}",
+        )
+        self.store.transition(
+            request["id"], "processing", "Searching", service="shelfarr"
+        )
+        self.store.create_candidate_confirmation(
+            request["id"], self.options(), ttl_seconds=ttl_seconds
+        )
+        return int(request["id"])
+
+    def redrive(self, request_id):
+        self.store.transition(
+            request_id, "processing", "Re-driving", service="shelfarr"
+        )
+        return self.store.create_candidate_confirmation(request_id, self.options())
+
+    def confirmation_rows(self, request_id):
+        with self.store.connect() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM candidate_confirmations WHERE request_id = ?",
+                    (request_id,),
+                )
+            ]
+
+    def test_an_expired_prompt_no_longer_blocks_a_new_one(self):
+        request_id = self.prompt(ttl_seconds=1)
+        time.sleep(1.2)
+        self.store.expire_candidate_confirmations()
+        self.assertEqual(self.store.get_request(request_id)["status"], "needs_selection")
+
+        confirmation = self.redrive(request_id)
+
+        self.assertEqual(confirmation["status"], "pending")
+        self.assertEqual(
+            self.store.get_request(request_id)["status"], "awaiting_selection"
+        )
+
+    def test_a_prompt_failed_by_restart_recovery_no_longer_blocks_a_new_one(self):
+        request_id = self.prompt(message_id="200")
+        # Startup recovery fails prompts Discord never durably bound.
+        self.store.initialize()
+        rows = self.confirmation_rows(request_id)
+        self.assertEqual(rows[0]["status"], "failed")
+
+        self.assertEqual(self.redrive(request_id)["status"], "pending")
+
+    def test_a_live_or_answered_prompt_still_blocks(self):
+        for status in ("pending", "claimed"):
+            with self.subTest(status=status):
+                request_id = self.prompt(message_id=f"30{status}")
+                with self.store.connect() as connection:
+                    connection.execute(
+                        "UPDATE candidate_confirmations SET status = ? WHERE request_id = ?",
+                        (status, request_id),
+                    )
+                self.store.transition(
+                    request_id, "processing", "Re-driving", service="shelfarr"
+                )
+                with self.assertRaises(ValueError):
+                    self.store.create_candidate_confirmation(request_id, self.options())
+
+    def test_the_schema_invariant_of_one_row_per_request_is_kept(self):
+        request_id = self.prompt(ttl_seconds=1, message_id="400")
+        time.sleep(1.2)
+        self.store.expire_candidate_confirmations()
+        self.redrive(request_id)
+
+        self.assertEqual(len(self.confirmation_rows(request_id)), 1)
+
+    def test_a_reset_prompt_releases_its_old_discord_message(self):
+        request_id = self.prompt(ttl_seconds=1, message_id="500")
+        self.assertTrue(self.store.bind_candidate_prompt(request_id, "999000111222"))
+        time.sleep(1.2)
+        self.store.expire_candidate_confirmations()
+        self.redrive(request_id)
+
+        row = self.confirmation_rows(request_id)[0]
+        self.assertIsNone(row["prompt_message_id"])
+        self.assertIsNone(row["selected_ordinal"])
+        self.assertIsNone(row["failure_message"])
+        # A reply to the stale prompt cannot claim the fresh one.
+        claim = self.store.claim_candidate_selection(
+            prompt_message_id="999000111222",
+            reply_message_id="999000111333",
+            discord_user_id="1",
+            channel_id="2",
+            ordinal=1,
+        )
+        self.assertEqual(claim["outcome"], "not_found")
+
+    def test_the_reset_prompt_carries_the_new_options_only(self):
+        request_id = self.prompt(ttl_seconds=1, message_id="600")
+        time.sleep(1.2)
+        self.store.expire_candidate_confirmations()
+        confirmation = self.redrive(request_id)
+
+        self.assertEqual(len(confirmation["options"]), len(self.options()))
+        self.assertEqual(
+            [option["ordinal"] for option in confirmation["options"]], [1, 2]
+        )
 
 
 class DatabaseTests(unittest.TestCase):

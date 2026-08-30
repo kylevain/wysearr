@@ -127,7 +127,19 @@ Next work is in **Huey**, not Louie:
   ambiguous row rather than the request actually replied to. Unconfirmed,
   needs investigation before building on it.
 - A numbered picker is the intended fix — post candidates, accept a numeric
-  reply. Applies to every channel.
+  reply. Applies to every channel. Shipped for movies-tv, ebooks, and
+  audiobooks.
+- 66 movies-tv rows in `needs_selection` predate the picker and are inert.
+  `scripts/huey/redrive_selection.py report` surveys them read-only against
+  live Radarr/Sonarr; it must be run on wysearr and reviewed before anything
+  posts. The posting half is deliberately not built yet.
+
+A candidate prompt used to be one-shot per request row: `expires_at` passing,
+or startup recovery failing an unbound prompt, left a terminal
+`candidate_confirmations` row that refused every later confirmation. The row
+is now reset instead. One row per request stays a schema invariant —
+`request_id` and `shelfarr_correlation` are both `UNIQUE` — so a second prompt
+reuses the row rather than adding one.
 
 ## Known limitation: the parser keeps the author inside the title
 
