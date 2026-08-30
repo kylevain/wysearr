@@ -226,6 +226,23 @@ def select_release(
     return Selection(ranked[0].item, "selected", tuple(ranked))
 
 
+# A requested year orders the field; it must never empty it. TMDb's release
+# year routinely disagrees with every consumer source -- "Cashback" is listed
+# as 2006 by Google, Netflix and the BFI, while TMDb offers 2021, 2007 and
+# 2004 and no 2006 at all -- and excluding on that left nothing for the
+# automatic gate *or* the picker, so an accurate year produced strictly less
+# than no year.
+#
+# The cap is set against the real backlog rather than a guess: among the rows
+# a year fix can rescue, the weakest stripped-title score is 0.596 ("the
+# wildlife" against "The Wild Life"), and 0.12 keeps it above the picker's
+# 0.45 display floor even at maximum penalty, while still ordering a one-year
+# miss above a two-year miss.
+YEAR_MISMATCH_PENALTY_PER_YEAR = 0.02
+MAX_YEAR_MISMATCH_PENALTY = 0.12
+_YEAR_TOKEN = re.compile(r"\b((?:18|19|20|21)\d{2})\b")
+
+
 @dataclass(frozen=True)
 class ArrCandidate:
     item: Mapping[str, Any]
@@ -233,6 +250,10 @@ class ArrCandidate:
     title: str
     year: int | None
     provider_id: str
+    # True when a requested year was a genuine release-year hint and this
+    # candidate disagrees with it. Ranking demotes such a candidate so the
+    # requester can still be offered it; the automatic gate drops it.
+    year_conflict: bool = False
 
 
 def rank_arr_candidates(
@@ -255,7 +276,7 @@ def rank_arr_candidates(
             or ""
         )
 
-    year_match = re.search(r"\b((?:18|19|20|21)\d{2})\b", title)
+    year_match = _YEAR_TOKEN.search(title)
     wanted_year = int(year_match.group(1)) if year_match else None
     wanted_title = (
         " ".join((title[: year_match.start()] + " " + title[year_match.end() :]).split())
@@ -281,12 +302,32 @@ def rank_arr_candidates(
         if not isinstance(item, Mapping):
             continue
         item_year = candidate_year(item)
-        similarity = title_similarity(wanted_title, candidate_title(item))
+        similarity = title_similarity(title, candidate_title(item))
+        year_conflict = False
         if wanted_year is not None:
-            if item_year is not None and item_year != wanted_year:
-                continue
-            if item_year is None:
-                similarity = max(0.0, similarity - 0.15)
+            # Score the title with the year token left in as well as taken
+            # out, and keep whichever fits better. A candidate that matches
+            # the full form is telling us the token is part of its name --
+            # "Blade Runner 2049", "1917", "2012" -- not a release-year hint,
+            # and it must not then be filtered against a release year no film
+            # has. Taking the better of two forms is the same approach
+            # AbbaClient._release_title_score already uses for release names.
+            stripped_similarity = title_similarity(wanted_title, candidate_title(item))
+            if stripped_similarity > similarity:
+                similarity = stripped_similarity
+                if item_year is None:
+                    similarity = max(0.0, similarity - 0.15)
+                elif item_year != wanted_year:
+                    similarity = max(
+                        0.0,
+                        similarity
+                        - min(
+                            MAX_YEAR_MISMATCH_PENALTY,
+                            YEAR_MISMATCH_PENALTY_PER_YEAR
+                            * abs(item_year - wanted_year),
+                        ),
+                    )
+                    year_conflict = True
         scored.append(
             (
                 similarity,
@@ -300,6 +341,7 @@ def rank_arr_candidates(
                     or ""
                 ),
                 item,
+                year_conflict,
             )
         )
     # Ties break toward the most recent release. A request that names no year
@@ -315,13 +357,22 @@ def rank_arr_candidates(
             title=candidate_title(value[4]),
             year=candidate_year(value[4]),
             provider_id=value[3],
+            year_conflict=value[5],
         )
         for value in scored
     ]
 
 
 def select_arr_candidate(title: str, items: Iterable[Mapping[str, Any]]) -> Mapping[str, Any] | None:
-    ranked = rank_arr_candidates(title, items)
+    # The automatic gate still requires the requested year. Dropping the
+    # conflicting candidates here rather than during ranking is what lets the
+    # picker offer them: nothing that could not auto-match before can now, and
+    # nothing that auto-matched before stops.
+    ranked = [
+        candidate
+        for candidate in rank_arr_candidates(title, items)
+        if not candidate.year_conflict
+    ]
     if not ranked or ranked[0].score < 0.62:
         return None
     if len(ranked) > 1 and ranked[0].score - ranked[1].score < 0.05:

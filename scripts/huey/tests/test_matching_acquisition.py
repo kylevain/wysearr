@@ -17,6 +17,7 @@ from acquisition import (
 )
 from matching import (
     normalize_text,
+    rank_arr_candidates,
     select_arr_candidate,
     select_release,
     select_shelfarr_candidate,
@@ -74,6 +75,88 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(
             select_arr_candidate("The Thing 1982", reversed(candidates))["tmdbId"],
             1091,
+        )
+
+    # A requested year used to be a hard exclusion, so an accurate year that
+    # TMDb disputes emptied the candidate list and starved the picker as well
+    # as the automatic gate. "Cashback" is 2006 by every consumer source;
+    # TMDb has 2021, 2007 and 2004.
+    CASHBACK = (
+        {"title": "Cashback", "year": 2021, "tmdbId": 799379},
+        {"title": "Cashback", "year": 2007, "tmdbId": 13005},
+        {"title": "Cashback", "year": 2004, "tmdbId": 55731},
+    )
+
+    def test_a_disputed_year_narrows_the_field_instead_of_emptying_it(self):
+        ranked = rank_arr_candidates("cashback 2006", self.CASHBACK)
+
+        self.assertEqual(len(ranked), 3)
+        # Nearest year first, so the picker offers the real film at the top.
+        self.assertEqual([candidate.year for candidate in ranked], [2007, 2004, 2021])
+        self.assertTrue(all(candidate.year_conflict for candidate in ranked))
+
+    def test_a_disputed_year_still_never_auto_matches(self):
+        self.assertIsNone(select_arr_candidate("cashback 2006", self.CASHBACK))
+
+    def test_a_demoted_candidate_stays_above_the_picker_floor(self):
+        # The cap exists so a year the metadata disputes demotes a candidate
+        # out of the automatic gate without demoting it out of the prompt.
+        ranked = rank_arr_candidates("cashback 2006", self.CASHBACK)
+
+        for candidate in ranked:
+            self.assertGreaterEqual(candidate.score, 0.45)
+
+    def test_an_exact_year_still_auto_matches(self):
+        self.assertEqual(
+            select_arr_candidate("cashback 2007", self.CASHBACK)["tmdbId"], 13005
+        )
+
+    def test_a_year_inside_the_title_is_title_text_not_a_filter(self):
+        # These bailed with zero candidates: the title's own digits were read
+        # as a release year no film could satisfy.
+        for term, candidates, expected in (
+            (
+                "blade runner 2049",
+                [
+                    {"title": "Blade Runner 2049", "year": 2017, "tmdbId": 335984},
+                    {"title": "Blade Runner", "year": 1982, "tmdbId": 78},
+                ],
+                335984,
+            ),
+            ("2012", [{"title": "2012", "year": 2009, "tmdbId": 14161}], 14161),
+        ):
+            with self.subTest(term=term):
+                selected = select_arr_candidate(term, candidates)
+                self.assertIsNotNone(selected)
+                self.assertEqual(selected["tmdbId"], expected)
+
+    def test_a_bare_year_title_ranks_every_candidate(self):
+        ranked = rank_arr_candidates(
+            "1917",
+            [
+                {"title": "1917", "year": 2019, "tmdbId": 530915},
+                {"title": "1917", "year": 1970, "tmdbId": 44903},
+            ],
+        )
+
+        self.assertEqual(len(ranked), 2)
+        self.assertFalse(any(candidate.year_conflict for candidate in ranked))
+
+    def test_a_year_only_row_is_ranked_but_left_for_the_requester(self):
+        # One lookup result, one year off: ranked and offerable, never
+        # auto-accepted.
+        ranked = rank_arr_candidates(
+            "Personal Shopper (2017)",
+            [{"title": "Personal Shopper", "year": 2016, "tmdbId": 381518}],
+        )
+
+        self.assertEqual(len(ranked), 1)
+        self.assertTrue(ranked[0].year_conflict)
+        self.assertIsNone(
+            select_arr_candidate(
+                "Personal Shopper (2017)",
+                [{"title": "Personal Shopper", "year": 2016, "tmdbId": 381518}],
+            )
         )
 
     def test_display_sanitizer_keeps_titles_but_rejects_embedded_credentials(self):

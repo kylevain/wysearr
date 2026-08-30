@@ -141,6 +141,23 @@ is now reset instead. One row per request stays a schema invariant —
 `request_id` and `shelfarr_correlation` are both `UNIQUE` — so a second prompt
 reuses the row rather than adding one.
 
+## A requested year orders the field, it never empties it
+
+`rank_arr_candidates` used to drop every candidate whose release year differed
+from the one the requester typed. TMDb disagrees with consumer sources often
+enough that this made an accurate year worse than no year: `movie: cashback
+2006` returned nothing while `movie: cashback` returned a three-option picker
+containing the film. It also broke any title whose own name contains digits —
+`1917`, `2012`, `blade runner 2049` all bailed with zero candidates.
+
+The year is now scored, not filtered. Each candidate is scored against the
+title with the year token left in and taken out, and the better fit wins, so a
+candidate that matches the full form is treated as having the digits in its
+name rather than being filtered against a release year no film has. A year
+mismatch demotes by 0.02 per year, capped at 0.12. `select_arr_candidate`
+still drops conflicting candidates before its gates, so no wrong-year film can
+auto-match and nothing that auto-matched before stops.
+
 ## Known limitation: the parser keeps the author inside the title
 
 `parse_request` only splits an author off when the text contains ` by `.
