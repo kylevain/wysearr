@@ -1,6 +1,7 @@
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -67,6 +68,132 @@ class ClassificationTests(unittest.TestCase):
 
         self.assertEqual(value["outcome"], "still_bails")
         self.assertEqual(value["reason"], "no lookup results")
+
+
+class FakePoster:
+    def __init__(self, fail=False):
+        self.posted = []
+        self.fail = fail
+        self.next_id = 880000111000
+
+    def post(self, channel_id, content):
+        if self.fail:
+            raise RuntimeError("discord unavailable")
+        self.next_id += 1
+        self.posted.append((channel_id, content))
+        return str(self.next_id)
+
+
+THE_THING = [arr_item("The Thing", 1091, 1982), arr_item("The Thing", 54580, 2011)]
+ARRIVAL = [arr_item("Arrival", 329865, 2016)]
+
+
+class BatchTests(unittest.TestCase):
+    """The three properties the backfill has to hold before it posts."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.store = RequestStore(Path(self.temporary.name) / "huey.db")
+        self.store.initialize()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def stick(self, raw, *, message_id, channel_id="2"):
+        request, _ = self.store.create_request(
+            discord_user_id="1", discord_username="kyle", channel_id=channel_id,
+            message_id=message_id, media_type="movies-tv", raw_request=raw,
+            title=raw, author=None, target_key=f"v1:{message_id}",
+        )
+        self.store.transition(
+            request["id"], "needs_selection", "could not identify one safe match"
+        )
+        return int(request["id"])
+
+    def run_batch(self, results, *, poster, limit=5, ttl_seconds=900):
+        return redrive_selection.redrive_batch(
+            self.store,
+            StubbedServices(StubbedRadarr(results)),
+            channel_id="2",
+            poster=poster,
+            limit=limit,
+            ttl_seconds=ttl_seconds,
+            pause_seconds=0,
+            sleep=lambda _seconds: None,
+        )
+
+    def status(self, request_id):
+        return self.store.get_request(request_id)["status"]
+
+    def test_a_batch_posts_only_to_the_named_channel(self):
+        here = self.stick("movie: the thing", message_id="10")
+        elsewhere = self.stick("movie: the thing", message_id="11", channel_id="999")
+        poster = FakePoster()
+
+        results = self.run_batch(THE_THING, poster=poster)
+
+        self.assertEqual([channel for channel, _ in poster.posted], ["2"])
+        self.assertEqual(self.status(here), "awaiting_selection")
+        # The other channel's row was not touched at all.
+        self.assertEqual(self.status(elsewhere), "needs_selection")
+        skipped = next(r for r in results if r["request_id"] == elsewhere)
+        self.assertEqual(skipped["reason"], "row belongs to a different channel")
+
+    def test_a_row_that_would_auto_match_is_reported_not_acquired(self):
+        request_id = self.stick("movie: arrival", message_id="20")
+        poster = FakePoster()
+
+        results = self.run_batch(ARRIVAL, poster=poster)
+
+        self.assertEqual(poster.posted, [])
+        self.assertEqual(self.status(request_id), "needs_selection")
+        self.assertEqual(results[0]["action"], "skipped")
+        self.assertIn("never acquires", results[0]["reason"])
+
+    def test_an_unanswered_prompt_returns_to_needs_selection_and_redrives(self):
+        request_id = self.stick("movie: the thing", message_id="30")
+        self.run_batch(THE_THING, poster=FakePoster(), ttl_seconds=1)
+        self.assertEqual(self.status(request_id), "awaiting_selection")
+
+        time.sleep(1.2)
+        self.store.expire_candidate_confirmations()
+        self.assertEqual(self.status(request_id), "needs_selection")
+
+        # The whole point of the guard fix: a second pass can prompt it again.
+        again = self.run_batch(THE_THING, poster=FakePoster())
+        self.assertEqual(again[0]["action"], "prompted")
+        self.assertEqual(self.status(request_id), "awaiting_selection")
+
+    def test_a_failed_post_releases_the_row_and_leaves_it_redrivable(self):
+        request_id = self.stick("movie: the thing", message_id="40")
+
+        results = self.run_batch(THE_THING, poster=FakePoster(fail=True))
+
+        self.assertEqual(results[0]["action"], "failed")
+        self.assertEqual(self.status(request_id), "needs_selection")
+        retried = self.run_batch(THE_THING, poster=FakePoster())
+        self.assertEqual(retried[0]["action"], "prompted")
+
+    def test_the_batch_size_bounds_what_is_prompted(self):
+        for index in range(3):
+            self.stick("movie: the thing", message_id=f"5{index}")
+        poster = FakePoster()
+
+        results = self.run_batch(THE_THING, poster=poster, limit=2)
+
+        self.assertEqual(len(poster.posted), 2)
+        self.assertEqual(
+            sum(1 for r in results if r["action"] == "prompted"), 2
+        )
+
+    def test_planning_a_batch_writes_nothing_and_posts_nothing(self):
+        request_id = self.stick("movie: the thing", message_id="60")
+
+        results = self.run_batch(THE_THING, poster=None)
+
+        self.assertEqual(results[0]["action"], "would_prompt")
+        self.assertIn("Request #", results[0]["prompt"])
+        self.assertEqual(self.status(request_id), "needs_selection")
 
 
 class SurveyTests(unittest.TestCase):

@@ -22,16 +22,23 @@ import argparse
 import json
 import os
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Mapping
 
+import requests
+
 try:
+    from .database import TERMINAL_CONFIRMATION_STATUSES, RequestStore
+    from .huey import format_candidate_prompt
     from .matching import rank_arr_candidates, select_arr_candidate
     from .parser import RequestParseError, parse_request
     from .results import sanitize_display_text
     from .services import ServiceRegistry
 except ImportError:  # pragma: no cover - direct container entrypoint
+    from database import TERMINAL_CONFIRMATION_STATUSES, RequestStore
+    from huey import format_candidate_prompt
     from matching import rank_arr_candidates, select_arr_candidate
     from parser import RequestParseError, parse_request
     from results import sanitize_display_text
@@ -121,6 +128,7 @@ def classify(client: Any, title: str) -> dict[str, Any]:
         return {
             "outcome": "picker",
             "options": [option["label"] for option in proposal],
+            "proposal": list(proposal),
             "ranked": _ranked_summary(ranked),
         }
     return {
@@ -144,11 +152,13 @@ def survey_row(row: Mapping[str, Any], services: Any) -> dict[str, Any]:
     if row["error"] and PARSER_ERROR_MARKER in str(row["error"]):
         return {**record, "outcome": "skipped_unparsed",
                 "reason": "parser failure, out of scope"}
-    if row["prior_prompt"]:
-        # create_candidate_confirmation refuses a second confirmation for the
-        # same request, whatever the first one's outcome was.
+    prior = str(row["prior_prompt"] or "")
+    if prior and prior not in TERMINAL_CONFIRMATION_STATUSES:
+        # A live or already-answered prompt owns the row. A finished one does
+        # not: create_candidate_confirmation resets it, which is what makes an
+        # expired prompt re-drivable rather than a dead end.
         return {**record, "outcome": "blocked_by_prior_prompt",
-                "reason": f"prior candidate prompt is {row['prior_prompt']}"}
+                "reason": f"prior candidate prompt is {prior}"}
     try:
         parsed = parse_request(str(row["raw_request"] or ""), MEDIA_TYPE)
     except RequestParseError as error:
@@ -183,6 +193,143 @@ def report(database: Path, environment: Mapping[str, str]) -> dict[str, Any]:
     }
 
 
+class DiscordPoster:
+    """Post one message to one channel as the Huey bot, and nothing else.
+
+    The backfill runs outside the gateway process, so it cannot reuse the live
+    client object. It uses the same bot identity and the same channel, and it
+    has no other capability: there is no edit, no delete, and no way to name a
+    channel other than the one the operator passed on the command line.
+    """
+
+    API = "https://discord.com/api/v10"
+
+    def __init__(self, token: str, *, timeout: float = 20.0):
+        if not token.strip():
+            raise ValueError("DISCORD_BOT_TOKEN is required to post prompts")
+        self.token = token.strip()
+        self.timeout = timeout
+
+    def post(self, channel_id: str, content: str) -> str:
+        response = requests.post(
+            f"{self.API}/channels/{int(channel_id)}/messages",
+            headers={
+                "Authorization": f"Bot {self.token}",
+                "Content-Type": "application/json",
+            },
+            json={"content": content},
+            timeout=self.timeout,
+        )
+        if response.status_code >= 400:
+            # Never echo the body: it can carry the token back in an error.
+            raise RuntimeError(f"Discord rejected the prompt ({response.status_code})")
+        message_id = str((response.json() or {}).get("id") or "")
+        if not message_id.isdigit() or int(message_id) <= 0:
+            raise RuntimeError("Discord did not confirm the prompt message ID")
+        return message_id
+
+
+def redrive_batch(
+    store: Any,
+    services: Any,
+    *,
+    channel_id: str,
+    poster: Any | None,
+    limit: int,
+    ttl_seconds: int = 900,
+    pause_seconds: float = 1.5,
+    sleep: Any = time.sleep,
+) -> list[dict[str, Any]]:
+    """Prompt at most ``limit`` stuck rows, or plan the batch when poster is None.
+
+    Every row is classified read-only *before* anything is written, and only a
+    row that would produce a picker is touched at all. A row that would
+    auto-match is reported and left exactly as it was: the backfill re-drives
+    requests into a prompt, and never acquires on the requester's behalf.
+    """
+
+    with closing(open_readonly(Path(store.path))) as connection:
+        rows = stuck_rows(connection)
+    results: list[dict[str, Any]] = []
+    prompted = 0
+    for row in rows:
+        if prompted >= limit:
+            break
+        if str(row["channel_id"]) != str(channel_id):
+            results.append(
+                {
+                    "request_id": int(row["id"]),
+                    "action": "skipped",
+                    "reason": "row belongs to a different channel",
+                }
+            )
+            continue
+        survey = survey_row(row, services)
+        if survey["outcome"] != "picker":
+            results.append(
+                {
+                    **survey,
+                    "action": "skipped",
+                    "reason": (
+                        "would auto-match; the backfill never acquires"
+                        if survey["outcome"] == "auto_match"
+                        else survey["outcome"]
+                    ),
+                }
+            )
+            continue
+
+        request_id = int(row["id"])
+        prompt = format_candidate_prompt(
+            MEDIA_TYPE,
+            {
+                "request_id": request_id,
+                "service": survey["service"],
+                "selection_proposal": survey["proposal"],
+            },
+            ttl_seconds=ttl_seconds,
+        )
+        if poster is None:
+            results.append(
+                {**survey, "action": "would_prompt", "prompt": prompt}
+            )
+            prompted += 1
+            continue
+
+        store.transition(
+            request_id,
+            "processing",
+            "Re-driving a stuck selection",
+            service=survey["service"],
+        )
+        store.create_candidate_confirmation(
+            request_id, survey["proposal"], ttl_seconds=ttl_seconds
+        )
+        try:
+            message_id = poster.post(str(row["channel_id"]), prompt)
+            if not store.bind_candidate_prompt(request_id, message_id):
+                raise RuntimeError("Candidate prompt could not be bound")
+        except Exception as error:
+            # Same release the gateway performs, so the row returns to
+            # needs_selection and stays re-drivable rather than stranding.
+            store.fail_candidate_prompt(
+                request_id, "Could not deliver the Discord candidate prompt"
+            )
+            results.append(
+                {
+                    **survey,
+                    "action": "failed",
+                    "reason": type(error).__name__,
+                }
+            )
+            continue
+        results.append({**survey, "action": "prompted", "prompt_message_id": message_id})
+        prompted += 1
+        if prompted < limit:
+            sleep(pause_seconds)
+    return results
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -192,6 +339,20 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("report", help="Read-only survey; writes and posts nothing")
+    run = commands.add_parser(
+        "run", help="Prompt one batch of stuck rows (plans unless --post is given)"
+    )
+    run.add_argument(
+        "--channel",
+        required=True,
+        help="The only channel this batch may post to; other rows are skipped",
+    )
+    run.add_argument("--batch", type=int, default=5, help="Rows to prompt (default 5)")
+    run.add_argument(
+        "--post",
+        action="store_true",
+        help="Actually post. Without it the batch is planned and nothing is written.",
+    )
     return parser
 
 
@@ -200,8 +361,30 @@ def main() -> int:
     database = Path(arguments.database)
     if not database.is_file():
         raise SystemExit(f"Huey database does not exist: {database}")
-    value = report(database, os.environ)
-    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+    if arguments.command == "report":
+        value = report(database, os.environ)
+        print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    if not 1 <= int(arguments.batch) <= 25:
+        raise SystemExit("Batch size must be between 1 and 25")
+    if not str(arguments.channel).isdigit():
+        raise SystemExit("Channel must be a Discord channel ID")
+    services = ServiceRegistry(dict(os.environ))
+    store = RequestStore(database)
+    poster = (
+        DiscordPoster(os.environ.get("DISCORD_BOT_TOKEN", ""))
+        if arguments.post
+        else None
+    )
+    results = redrive_batch(
+        store,
+        services,
+        channel_id=str(arguments.channel),
+        poster=poster,
+        limit=int(arguments.batch),
+    )
+    print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 

@@ -55,7 +55,7 @@ _SELECTION_SERVICES = ("shelfarr", "abba", "lazylibrarian", "radarr", "sonarr")
 # A prompt that expired, or was failed by startup recovery, is finished: it
 # must not block the request being offered a choice again. Only a live prompt
 # ('pending') or one already answered and being acted on ('claimed') does.
-_TERMINAL_CONFIRMATION_STATUSES = frozenset({"expired", "failed"})
+TERMINAL_CONFIRMATION_STATUSES = frozenset({"expired", "failed"})
 _SELECTION_SERVICE_SQL = ", ".join(f"'{service}'" for service in _SELECTION_SERVICES)
 _SENSITIVE_SELECTION_TEXT = re.compile(
     r"(?:https?://|ftp://|www\.|magnet:|"
@@ -3774,7 +3774,7 @@ class RequestStore:
             if existing is not None:
                 if existing["status"] == "pending" and request["status"] == "awaiting_selection":
                     return existing
-                if existing["status"] not in _TERMINAL_CONFIRMATION_STATUSES:
+                if existing["status"] not in TERMINAL_CONFIRMATION_STATUSES:
                     raise ValueError("Request already has a candidate confirmation")
             if (
                 request["status"] != "processing"
