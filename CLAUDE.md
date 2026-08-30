@@ -132,7 +132,10 @@ Next work is in **Huey**, not Louie:
 - 66 movies-tv rows in `needs_selection` predate the picker and are inert.
   `scripts/huey/redrive_selection.py report` surveys them read-only against
   live Radarr/Sonarr; it must be run on wysearr and reviewed before anything
-  posts. The posting half is deliberately not built yet.
+  posts.
+- Backfill batch one prompted #5, #16 and #25 successfully, then crashed on
+  #26 with a `target_key` UNIQUE violation. See *Duplicate rows for one exact
+  target*. Batch two must run `collapse` first, and has not been run yet.
 
 A candidate prompt used to be one-shot per request row: `expires_at` passing,
 or startup recovery failing an unbound prompt, left a terminal
@@ -140,6 +143,57 @@ or startup recovery failing an unbound prompt, left a terminal
 is now reset instead. One row per request stays a schema invariant —
 `request_id` and `shelfarr_correlation` are both `UNIQUE` — so a second prompt
 reuses the row rather than adding one.
+
+## Duplicate rows for one exact target
+
+`requests_active_target_uq` is UNIQUE on `target_key` across the *active*
+statuses only. `needs_selection` and `failed` are outside it, deliberately, so
+those rows stay retryable. The cost: two rows naming one exact target coexist
+happily while both sit stuck, and collide the instant the second is driven out.
+Three `movie: coda 2021` rows crashed backfill batch one that way, and once the
+first was queued the other two were stranded **permanently** — nothing retries a
+`needs_selection` row on its own.
+
+The constraint is now handled where it bites, not by the caller:
+
+- **Entering any active status**, a row whose target another active or complete
+  request already owns is aliased onto that owner rather than raising —
+  `_coalesce_target_duplicate`, the ABBA coalescer generalised, sharing
+  `_repoint_aliased_request` with it so the two cannot drift.
+- **Reaching `queued`/`complete`/`completed`**, the owner sweeps every
+  `needs_selection` row naming the same target onto itself.
+
+The two fire at different boundaries on purpose. `processing` is not a
+commitment — `fail_candidate_prompt` releases a prompt that could not be posted
+straight back to `needs_selection` — so sweeping there would alias siblings onto
+a row that then goes back to being stuck. Only `failed` siblings are never
+swept: a failure may be unrelated to the target and stays legitimately
+retryable.
+
+Aliased requesters are told (`request_accepted`, "already tracked as request
+#N"), unless they are the owner's requester. A distinct person who asked months
+ago and hears nothing cannot tell the fix from the bug it replaces.
+
+**The key is exact typed text, not the film.** `request_target_key` is
+`[media_type, kind, title, author]` with only case and whitespace normalised,
+and the parser does not extract years, so `coda 2021` and `coda` are different
+targets, as are `passengers` and `passenger`. Only byte-identical requests
+merge. Duplicate-looking rows are not necessarily duplicate targets.
+
+`scripts/huey/redrive_selection.py` prompts at most one row per target per
+batch and never prompts a row whose target is already owned. Its `collapse`
+subcommand repairs rows stranded before this existed — report-first, writing
+only with `--apply`. It deliberately leaves clusters with *no* owner alone:
+nothing has been acquired, so there is no winner to pick, and the sweep settles
+them when a real owner commits. That work is not an automatic migration in
+`initialize()` on purpose — restarts run unattended, and this backlog is read
+before it is written.
+
+**A third `failed` -> active site is knowingly unguarded**: the Shelfarr
+completion reconciliation (`database.py`, `SET status = 'completed' ... WHERE
+id = ? AND status = 'failed'`). Coalescing there would discard a row that has a
+verified artifact, and clearing its `target_key` instead is the plausible fix
+but has no evidence behind it. It has never been observed to collide.
 
 ## A requested year orders the field, it never empties it
 

@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .results import SELECTION_OPTION_KINDS
+    from .results import SELECTION_OPTION_KINDS, sanitize_display_text
 except ImportError:  # pragma: no cover - direct container entrypoint
-    from results import SELECTION_OPTION_KINDS
+    from results import SELECTION_OPTION_KINDS, sanitize_display_text
 
 
 REQUEST_STATUSES = frozenset(
@@ -28,6 +28,29 @@ REQUEST_STATUSES = frozenset(
         "complete",
         "completed",
     }
+)
+# The statuses ``requests_active_target_uq`` indexes.  A row outside this set
+# carries its ``target_key`` unindexed, which is what lets duplicate
+# ``needs_selection`` rows coexist -- and what makes the first of them to enter
+# the set the sole owner of that target.
+TARGET_ACTIVE_STATUSES = frozenset(
+    {"new", "processing", "awaiting_selection", "queued", "complete", "completed"}
+)
+# Entering ``processing`` is not a commitment: a candidate prompt that fails to
+# post is released straight back to ``needs_selection``.  Only these statuses
+# mean the owner is really acquiring the target, which is why inert duplicates
+# are swept onto it here and not at the earlier boundary.
+TARGET_COMMITTED_STATUSES = frozenset({"queued", "complete", "completed"})
+_TARGET_ACTIVE_SQL = ", ".join(
+    f"'{status}'"
+    for status in (
+        "new",
+        "processing",
+        "awaiting_selection",
+        "queued",
+        "complete",
+        "completed",
+    )
 )
 CANDIDATE_CONFIRMATION_TTL_SECONDS = 15 * 60
 UNAVAILABLE_FIRST_RETRY_DELAY = timedelta(days=7)
@@ -1210,37 +1233,20 @@ class RequestStore:
             )
 
     @staticmethod
-    def _coalesce_abba_row(
+    def _repoint_aliased_request(
         connection: sqlite3.Connection,
-        alias_request_id: int,
-        canonical_request_id: int,
-        *,
-        reason: str,
+        alias_id: int,
+        owner_id: int,
+        message: str,
     ) -> None:
-        """Turn one duplicate ABBA row into an inert canonical-request alias."""
+        """Move every delivery, prompt and pending notice onto the alias owner.
 
-        alias_id = int(alias_request_id)
-        owner_id = int(canonical_request_id)
-        if alias_id == owner_id:
-            raise sqlite3.IntegrityError("An ABBA request cannot alias itself")
-        message = (
-            "ABBA acquisition identity is already owned by canonical request "
-            f"#{owner_id} ({reason})"
-        )
-        cursor = connection.execute(
-            """
-            UPDATE requests
-            SET status = 'failed', canonical_request_id = ?,
-                external_status = 'canonical_duplicate', error = NULL,
-                notified_at = COALESCE(notified_at, CURRENT_TIMESTAMP),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND service = 'abba'
-              AND canonical_request_id IS NULL
-            """,
-            (owner_id, alias_id),
-        )
-        if cursor.rowcount != 1:
-            raise sqlite3.IntegrityError("ABBA duplicate could not be aliased")
+        This is the mechanical half of coalescing, shared by the ABBA download
+        identity and the exact-target identity so the two cannot drift apart.
+        The caller owns the status write and its events; this owns everything
+        which would otherwise keep pointing at a row nobody may act on.
+        """
+
         connection.execute(
             """
             UPDATE requests
@@ -1298,6 +1304,192 @@ class RequestStore:
             "DELETE FROM notification_deliveries "
             "WHERE request_id = ? AND delivered_at IS NULL",
             (alias_id,),
+        )
+
+    @staticmethod
+    def _target_key_owner(
+        connection: sqlite3.Connection, request_id: int, target_key: str
+    ) -> sqlite3.Row | None:
+        """Return the request already holding this exact target, if any.
+
+        Terminal owners sort first so a duplicate always aliases onto the row
+        which got furthest, never onto one which may still be released.
+        """
+
+        return connection.execute(
+            """
+            SELECT * FROM requests
+            WHERE target_key = ? AND id != ?
+              AND canonical_request_id IS NULL
+              AND status IN (%s)
+            ORDER BY
+                CASE
+                    WHEN status IN ('complete', 'completed') THEN 0
+                    WHEN status = 'queued' THEN 1
+                    ELSE 2
+                END,
+                id
+            LIMIT 1
+            """
+            % _TARGET_ACTIVE_SQL,
+            (str(target_key), int(request_id)),
+        ).fetchone()
+
+    @staticmethod
+    def _coalesce_target_duplicate(
+        connection: sqlite3.Connection,
+        alias_request_id: int,
+        canonical_request_id: int,
+        *,
+        reason: str,
+    ) -> None:
+        """Alias one duplicate-target row onto the request which owns the target.
+
+        ``requests_active_target_uq`` covers only the active statuses, so two
+        rows for one target coexist happily while both sit in
+        ``needs_selection`` and collide the instant the second is driven out of
+        it.  Raising there strands the row forever once the first is acquired.
+        Aliasing instead keeps one acquisition and loses no request.
+
+        The requester is told, unless they are the requester of the owner: a
+        distinct person who asked months ago and hears nothing cannot tell this
+        apart from the bug it replaces.
+        """
+
+        alias_id = int(alias_request_id)
+        owner_id = int(canonical_request_id)
+        if alias_id == owner_id:
+            raise sqlite3.IntegrityError("A request cannot alias itself")
+        alias = connection.execute(
+            "SELECT * FROM requests WHERE id = ?", (alias_id,)
+        ).fetchone()
+        owner = connection.execute(
+            "SELECT * FROM requests WHERE id = ?", (owner_id,)
+        ).fetchone()
+        if alias is None or owner is None:
+            raise sqlite3.IntegrityError("Exact-target duplicate is missing a request")
+        if owner["canonical_request_id"] is not None:
+            raise sqlite3.IntegrityError("Exact-target owner is itself an alias")
+        message = (
+            "Exact target is already owned by canonical request "
+            f"#{owner_id} ({reason})"
+        )
+        cursor = connection.execute(
+            """
+            UPDATE requests
+            SET status = 'failed', canonical_request_id = ?,
+                external_status = 'canonical_duplicate', error = NULL,
+                notified_at = COALESCE(notified_at, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND canonical_request_id IS NULL
+            """,
+            (owner_id, alias_id),
+        )
+        if cursor.rowcount != 1:
+            raise sqlite3.IntegrityError("Exact-target duplicate could not be aliased")
+        RequestStore._repoint_aliased_request(
+            connection, alias_id, owner_id, message
+        )
+        if str(alias["discord_user_id"]) != str(owner["discord_user_id"]):
+            display = sanitize_display_text(
+                alias["title"] or alias["raw_request"], limit=160
+            )
+            notice = (
+                f"\u2705 Request #{alias_id} ({display}) is already tracked as "
+                f"request #{owner_id} (status: {owner['status']})."
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO notification_deliveries (
+                    request_id, event_key, route, message
+                ) VALUES (?, 'request_accepted', 'request-status', ?)
+                """,
+                (alias_id, notice[:2000]),
+            )
+        connection.execute(
+            "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+            (alias_id, "target_canonical_alias", message),
+        )
+        connection.execute(
+            "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+            (
+                owner_id,
+                "target_duplicate_coalesced",
+                f"Coalesced duplicate request #{alias_id} ({reason})",
+            ),
+        )
+
+    @classmethod
+    def _sweep_target_siblings(
+        cls,
+        connection: sqlite3.Connection,
+        owner_id: int,
+        target_key: str,
+    ) -> list[int]:
+        """Alias every inert duplicate of a newly committed target onto its owner.
+
+        Only ``needs_selection`` rows are swept.  A ``failed`` row may have
+        failed for a reason unrelated to the target and stays legitimately
+        retryable; folding it in here would hide that.
+        """
+
+        if not target_key:
+            return []
+        siblings = connection.execute(
+            """
+            SELECT id FROM requests
+            WHERE target_key = ? AND id != ?
+              AND status = 'needs_selection'
+              AND canonical_request_id IS NULL
+            ORDER BY id
+            """,
+            (str(target_key), int(owner_id)),
+        ).fetchall()
+        swept: list[int] = []
+        for sibling in siblings:
+            cls._coalesce_target_duplicate(
+                connection,
+                int(sibling["id"]),
+                int(owner_id),
+                reason="the same target was settled by its owner",
+            )
+            swept.append(int(sibling["id"]))
+        return swept
+
+    @staticmethod
+    def _coalesce_abba_row(
+        connection: sqlite3.Connection,
+        alias_request_id: int,
+        canonical_request_id: int,
+        *,
+        reason: str,
+    ) -> None:
+        """Turn one duplicate ABBA row into an inert canonical-request alias."""
+
+        alias_id = int(alias_request_id)
+        owner_id = int(canonical_request_id)
+        if alias_id == owner_id:
+            raise sqlite3.IntegrityError("An ABBA request cannot alias itself")
+        message = (
+            "ABBA acquisition identity is already owned by canonical request "
+            f"#{owner_id} ({reason})"
+        )
+        cursor = connection.execute(
+            """
+            UPDATE requests
+            SET status = 'failed', canonical_request_id = ?,
+                external_status = 'canonical_duplicate', error = NULL,
+                notified_at = COALESCE(notified_at, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND service = 'abba'
+              AND canonical_request_id IS NULL
+            """,
+            (owner_id, alias_id),
+        )
+        if cursor.rowcount != 1:
+            raise sqlite3.IntegrityError("ABBA duplicate could not be aliased")
+        RequestStore._repoint_aliased_request(
+            connection, alias_id, owner_id, message
         )
         connection.execute(
             "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
@@ -1845,6 +2037,48 @@ class RequestStore:
                 cascade = self._ebook_cascade_row(connection, request_id)
                 if cascade is None or not cascade["policy"]:
                     continue
+                # Rearming drives a failed row back into an active status, so
+                # it meets the exact-target index exactly as a re-drive does.
+                # A silent scheduler must not raise here; if the target is
+                # already spoken for there is nothing left to retry.
+                stored = connection.execute(
+                    "SELECT target_key FROM requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                target_key = stored["target_key"] if stored is not None else None
+                if target_key:
+                    owner = self._target_key_owner(
+                        connection, request_id, str(target_key)
+                    )
+                    if owner is not None:
+                        self._coalesce_target_duplicate(
+                            connection,
+                            request_id,
+                            int(owner["id"]),
+                            reason="the target was acquired while the retry waited",
+                        )
+                        connection.execute(
+                            """
+                            UPDATE unavailable_retries
+                            SET state = 'expired', next_retry_at = NULL,
+                                expired_at = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE request_id = ? AND state = 'queued'
+                            """,
+                            (timestamp, request_id),
+                        )
+                        self._release_unowned_ebook_backend_reservations(
+                            connection, request_id
+                        )
+                        connection.execute(
+                            "INSERT INTO events (request_id, event_type, message) "
+                            "VALUES (?, ?, ?)",
+                            (
+                                request_id,
+                                "unavailable_retry_expired",
+                                "Unavailable retry retired: the exact target is "
+                                f"owned by request #{int(owner['id'])}",
+                            ),
+                        )
+                        continue
                 first_backend = str(cascade["policy"][0])
                 attempts = connection.execute(
                     """
@@ -4817,7 +5051,10 @@ class RequestStore:
                 service in {"lazylibrarian", "abba"}
                 and normalized_external_id is not None
                 and status in {"processing", "queued"}
-            ):
+            ) or status in TARGET_ACTIVE_STATUSES:
+                # Reserving an exact target is a read-before-write like the
+                # download-identity defences below, so it takes the write lock
+                # up front rather than racing another transition into it.
                 connection.execute("BEGIN IMMEDIATE")
             if (
                 service == "abba"
@@ -4883,6 +5120,31 @@ class RequestStore:
                     raise LazyLibrarianHashCollision(
                         "Active LazyLibrarian download identity collision"
                     )
+            target_key: str | None = None
+            if status in TARGET_ACTIVE_STATUSES:
+                current = connection.execute(
+                    "SELECT target_key, canonical_request_id FROM requests "
+                    "WHERE id = ?",
+                    (int(request_id),),
+                ).fetchone()
+                if current is not None and current["canonical_request_id"] is None:
+                    target_key = current["target_key"]
+                if target_key:
+                    owner = self._target_key_owner(
+                        connection, int(request_id), str(target_key)
+                    )
+                    if owner is not None:
+                        # The exact target is spoken for.  Alias rather than
+                        # let the partial unique index raise: a raise here
+                        # strands this row permanently once the owner is
+                        # acquired, because nothing ever retries it.
+                        self._coalesce_target_duplicate(
+                            connection,
+                            int(request_id),
+                            int(owner["id"]),
+                            reason="Huey exact-target defence",
+                        )
+                        return dict(owner)
             cursor = connection.execute(
                 """
                 UPDATE requests
@@ -4907,6 +5169,10 @@ class RequestStore:
                 "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
                 (request_id, event_type or status, message.strip()),
             )
+            if target_key and status in TARGET_COMMITTED_STATUSES:
+                self._sweep_target_siblings(
+                    connection, int(request_id), str(target_key)
+                )
             for event_key, route, notification_message in normalized_notifications:
                 connection.execute(
                     """
@@ -4920,6 +5186,70 @@ class RequestStore:
                 "SELECT * FROM requests WHERE id = ?", (request_id,)
             ).fetchone()
         return dict(row)
+
+    def target_key_owner(self, request_id: int, target_key: str) -> dict[str, Any] | None:
+        """Return the active request already holding this exact target, if any."""
+
+        if not target_key:
+            return None
+        with self.connect() as connection:
+            owner = self._target_key_owner(connection, int(request_id), str(target_key))
+        return dict(owner) if owner is not None else None
+
+    def reserve_target_key(self, request_id: int, target_key: str) -> bool:
+        """Give an unkeyed row its exact identity, but never steal an owned one.
+
+        Rows which predate ``target_key`` carry NULL and so reserve nothing:
+        re-driving one leaves the next duplicate free to be created all over
+        again. Keying it on the way out of ``needs_selection`` closes that,
+        and refusing when the target is owned keeps the reservation single.
+        """
+
+        if not target_key:
+            return False
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if self._target_key_owner(connection, int(request_id), str(target_key)):
+                return False
+            cursor = connection.execute(
+                "UPDATE requests SET target_key = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND target_key IS NULL AND canonical_request_id IS NULL",
+                (str(target_key), int(request_id)),
+            )
+            return cursor.rowcount == 1
+
+    def collapse_target_duplicate(self, request_id: int, target_key: str) -> int | None:
+        """Alias one stranded row onto the request which owns its exact target.
+
+        This is the explicit repair for rows which were already stranded before
+        the transition defence existed: their owner is long since acquired, so
+        nothing will ever touch them again on its own.
+        """
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, canonical_request_id FROM requests WHERE id = ?",
+                (int(request_id),),
+            ).fetchone()
+            # Idempotent: a row the sweep already collapsed, or one which has
+            # since been driven somewhere else, is not a repair candidate.
+            if (
+                row is None
+                or row["canonical_request_id"] is not None
+                or row["status"] != "needs_selection"
+            ):
+                return None
+            owner = self._target_key_owner(connection, int(request_id), str(target_key))
+            if owner is None:
+                return None
+            self._coalesce_target_duplicate(
+                connection,
+                int(request_id),
+                int(owner["id"]),
+                reason="stranded duplicate collapsed onto its owner",
+            )
+            return int(owner["id"])
 
     def events_for(self, request_id: int) -> list[dict[str, Any]]:
         with self.connect() as connection:

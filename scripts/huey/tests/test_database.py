@@ -1145,5 +1145,252 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.store.interrupted_shelfarr_requests(), [])
 
 
+class DuplicateTargetTests(unittest.TestCase):
+    """Two rows naming one exact target must both be able to leave limbo.
+
+    ``requests_active_target_uq`` covers only the active statuses, so
+    duplicates coexist while they sit in ``needs_selection`` and collide the
+    moment the second is driven out of it.
+    """
+
+    CODA = request_target_key("movies-tv", {"kind": "movie", "title": "coda 2021"})
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.store = RequestStore(Path(self.temporary.name) / "huey.db")
+        self.store.initialize()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def stuck(self, message_id, discord_user_id="1"):
+        with self.store.connect() as connection:
+            return int(
+                connection.execute(
+                    """
+                    INSERT INTO requests (
+                        discord_user_id, discord_username, channel_id, message_id,
+                        media_type, raw_request, title, target_key, status
+                    ) VALUES (?, 'reader', '2', ?, 'movies-tv',
+                              'movie: coda 2021', 'coda 2021', ?, 'needs_selection')
+                    """,
+                    (discord_user_id, message_id, self.CODA),
+                ).lastrowid
+            )
+
+    def status_of(self, request_id):
+        with self.store.connect() as connection:
+            row = connection.execute(
+                "SELECT status, canonical_request_id, external_status FROM requests "
+                "WHERE id = ?",
+                (request_id,),
+            ).fetchone()
+        return dict(row)
+
+    def test_duplicates_coexist_only_while_they_are_stuck(self):
+        first, second = self.stuck("101"), self.stuck("102")
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.status_of(second)["status"], "needs_selection")
+
+    def test_the_second_re_drive_aliases_instead_of_raising(self):
+        first, second = self.stuck("101"), self.stuck("102")
+        self.store.transition(first, "processing", "Re-driving", service="radarr")
+
+        owner = self.store.transition(second, "processing", "Re-driving", service="radarr")
+
+        self.assertEqual(int(owner["id"]), first)
+        aliased = self.status_of(second)
+        self.assertEqual(aliased["status"], "failed")
+        self.assertEqual(aliased["canonical_request_id"], first)
+        self.assertEqual(aliased["external_status"], "canonical_duplicate")
+
+    def strand(self):
+        """Build the exact state batch one left behind, without the sweep.
+
+        The owner is moved straight into an active status in SQL, so the
+        sibling is stranded the way rows were before the sweep existed. Driving
+        the owner through ``transition`` would collapse the sibling on the way
+        past and there would be nothing left to rescue.
+        """
+
+        first, second = self.stuck("101"), self.stuck("102")
+        with self.store.connect() as connection:
+            connection.execute(
+                "UPDATE requests SET status = 'queued', service = 'radarr' "
+                "WHERE id = ?",
+                (first,),
+            )
+        return first, second
+
+    def test_a_row_stranded_behind_an_acquired_owner_still_aliases(self):
+        """The state batch one actually left behind: the owner is long queued."""
+
+        first, second = self.strand()
+
+        owner = self.store.transition(second, "processing", "Re-driving", service="radarr")
+
+        self.assertEqual(int(owner["id"]), first)
+        self.assertEqual(self.status_of(second)["canonical_request_id"], first)
+
+    def test_committing_the_owner_sweeps_its_stuck_siblings(self):
+        first, second, third = self.stuck("101"), self.stuck("102"), self.stuck("103")
+        self.store.transition(first, "processing", "Re-driving", service="radarr")
+
+        self.assertEqual(self.status_of(second)["status"], "needs_selection")
+        self.store.transition(first, "queued", "Queued in Radarr", service="radarr")
+
+        for sibling in (second, third):
+            self.assertEqual(self.status_of(sibling)["canonical_request_id"], first)
+
+    def test_reaching_processing_alone_does_not_sweep(self):
+        """A prompt which fails to post is released, so processing is not a commitment."""
+
+        first, second = self.stuck("101"), self.stuck("102")
+        self.store.transition(first, "processing", "Re-driving", service="radarr")
+
+        self.assertIsNone(self.status_of(second)["canonical_request_id"])
+        self.assertEqual(self.status_of(second)["status"], "needs_selection")
+
+    def test_a_failed_sibling_is_never_swept(self):
+        first, second = self.stuck("101"), self.stuck("102")
+        with self.store.connect() as connection:
+            connection.execute(
+                "UPDATE requests SET status = 'failed' WHERE id = ?", (second,)
+            )
+        self.store.transition(first, "processing", "Re-driving", service="radarr")
+        self.store.transition(first, "queued", "Queued in Radarr", service="radarr")
+
+        self.assertIsNone(self.status_of(second)["canonical_request_id"])
+
+    def test_a_distinct_requester_is_told_where_their_request_went(self):
+        first = self.stuck("101", discord_user_id="1")
+        second = self.stuck("102", discord_user_id="99")
+        self.store.transition(first, "processing", "Re-driving", service="radarr")
+        self.store.transition(second, "processing", "Re-driving", service="radarr")
+
+        with self.store.connect() as connection:
+            notices = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT request_id, event_key, message FROM notification_deliveries"
+                )
+            ]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["request_id"], second)
+        self.assertEqual(notices[0]["event_key"], "request_accepted")
+        self.assertIn(f"#{first}", notices[0]["message"])
+
+    def test_the_same_requester_is_not_told_twice(self):
+        first, second = self.stuck("101"), self.stuck("102")
+        self.store.transition(first, "processing", "Re-driving", service="radarr")
+        self.store.transition(second, "processing", "Re-driving", service="radarr")
+
+        with self.store.connect() as connection:
+            notices = connection.execute(
+                "SELECT COUNT(*) AS total FROM notification_deliveries"
+            ).fetchone()
+        self.assertEqual(notices["total"], 0)
+
+    def test_an_unrelated_target_is_untouched(self):
+        first = self.stuck("101")
+        with self.store.connect() as connection:
+            other = int(
+                connection.execute(
+                    """
+                    INSERT INTO requests (
+                        discord_user_id, discord_username, channel_id, message_id,
+                        media_type, raw_request, title, target_key, status
+                    ) VALUES ('1', 'reader', '2', '103', 'movies-tv',
+                              'movie: coda', 'coda', ?, 'needs_selection')
+                    """,
+                    (request_target_key("movies-tv", {"kind": "movie", "title": "coda"}),),
+                ).lastrowid
+            )
+        self.store.transition(first, "processing", "Re-driving", service="radarr")
+        self.store.transition(first, "queued", "Queued", service="radarr")
+
+        self.assertIsNone(self.status_of(other)["canonical_request_id"])
+        self.assertEqual(self.status_of(other)["status"], "needs_selection")
+
+    def test_an_unkeyed_row_can_reserve_its_target(self):
+        with self.store.connect() as connection:
+            unkeyed = int(
+                connection.execute(
+                    """
+                    INSERT INTO requests (
+                        discord_user_id, discord_username, channel_id, message_id,
+                        media_type, raw_request, title, status
+                    ) VALUES ('1', 'reader', '2', '104', 'movies-tv',
+                              'movie: coda 2021', 'coda 2021', 'needs_selection')
+                    """
+                ).lastrowid
+            )
+
+        self.assertTrue(self.store.reserve_target_key(unkeyed, self.CODA))
+        with self.store.connect() as connection:
+            stored = connection.execute(
+                "SELECT target_key FROM requests WHERE id = ?", (unkeyed,)
+            ).fetchone()
+        self.assertEqual(stored["target_key"], self.CODA)
+
+    def test_reserving_an_owned_target_is_refused(self):
+        first = self.stuck("101")
+        self.store.transition(first, "processing", "Re-driving", service="radarr")
+        with self.store.connect() as connection:
+            unkeyed = int(
+                connection.execute(
+                    """
+                    INSERT INTO requests (
+                        discord_user_id, discord_username, channel_id, message_id,
+                        media_type, raw_request, title, status
+                    ) VALUES ('1', 'reader', '2', '104', 'movies-tv',
+                              'movie: coda 2021', 'coda 2021', 'needs_selection')
+                    """
+                ).lastrowid
+            )
+
+        self.assertFalse(self.store.reserve_target_key(unkeyed, self.CODA))
+
+    def test_collapsing_a_stranded_row_reports_its_owner(self):
+        first, second = self.strand()
+
+        self.assertEqual(
+            self.store.collapse_target_duplicate(second, self.CODA), first
+        )
+        self.assertEqual(self.status_of(second)["canonical_request_id"], first)
+
+    def test_a_swept_cluster_leaves_the_collapse_command_nothing_to_do(self):
+        """The sweep is the forward fix; collapse only ever repairs old rows."""
+
+        first, second = self.stuck("101"), self.stuck("102")
+        self.store.transition(first, "processing", "Re-driving", service="radarr")
+        self.store.transition(first, "queued", "Queued in Radarr", service="radarr")
+
+        self.assertEqual(self.status_of(second)["canonical_request_id"], first)
+        self.assertIsNone(self.store.collapse_target_duplicate(second, self.CODA))
+
+    def test_collapsing_without_an_owner_does_nothing(self):
+        first, second = self.stuck("101"), self.stuck("102")
+
+        self.assertIsNone(self.store.collapse_target_duplicate(second, self.CODA))
+        self.assertEqual(self.status_of(second)["status"], "needs_selection")
+        self.assertEqual(self.status_of(first)["status"], "needs_selection")
+
+    def test_an_aliased_row_is_not_offered_for_re_drive(self):
+        first, second = self.stuck("101"), self.stuck("102")
+        self.store.transition(first, "processing", "Re-driving", service="radarr")
+        self.store.transition(second, "processing", "Re-driving", service="radarr")
+
+        with self.store.connect() as connection:
+            remaining = [
+                int(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM requests WHERE status = 'needs_selection' "
+                    "AND canonical_request_id IS NULL"
+                )
+            ]
+        self.assertEqual(remaining, [])
+
+
 if __name__ == "__main__":
     unittest.main()

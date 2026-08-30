@@ -11,6 +11,7 @@ sys.path.insert(0, str(HUEY_ROOT))
 import redrive_selection
 from clients import RadarrClient, ServiceError
 from database import RequestStore
+from matching import request_target_key
 
 
 def arr_item(title, tmdb_id, year):
@@ -286,6 +287,250 @@ class SurveyTests(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError):
             connection.execute("UPDATE requests SET status = 'queued'")
         connection.close()
+
+
+class DuplicateTargetBatchTests(unittest.TestCase):
+    """A batch must ask about one film once, however many rows name it."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.path = Path(self.temporary.name) / "huey.db"
+        self.store = RequestStore(self.path)
+        self.store.initialize()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def stick(self, *, message_id, target_key="v1:shared", raw="movie: the thing"):
+        request, _ = self.store.create_request(
+            discord_user_id="1", discord_username="kyle", channel_id="2",
+            message_id=message_id, media_type="movies-tv", raw_request=raw,
+            title=raw, author=None, target_key=target_key,
+        )
+        self.store.transition(
+            request["id"], "needs_selection", "could not identify one safe match"
+        )
+        return int(request["id"])
+
+    def run_batch(self, poster, limit=5):
+        return redrive_selection.redrive_batch(
+            self.store,
+            StubbedServices(StubbedRadarr(THE_THING)),
+            channel_id="2",
+            poster=poster,
+            limit=limit,
+            pause_seconds=0,
+            sleep=lambda _seconds: None,
+        )
+
+    def status(self, request_id):
+        return self.store.get_request(request_id)["status"]
+
+    def test_one_prompt_is_posted_for_a_cluster(self):
+        first, second, third = (
+            self.stick(message_id="10"),
+            self.stick(message_id="11"),
+            self.stick(message_id="12"),
+        )
+        poster = FakePoster()
+
+        results = self.run_batch(poster)
+
+        self.assertEqual(len(poster.posted), 1)
+        self.assertEqual(self.status(first), "awaiting_selection")
+        for sibling in (second, third):
+            self.assertEqual(self.status(sibling), "needs_selection")
+            skipped = next(r for r in results if r["request_id"] == sibling)
+            self.assertEqual(skipped["action"], "skipped")
+            self.assertEqual(skipped["duplicate_of"], first)
+
+    def test_a_distinct_target_in_the_same_batch_is_still_prompted(self):
+        first = self.stick(message_id="10")
+        other = self.stick(message_id="11", target_key="v1:other")
+        poster = FakePoster()
+
+        self.run_batch(poster)
+
+        self.assertEqual(len(poster.posted), 2)
+        self.assertEqual(self.status(first), "awaiting_selection")
+        self.assertEqual(self.status(other), "awaiting_selection")
+
+    def test_a_row_whose_target_is_already_owned_is_never_prompted(self):
+        owned = self.stick(message_id="10")
+        stranded = self.stick(message_id="11")
+        with self.store.connect() as connection:
+            connection.execute(
+                "UPDATE requests SET status = 'queued', service = 'radarr' "
+                "WHERE id = ?",
+                (owned,),
+            )
+        poster = FakePoster()
+
+        results = self.run_batch(poster)
+
+        self.assertEqual(poster.posted, [])
+        self.assertEqual(self.status(stranded), "needs_selection")
+        skipped = next(r for r in results if r["request_id"] == stranded)
+        self.assertEqual(skipped["duplicate_of"], owned)
+        self.assertEqual(skipped["owner_status"], "queued")
+
+    def test_planning_a_cluster_still_writes_nothing(self):
+        first, second = self.stick(message_id="10"), self.stick(message_id="11")
+
+        results = redrive_selection.redrive_batch(
+            self.store,
+            StubbedServices(StubbedRadarr(THE_THING)),
+            channel_id="2",
+            poster=None,
+            limit=5,
+            pause_seconds=0,
+            sleep=lambda _seconds: None,
+        )
+
+        self.assertEqual(self.status(first), "needs_selection")
+        self.assertEqual(self.status(second), "needs_selection")
+        self.assertEqual(
+            [r["action"] for r in results], ["would_prompt", "skipped"]
+        )
+
+    def test_an_unkeyed_row_reserves_its_target_when_re_driven(self):
+        with self.store.connect() as connection:
+            unkeyed = int(
+                connection.execute(
+                    """
+                    INSERT INTO requests (
+                        discord_user_id, discord_username, channel_id, message_id,
+                        media_type, raw_request, title, status
+                    ) VALUES ('1', 'kyle', '2', '99', 'movies-tv',
+                              'movie: the thing', 'the thing', 'needs_selection')
+                    """
+                ).lastrowid
+            )
+
+        self.run_batch(FakePoster())
+
+        with self.store.connect() as connection:
+            stored = connection.execute(
+                "SELECT target_key FROM requests WHERE id = ?", (unkeyed,)
+            ).fetchone()
+        self.assertEqual(
+            stored["target_key"],
+            request_target_key("movies-tv", {"kind": "movie", "title": "the thing"}),
+        )
+
+
+class CollapseTests(unittest.TestCase):
+    """``collapse`` reports before it writes, exactly as ``report`` does."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.path = Path(self.temporary.name) / "huey.db"
+        self.store = RequestStore(self.path)
+        self.store.initialize()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def strand(self, *, owner_user="1", alias_user="1"):
+        """One acquired owner and one row stranded behind it, as in production."""
+
+        key = request_target_key("movies-tv", {"kind": "movie", "title": "coda 2021"})
+        ids = []
+        with self.store.connect() as connection:
+            for index, user in enumerate((owner_user, alias_user)):
+                ids.append(
+                    int(
+                        connection.execute(
+                            """
+                            INSERT INTO requests (
+                                discord_user_id, discord_username, channel_id,
+                                message_id, media_type, raw_request, title,
+                                target_key, status
+                            ) VALUES (?, 'kyle', '2', ?, 'movies-tv',
+                                      'movie: coda 2021', 'coda 2021', ?,
+                                      'needs_selection')
+                            """,
+                            (user, str(700 + index), key),
+                        ).lastrowid
+                    )
+                )
+            connection.execute(
+                "UPDATE requests SET status = 'queued', service = 'radarr' "
+                "WHERE id = ?",
+                (ids[0],),
+            )
+        return ids[0], ids[1]
+
+    def test_the_plan_writes_nothing(self):
+        owner, stranded = self.strand()
+
+        plan = redrive_selection.collapse(self.path, apply=False)
+
+        self.assertFalse(plan["applied"])
+        self.assertEqual(plan["total"], 1)
+        self.assertEqual(plan["rows"][0]["request_id"], stranded)
+        self.assertEqual(plan["rows"][0]["owner_request_id"], owner)
+        self.assertEqual(
+            self.store.get_request(stranded)["status"], "needs_selection"
+        )
+
+    def test_applying_aliases_the_stranded_row(self):
+        owner, stranded = self.strand()
+
+        value = redrive_selection.collapse(self.path, apply=True)
+
+        self.assertTrue(value["applied"])
+        self.assertEqual(value["collapsed"], 1)
+        self.assertEqual(value["rows"][0]["collapsed_onto"], owner)
+        saved = self.store.get_request(stranded)
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["canonical_request_id"], owner)
+
+    def test_a_cluster_with_no_owner_is_left_alone(self):
+        """Nothing has been acquired, so there is no winner to pick."""
+
+        key = request_target_key("movies-tv", {"kind": "movie", "title": "coda 2021"})
+        with self.store.connect() as connection:
+            for index in range(2):
+                connection.execute(
+                    """
+                    INSERT INTO requests (
+                        discord_user_id, discord_username, channel_id, message_id,
+                        media_type, raw_request, title, target_key, status
+                    ) VALUES ('1', 'kyle', '2', ?, 'movies-tv',
+                              'movie: coda 2021', 'coda 2021', ?, 'needs_selection')
+                    """,
+                    (str(800 + index), key),
+                )
+
+        self.assertEqual(redrive_selection.collapse(self.path, apply=False)["total"], 0)
+
+    def test_the_plan_says_whether_the_requester_will_be_told(self):
+        _, stranded = self.strand(owner_user="1", alias_user="99")
+
+        plan = redrive_selection.collapse(self.path, apply=False)
+        self.assertTrue(plan["rows"][0]["notifies_requester"])
+
+        redrive_selection.collapse(self.path, apply=True)
+        with self.store.connect() as connection:
+            notices = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT request_id, event_key FROM notification_deliveries"
+                )
+            ]
+        self.assertEqual(notices, [{"request_id": stranded, "event_key": "request_accepted"}])
+
+    def test_applying_twice_is_a_no_op(self):
+        redrive_selection.collapse(self.path, apply=True)
+        _, stranded = self.strand()
+        redrive_selection.collapse(self.path, apply=True)
+
+        second = redrive_selection.collapse(self.path, apply=True)
+        self.assertEqual(second["total"], 0)
+        self.assertEqual(
+            self.store.get_request(stranded)["status"], "failed"
+        )
 
 
 if __name__ == "__main__":
