@@ -140,15 +140,27 @@ def format_candidate_prompt(
     candidates = response.get("selection_proposal")
     if not isinstance(candidates, (list, tuple)) or not candidates:
         raise ValueError("Candidate prompt requires at least one option")
-    lines = []
-    for ordinal, candidate in enumerate(candidates[:3], start=1):
+    labels = []
+    for candidate in candidates[:3]:
         if not isinstance(candidate, dict):
             raise ValueError("Candidate prompt contains an invalid option")
         label = sanitize_display_text(candidate.get("label"), limit=300)
         if not label:
             raise ValueError("Candidate prompt contains an invalid label")
-        lines.append(f"{ordinal}. {label}")
+        labels.append(label)
     minutes = max(1, (int(ttl_seconds) + 59) // 60)
+    plural = "" if minutes == 1 else "s"
+    if len(labels) == 1:
+        # One option is a confirmation, not a choice. Asking "choose one" of a
+        # single line reads as a bug; asking whether it is the right title
+        # reads as the question it actually is.
+        return (
+            f"⚠️ Request #{response['request_id']} needs one confirmation\n"
+            f"Type: {media_type}\n"
+            f"Did you mean {labels[0]}?\n"
+            "Use Discord's Reply action on this message, then send 1 to confirm "
+            f"within {minutes} minute{plural}."
+        )
     service = str(response.get("service") or "").casefold()
     if service in {"radarr", "sonarr"}:
         choice_kind = "title choice"
@@ -156,12 +168,13 @@ def format_candidate_prompt(
         choice_kind = "audiobook choice"
     else:
         choice_kind = "metadata choice"
+    lines = [f"{ordinal}. {label}" for ordinal, label in enumerate(labels, start=1)]
     return (
         f"⚠️ Request #{response['request_id']} needs one {choice_kind}\n"
         f"Type: {media_type}\n"
         + "\n".join(lines)
         + f"\nUse Discord's Reply action on this message, then send one number within {minutes} minute"
-        + ("" if minutes == 1 else "s")
+        + plural
         + "."
     )
 

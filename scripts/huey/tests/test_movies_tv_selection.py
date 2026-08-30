@@ -245,6 +245,103 @@ class MoviesTvPickerTests(unittest.TestCase):
         self.assertEqual(response["status"], "needs_selection")
         self.assertIn("could not identify one safe match", response["message"])
 
+    def redriven(self, content, results, *, message_id):
+        session = FakeSession({content.split(": ", 1)[1]: results})
+        registry = ServiceRegistry()
+        registry._clients["radarr"] = radarr(session)
+        processor = RequestProcessor(self.store, services=registry)
+        response = processor.process(
+            {**self.delivery, "message_id": message_id, "content": content}
+        )
+        return response, session
+
+    def test_a_lone_strong_result_is_offered_as_a_confirmation(self):
+        # Backlog row: the requester's year is right by every consumer source
+        # and TMDb disagrees, leaving exactly one candidate at 0.98. Refusing
+        # to mention it because there is only one of it is the same error as
+        # discarding ranked candidates.
+        response, session = self.redriven(
+            "movie: personal shopper 2017",
+            [{"title": "Personal Shopper", "year": 2016, "tmdbId": 381518}],
+            message_id="170",
+        )
+
+        self.assertEqual(response["status"], "awaiting_selection")
+        self.assertEqual(len(response["selection_proposal"]), 1)
+        self.assertEqual(
+            response["selection_proposal"][0]["work_id"], "radarr:tmdb:381518"
+        )
+        saved = self.store.get_request(response["request_id"])
+        self.assertEqual(saved["status"], "awaiting_selection")
+        # Confirming is not accepting: nothing reached Radarr.
+        self.assertEqual([call for call in session.calls if call[0] != "GET"], [])
+
+    def test_a_lone_result_below_the_confirmation_floor_still_bails(self):
+        # 0.596 against "The Wild Life". Here the identity itself is what is
+        # in doubt, not the year, so a confirmation would be a backdoor to
+        # accepting what the gate refused.
+        response, _ = self.redriven(
+            "movie: the wildlife 1984",
+            [{"title": "The Wild Life", "year": 1984, "tmdbId": 30765}],
+            message_id="171",
+        )
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["selection_proposal"], ())
+
+    def test_a_lone_confirmation_can_be_claimed_with_one(self):
+        response, _ = self.redriven(
+            "movie: crime zone 1989",
+            [{"title": "Crime Zone", "year": 1988, "tmdbId": 124506}],
+            message_id="172",
+        )
+        request_id = response["request_id"]
+        self.assertTrue(self.store.bind_candidate_prompt(request_id, "880000111222"))
+
+        claim = self.store.claim_candidate_selection(
+            prompt_message_id="880000111222",
+            reply_message_id="880000111333",
+            discord_user_id="1",
+            channel_id="2",
+            ordinal=1,
+        )
+        self.assertEqual(claim["outcome"], "claimed")
+
+    def test_a_confirmation_prompt_asks_instead_of_listing(self):
+        one = format_candidate_prompt(
+            "movies-tv",
+            {
+                "request_id": 231,
+                "service": "radarr",
+                "selection_proposal": [
+                    {"label": "Personal Shopper (2016)", "work_id": "radarr:tmdb:381518"}
+                ],
+            },
+            ttl_seconds=900,
+        )
+
+        self.assertIn("Did you mean Personal Shopper (2016)?", one)
+        self.assertIn("send 1 to confirm", one)
+        self.assertNotIn("1. ", one)
+
+    def test_a_multi_option_prompt_keeps_the_numbered_list(self):
+        many = format_candidate_prompt(
+            "movies-tv",
+            {
+                "request_id": 232,
+                "service": "radarr",
+                "selection_proposal": [
+                    {"label": "The Thing (1982)", "work_id": "radarr:tmdb:1091"},
+                    {"label": "The Thing (2011)", "work_id": "radarr:tmdb:54580"},
+                ],
+            },
+            ttl_seconds=900,
+        )
+
+        self.assertIn("1. The Thing (1982)", many)
+        self.assertIn("2. The Thing (2011)", many)
+        self.assertNotIn("Did you mean", many)
+
     def test_sonarr_offers_tvdb_identities(self):
         session = FakeSession(
             {

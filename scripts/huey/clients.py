@@ -22,6 +22,7 @@ try:  # Support both package imports and direct container script execution.
         Selection,
         normalize_text,
         normalize_identity_text,
+        ARR_AUTO_MATCH_MIN_SIMILARITY,
         rank_arr_candidates,
         select_arr_candidate,
         select_shelfarr_candidate,
@@ -35,6 +36,7 @@ except ImportError:  # pragma: no cover - exercised by the container entrypoint
         Selection,
         normalize_identity_text,
         normalize_text,
+        ARR_AUTO_MATCH_MIN_SIMILARITY,
         rank_arr_candidates,
         select_arr_candidate,
         select_shelfarr_candidate,
@@ -449,6 +451,14 @@ class ArrClient(JsonClient):
     # Display-only floor. A candidate below this is too weak to be worth
     # showing; it has no bearing on what select_arr_candidate auto-accepts.
     _PICKER_MIN_SIMILARITY = 0.45
+    # A lone option is a confirmation, not a choice, so it clears a higher bar
+    # than the display floor: the one the automatic gate already demands of a
+    # title. What separates it from an auto-match is never the strength of the
+    # identity -- it is that something else stopped it, a disputed release year
+    # or an unresolved tie -- so asking is worth it where guessing is not.
+    # Refusing to mention a 0.98 match because there is only one of it is the
+    # same error as discarding ranked candidates.
+    _PICKER_MIN_LONE_SIMILARITY = ARR_AUTO_MATCH_MIN_SIMILARITY
 
     def _candidate_work_id(self, candidate: Mapping[str, Any]) -> str | None:
         """Return the stable provider identity used to re-resolve a choice."""
@@ -475,6 +485,7 @@ class ArrClient(JsonClient):
         if option_kind is None:
             return ()
         options: list[dict[str, Any]] = []
+        scores: list[float] = []
         seen: set[str] = set()
         for candidate in ranked:
             if candidate.score < self._PICKER_MIN_SIMILARITY:
@@ -498,6 +509,7 @@ class ArrClient(JsonClient):
             if label is None:
                 continue
             seen.add(work_id)
+            scores.append(candidate.score)
             options.append(
                 {
                     "fingerprint": hashlib.sha256(work_id.encode("utf-8")).hexdigest(),
@@ -514,9 +526,14 @@ class ArrClient(JsonClient):
             )
             if len(options) == 3:
                 break
-        # The persisted contract requires at least two distinct options; a
-        # single plausible result is not a choice worth asking about.
-        return tuple(options) if len(options) >= 2 else ()
+        if len(options) >= 2:
+            return tuple(options)
+        # One clearly-good option is still worth putting to the requester, as a
+        # confirmation rather than a choice. A weak one is not: that would make
+        # the prompt a backdoor to accepting what the gate refused.
+        if options and scores[0] >= self._PICKER_MIN_LONE_SIMILARITY:
+            return tuple(options)
+        return ()
 
     def submit(self, title: str) -> dict[str, str | None]:
         candidates = self.lookup(title)

@@ -94,8 +94,8 @@ def _normalize_selection_proposal(value: object) -> tuple[dict[str, Any], ...]:
 
     if value in (None, (), []):
         return ()
-    if not isinstance(value, (list, tuple)) or not 2 <= len(value) <= 3:
-        raise ValueError("Selection proposals require two or three candidates")
+    if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= 3:
+        raise ValueError("Selection proposals require one to three candidates")
 
     normalized: list[dict[str, Any]] = []
     for item in value:

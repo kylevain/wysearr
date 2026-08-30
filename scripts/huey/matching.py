@@ -238,6 +238,10 @@ def select_release(
 # wildlife" against "The Wild Life"), and 0.12 keeps it above the picker's
 # 0.45 display floor even at maximum penalty, while still ordering a one-year
 # miss above a two-year miss.
+# The title score the automatic gate demands before it will accept a match
+# without asking. Named so the picker can reuse it as the bar a lone option
+# must clear to be worth confirming.
+ARR_AUTO_MATCH_MIN_SIMILARITY = 0.62
 YEAR_MISMATCH_PENALTY_PER_YEAR = 0.02
 MAX_YEAR_MISMATCH_PENALTY = 0.12
 _YEAR_TOKEN = re.compile(r"\b((?:18|19|20|21)\d{2})\b")
@@ -373,7 +377,7 @@ def select_arr_candidate(title: str, items: Iterable[Mapping[str, Any]]) -> Mapp
         for candidate in rank_arr_candidates(title, items)
         if not candidate.year_conflict
     ]
-    if not ranked or ranked[0].score < 0.62:
+    if not ranked or ranked[0].score < ARR_AUTO_MATCH_MIN_SIMILARITY:
         return None
     if len(ranked) > 1 and ranked[0].score - ranked[1].score < 0.05:
         return None

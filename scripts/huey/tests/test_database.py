@@ -98,6 +98,34 @@ class ConfirmationReuseTests(unittest.TestCase):
                 )
             ]
 
+    def test_a_single_option_confirmation_is_accepted(self):
+        request, _ = self.store.create_request(
+            **DatabaseTests.request_values(message_id="700"), target_key="v1:single"
+        )
+        self.store.transition(
+            request["id"], "processing", "Searching", service="shelfarr"
+        )
+
+        confirmation = self.store.create_candidate_confirmation(
+            request["id"], self.options()[:1]
+        )
+
+        self.assertEqual(len(confirmation["options"]), 1)
+        self.assertEqual(confirmation["options"][0]["ordinal"], 1)
+
+    def test_no_options_and_too_many_options_are_still_refused(self):
+        request, _ = self.store.create_request(
+            **DatabaseTests.request_values(message_id="701"), target_key="v1:bounds"
+        )
+        self.store.transition(
+            request["id"], "processing", "Searching", service="shelfarr"
+        )
+
+        for candidates in ([], self.options() * 2):
+            with self.subTest(count=len(candidates)):
+                with self.assertRaises(ValueError):
+                    self.store.create_candidate_confirmation(request["id"], candidates)
+
     def test_an_expired_prompt_no_longer_blocks_a_new_one(self):
         request_id = self.prompt(ttl_seconds=1)
         time.sleep(1.2)

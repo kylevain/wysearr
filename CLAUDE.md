@@ -158,6 +158,29 @@ mismatch demotes by 0.02 per year, capped at 0.12. `select_arr_candidate`
 still drops conflicting candidates before its gates, so no wrong-year film can
 auto-match and nothing that auto-matched before stops.
 
+**Known design gap: year agreement counts for nothing.** The scoring is
+one-sided — a year that disagrees is penalised, a year that *agrees* earns
+nothing. So a corroborating year cannot lift a weak title: `The Wildlife 1984`
+matches `The Wild Life` (1984) on the year exactly, still scores 0.596, and
+bails below both the 0.62 confirmation floor and the automatic gate. The
+requester supplied evidence that the match is right and nothing counted it.
+
+Fixing it means scoring agreement as evidence, which raises scores and
+therefore **moves auto-accept outcomes** — titles that currently require a
+prompt would start being taken automatically. That is a different class of
+risk from a picker change, which by construction can only offer more, never
+acquire more. It needs its own evaluation against the backlog and must not be
+folded into a picker change.
+
+A single candidate can be offered as a confirmation — "Did you mean X (year)?
+Reply 1 to confirm" — but only above `ARR_AUTO_MATCH_MIN_SIMILARITY` (0.62),
+the bar the automatic gate already demands of a title. The point of the higher
+bar is that a lone option is only worth asking about when the identity is
+strong and something *else* blocked it, such as a disputed year. If the
+identity itself is weak, the prompt becomes a backdoor to accepting what the
+gate refused. Only the ARR picker emits one option; Shelfarr, LazyLibrarian
+and ABBA keep their own two-option rule.
+
 ## Known limitation: the parser keeps the author inside the title
 
 `parse_request` only splits an author off when the text contains ` by `.

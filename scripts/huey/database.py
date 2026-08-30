@@ -3754,8 +3754,8 @@ class RequestStore:
     ) -> dict[str, Any]:
         """Persist a bounded acquisition choice and reserve its target atomically."""
 
-        if isinstance(candidates, (str, bytes)) or not 2 <= len(candidates) <= 3:
-            raise ValueError("Candidate confirmations require two or three options")
+        if isinstance(candidates, (str, bytes)) or not 1 <= len(candidates) <= 3:
+            raise ValueError("Candidate confirmations require one to three options")
         if isinstance(ttl_seconds, bool) or not 1 <= int(ttl_seconds) <= 86_400:
             raise ValueError("Candidate confirmation TTL must be between 1 and 86400 seconds")
         moment = now or datetime.now(timezone.utc)
