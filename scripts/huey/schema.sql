@@ -98,7 +98,12 @@ CREATE TABLE IF NOT EXISTS candidate_confirmation_replies (
     discord_user_id TEXT NOT NULL,
     channel_id TEXT NOT NULL,
     ordinal INTEGER NOT NULL,
-    outcome TEXT NOT NULL CHECK (outcome IN ('claimed', 'invalid', 'expired', 'duplicate')),
+    -- 'rejected' is the requester answering the question correctly: none of
+    -- the offered candidates is the work they asked for.  It is deliberately
+    -- not folded into 'invalid', which means the reply could not be read.
+    outcome TEXT NOT NULL CHECK (
+        outcome IN ('claimed', 'invalid', 'expired', 'duplicate', 'rejected')
+    ),
     FOREIGN KEY(confirmation_id) REFERENCES candidate_confirmations(id) ON DELETE CASCADE
 );
 

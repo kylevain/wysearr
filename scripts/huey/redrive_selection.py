@@ -68,7 +68,13 @@ ARR_SERVICES = {"movie": "radarr", "tv": "sonarr"}
 # Every outcome a row can be assigned. Anything not in ``REDRIVABLE`` must not
 # be re-driven, for a reason the report states per row.
 REDRIVABLE = ("auto_match", "picker")
-TERMINAL = ("still_bails", "lookup_failed", "blocked_by_prior_prompt", "skipped_unparsed")
+TERMINAL = (
+    "still_bails",
+    "lookup_failed",
+    "blocked_by_prior_prompt",
+    "skipped_unparsed",
+    "rejected_by_requester",
+)
 
 
 def open_readonly(path: Path) -> sqlite3.Connection:
@@ -97,7 +103,17 @@ def stuck_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
                    FROM candidate_confirmations
                    WHERE candidate_confirmations.request_id = requests.id
                    LIMIT 1
-               ) AS prior_prompt
+               ) AS prior_prompt,
+               (
+                   SELECT events.event_type
+                   FROM events
+                   WHERE events.request_id = requests.id
+                     AND events.event_type IN (
+                         'selection_rejected', 'selection_requested'
+                     )
+                   ORDER BY events.id DESC
+                   LIMIT 1
+               ) AS last_selection_event
         FROM requests
         WHERE requests.media_type = ?
           AND requests.status = 'needs_selection'
@@ -222,6 +238,11 @@ def survey_row(row: Mapping[str, Any], services: Any) -> dict[str, Any]:
     if row["error"] and PARSER_ERROR_MARKER in str(row["error"]):
         return {**record, "outcome": "skipped_unparsed",
                 "reason": "parser failure, out of scope"}
+    if str(row["last_selection_event"] or "") == "selection_rejected":
+        # The requester has already seen these candidates and said none of them
+        # was the work. Re-driving would offer the identical list straight back.
+        return {**record, "outcome": "rejected_by_requester",
+                "reason": "requester rejected the offered candidates"}
     prior = str(row["prior_prompt"] or "")
     if prior and prior not in TERMINAL_CONFIRMATION_STATUSES:
         # A live or already-answered prompt owns the row. A finished one does

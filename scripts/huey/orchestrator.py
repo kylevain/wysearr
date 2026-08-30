@@ -1044,6 +1044,33 @@ class RequestProcessor:
         handler_result.update({"request_id": request_id, "duplicate": False})
         return handler_result
 
+    def process_candidate_rejection(
+        self, delivery: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Release one prompt the requester answered with 'none of these'.
+
+        No acquisition boundary is crossed, so unlike ``process_candidate_reply``
+        this never continues into a handler: the row is released and the
+        requester is asked for a more exact title.
+        """
+
+        rejection = self.store.reject_candidate_selection(
+            prompt_message_id=str(delivery["prompt_message_id"]),
+            reply_message_id=str(delivery["message_id"]),
+            discord_user_id=str(delivery["discord_user_id"]),
+            channel_id=str(delivery["channel_id"]),
+        )
+        request = rejection.get("request")
+        return {
+            "selection_outcome": str(rejection.get("outcome") or "not_found"),
+            "request_id": request.get("id") if isinstance(request, Mapping) else None,
+            "media_type": (
+                str(request.get("media_type"))
+                if isinstance(request, Mapping) and request.get("media_type")
+                else None
+            ),
+        }
+
     def process_candidate_reply(self, delivery: Mapping[str, Any]) -> dict[str, Any]:
         """Claim and continue one reply to a persisted candidate prompt.
 

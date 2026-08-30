@@ -13,9 +13,11 @@ sys.path.insert(0, str(HUEY_ROOT))
 from clients import RadarrClient, ServiceError, SonarrClient
 from database import RequestStore
 from huey import (
+    _is_selection_rejection,
     _reply_targets_huey_candidate_prompt,
     _selection_ordinal,
     format_candidate_prompt,
+    selection_correction,
 )
 from orchestrator import RequestProcessor
 from services import ServiceRegistry
@@ -74,7 +76,9 @@ def radarr(session):
     return RadarrClient("http://radarr:7878", "key", session=session)
 
 
-class MoviesTvPickerTests(unittest.TestCase):
+class PickerFixture:
+    """The shared ARR picker fixture, without any test methods."""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.store = RequestStore(Path(self.temporary.name) / "huey.db")
@@ -102,6 +106,8 @@ class MoviesTvPickerTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+
+class MoviesTvPickerTests(PickerFixture, unittest.TestCase):
     def test_ambiguous_lookup_persists_a_candidate_prompt(self):
         response = self.processor.process(self.delivery)
 
@@ -465,6 +471,324 @@ class CandidateOptionMigrationTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertIn("'movie'", sql)
         self.assertIn("ordinal BETWEEN 1 AND 3", sql)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class RejectionOutcomeMigrationTests(unittest.TestCase):
+    """The replies CHECK is rebuilt so 'rejected' can be recorded honestly."""
+
+    NARROW_TABLE = """
+        CREATE TABLE candidate_confirmation_replies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            confirmation_id INTEGER NOT NULL,
+            reply_message_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            outcome TEXT NOT NULL
+                CHECK (outcome IN ('claimed', 'invalid', 'expired', 'duplicate')),
+            FOREIGN KEY(confirmation_id)
+                REFERENCES candidate_confirmations(id) ON DELETE CASCADE
+        )
+    """
+
+    def old_schema_store(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "huey.db"
+        store = RequestStore(path)
+        store.initialize()
+        with sqlite3.connect(path) as setup:
+            setup.execute("PRAGMA foreign_keys = OFF")
+            setup.execute("DROP TABLE candidate_confirmation_replies")
+            setup.execute(self.NARROW_TABLE)
+            setup.execute(
+                "INSERT INTO candidate_confirmations "
+                "(id, request_id, shelfarr_correlation, created_at, updated_at, "
+                "expires_at) VALUES (1, 1, 'huey:1', '2026-01-01 00:00:00', "
+                "'2026-01-01 00:00:00', '2026-01-01 00:15:00')"
+            )
+            setup.execute(
+                "INSERT INTO candidate_confirmation_replies "
+                "(confirmation_id, reply_message_id, created_at, discord_user_id, "
+                "channel_id, ordinal, outcome) "
+                "VALUES (1, '9001', '2026-01-01 00:01:00', '1', '2', 2, 'claimed')"
+            )
+        return path
+
+    def test_the_old_constraint_refuses_a_rejection(self):
+        path = self.old_schema_store()
+
+        with sqlite3.connect(path) as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO candidate_confirmation_replies "
+                    "(confirmation_id, reply_message_id, created_at, "
+                    "discord_user_id, channel_id, ordinal, outcome) "
+                    "VALUES (1, '9002', '2026-01-01 00:02:00', '1', '2', 0, 'rejected')"
+                )
+
+    def test_migrating_admits_rejections_and_keeps_existing_replies(self):
+        path = self.old_schema_store()
+
+        RequestStore(path).initialize()
+
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "INSERT INTO candidate_confirmation_replies "
+                "(confirmation_id, reply_message_id, created_at, discord_user_id, "
+                "channel_id, ordinal, outcome) "
+                "VALUES (1, '9002', '2026-01-01 00:02:00', '1', '2', 0, 'rejected')"
+            )
+            rows = dict(
+                connection.execute(
+                    "SELECT reply_message_id, outcome "
+                    "FROM candidate_confirmation_replies"
+                ).fetchall()
+            )
+        self.assertEqual(rows, {"9001": "claimed", "9002": "rejected"})
+
+    def test_migrating_twice_is_a_no_op(self):
+        path = self.old_schema_store()
+
+        RequestStore(path).initialize()
+        RequestStore(path).initialize()
+
+        with sqlite3.connect(path) as connection:
+            total = connection.execute(
+                "SELECT COUNT(*) FROM candidate_confirmation_replies"
+            ).fetchone()[0]
+            self.assertEqual(total, 1)
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = "
+                    "'candidate_confirmation_replies_migrated'"
+                ).fetchone()
+            )
+
+    def test_a_still_invalid_outcome_is_refused_after_migrating(self):
+        path = self.old_schema_store()
+        RequestStore(path).initialize()
+
+        with sqlite3.connect(path) as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO candidate_confirmation_replies "
+                    "(confirmation_id, reply_message_id, created_at, "
+                    "discord_user_id, channel_id, ordinal, outcome) "
+                    "VALUES (1, '9003', '2026-01-01 00:03:00', '1', '2', 0, 'banana')"
+                )
+
+
+class RejectionTokenTests(unittest.TestCase):
+    """The token must not collide with the ordinal parser's invalid sentinel."""
+
+    def test_zero_is_indistinguishable_from_an_unreadable_reply(self):
+        # Why rejection is not spelled "0": _SELECTION_ORDINAL is ^[1-9][0-9]*$,
+        # so these all already collapse to the same value.
+        for unreadable in ("0", "banana", "", "0001", " 1", "1234567"):
+            self.assertEqual(_selection_ordinal(unreadable), 0)
+
+    def test_the_rejection_tokens_are_accepted(self):
+        for token in ("n", "N", "no", "No", "none", " n "):
+            self.assertTrue(_is_selection_rejection(token))
+
+    def test_an_ordinal_is_never_a_rejection(self):
+        for token in ("1", "2", "3", "0", "banana", "nine"):
+            self.assertFalse(_is_selection_rejection(token))
+
+
+class RejectionPromptTests(unittest.TestCase):
+    def prompt(self, labels):
+        return format_candidate_prompt(
+            "movies-tv",
+            {
+                "request_id": 113,
+                "service": "sonarr",
+                "selection_proposal": [
+                    {"label": label, "work_id": f"sonarr:tvdb:{index}"}
+                    for index, label in enumerate(labels, start=1)
+                ],
+            },
+            ttl_seconds=900,
+        )
+
+    def test_the_picker_offers_a_way_out(self):
+        prompt = self.prompt(
+            ["Brooklyn DA (2013)", "Brooklyn 11223 (2012)", "Brooklyn South (1997)"]
+        )
+
+        self.assertIn("or n if none of these match.", prompt)
+        self.assertIn("1. Brooklyn DA (2013)", prompt)
+
+    def test_the_confirmation_offers_a_way_to_say_no(self):
+        prompt = self.prompt(["Brooklyn Nine-Nine (2013)"])
+
+        self.assertIn("Did you mean Brooklyn Nine-Nine (2013)?", prompt)
+        self.assertIn("or n if that is not it.", prompt)
+
+    def test_both_prompts_are_recognised_as_reply_targets(self):
+        client = SimpleNamespace(user=SimpleNamespace(id=9))
+        for labels in (
+            ["Brooklyn DA (2013)", "Brooklyn South (1997)"],
+            # The single-option prompt was never matched here before.
+            ["Brooklyn Nine-Nine (2013)"],
+        ):
+            message = SimpleNamespace(
+                reference=SimpleNamespace(
+                    resolved=SimpleNamespace(
+                        author=SimpleNamespace(id=9), content=self.prompt(labels)
+                    ),
+                    cached_message=None,
+                )
+            )
+            self.assertIs(
+                asyncio.run(
+                    _reply_targets_huey_candidate_prompt(client, message, "5000")
+                ),
+                True,
+                msg=f"{len(labels)} option(s) not recognised",
+            )
+
+    def test_the_acknowledgement_names_the_released_request(self):
+        text = selection_correction("rejected", 113)
+
+        self.assertIn("#113", text)
+        self.assertIn("more detail", text)
+
+
+class RejectionFlowTests(PickerFixture, unittest.TestCase):
+    """Rejection through the processor, on the real picker fixture."""
+
+    def prompted(self):
+        response = self.processor.process(self.delivery)
+        self.assertEqual(response["status"], "awaiting_selection")
+        request_id = response["request_id"]
+        self.assertTrue(self.store.bind_candidate_prompt(request_id, "5000"))
+        return request_id
+
+    def reject(self, message_id="144", **overrides):
+        return self.processor.process_candidate_rejection(
+            {
+                **self.delivery,
+                "message_id": message_id,
+                "prompt_message_id": "5000",
+                **overrides,
+            }
+        )
+
+    def test_rejection_releases_the_row_at_once(self):
+        request_id = self.prompted()
+
+        outcome = self.reject()
+
+        self.assertEqual(outcome["selection_outcome"], "rejected")
+        self.assertEqual(outcome["request_id"], request_id)
+        saved = self.store.get_request(request_id)
+        self.assertEqual(saved["status"], "needs_selection")
+        # Nothing was added to Radarr on the way out.
+        self.assertEqual([call for call in self.session.calls if call[0] != "GET"], [])
+
+    def test_rejection_is_recorded_as_an_answer_not_a_mistake(self):
+        request_id = self.prompted()
+        self.reject()
+
+        with self.store.connect() as connection:
+            reply = connection.execute(
+                "SELECT outcome FROM candidate_confirmation_replies"
+            ).fetchone()
+            events = [
+                row["event_type"]
+                for row in connection.execute(
+                    "SELECT event_type FROM events WHERE request_id = ?", (request_id,)
+                )
+            ]
+        self.assertEqual(reply["outcome"], "rejected")
+        self.assertIn("selection_rejected", events)
+
+    def test_the_prompt_becomes_terminal_so_the_row_can_be_asked_again(self):
+        request_id = self.prompted()
+        self.reject()
+
+        confirmation = self.store.get_candidate_confirmation(request_id)
+        self.assertEqual(confirmation["status"], "failed")
+        self.store.transition(request_id, "processing", "Re-driving", service="radarr")
+        self.store.create_candidate_confirmation(
+            request_id,
+            [
+                {
+                    "fingerprint": "d" * 64,
+                    "label": "The Wrecking Crew (1968)",
+                    "work_id": "radarr:tmdb:222",
+                    "source_work_ids": ["radarr:tmdb:222"],
+                    "title": "The Wrecking Crew",
+                    "author": None,
+                    "year": 1968,
+                    "content_kind": "video",
+                    "media_type": "movies-tv",
+                    "book_type": "movie",
+                }
+            ],
+        )
+        self.assertEqual(
+            self.store.get_request(request_id)["status"], "awaiting_selection"
+        )
+
+    def test_a_redelivered_rejection_changes_nothing(self):
+        self.prompted()
+        self.reject(message_id="144")
+
+        again = self.reject(message_id="144")
+
+        self.assertEqual(again["selection_outcome"], "duplicate")
+
+    def test_another_user_cannot_reject_someone_elses_prompt(self):
+        request_id = self.prompted()
+
+        outcome = self.reject(message_id="145", discord_user_id="99")
+
+        self.assertEqual(outcome["selection_outcome"], "invalid")
+        self.assertEqual(
+            self.store.get_request(request_id)["status"], "awaiting_selection"
+        )
+
+    def test_a_rejection_from_another_channel_is_refused(self):
+        request_id = self.prompted()
+
+        outcome = self.reject(message_id="146", channel_id="999")
+
+        self.assertEqual(outcome["selection_outcome"], "invalid")
+        self.assertEqual(
+            self.store.get_request(request_id)["status"], "awaiting_selection"
+        )
+
+    def test_rejecting_after_choosing_does_not_undo_the_acquisition(self):
+        request_id = self.prompted()
+        claimed = self.processor.process_candidate_reply(
+            {
+                **self.delivery,
+                "message_id": "147",
+                "prompt_message_id": "5000",
+                "ordinal": _selection_ordinal("2"),
+            }
+        )
+        self.assertEqual(claimed["selection_outcome"], "claimed")
+
+        late = self.reject(message_id="148")
+
+        self.assertEqual(late["selection_outcome"], "duplicate")
+        self.assertEqual(self.store.get_request(request_id)["status"], "queued")
+
+    def test_an_unknown_prompt_is_not_found(self):
+        self.prompted()
+
+        outcome = self.reject(message_id="149", prompt_message_id="404404404")
+
+        self.assertEqual(outcome["selection_outcome"], "not_found")
 
 
 if __name__ == "__main__":

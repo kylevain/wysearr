@@ -3,6 +3,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 HUEY_ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +13,7 @@ import redrive_selection
 from clients import RadarrClient, ServiceError
 from database import RequestStore
 from matching import request_target_key
+from parser import parse_request
 
 
 def arr_item(title, tmdb_id, year):
@@ -531,6 +533,191 @@ class CollapseTests(unittest.TestCase):
         self.assertEqual(
             self.store.get_request(stranded)["status"], "failed"
         )
+
+
+class RejectedRowTests(unittest.TestCase):
+    """A rejected row must not be offered the candidates it already refused."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.path = Path(self.temporary.name) / "huey.db"
+        self.store = RequestStore(self.path)
+        self.store.initialize()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def prompted(self, raw="movie: the thing", message_id="10"):
+        request, _ = self.store.create_request(
+            discord_user_id="1", discord_username="kyle", channel_id="2",
+            message_id=message_id, media_type="movies-tv", raw_request=raw,
+            title=raw, author=None,
+            target_key=request_target_key(
+                "movies-tv", parse_request(raw, "movies-tv")
+            ),
+        )
+        request_id = int(request["id"])
+        self.store.transition(request_id, "processing", "Looking up", service="radarr")
+        self.store.create_candidate_confirmation(
+            request_id,
+            [
+                {
+                    "fingerprint": character * 64,
+                    "label": label,
+                    "work_id": f"radarr:tmdb:{tmdb}",
+                    "source_work_ids": [f"radarr:tmdb:{tmdb}"],
+                    "title": "The Thing",
+                    "author": None,
+                    "year": year,
+                    "content_kind": "video",
+                    "media_type": "movies-tv",
+                    "book_type": "movie",
+                }
+                for character, label, tmdb, year in (
+                    ("a", "The Thing (1982)", 1091, 1982),
+                    ("b", "The Thing (2011)", 54580, 2011),
+                )
+            ],
+        )
+        self.store.bind_candidate_prompt(request_id, "5000")
+        return request_id
+
+    def reject(self, request_id):
+        outcome = self.store.reject_candidate_selection(
+            prompt_message_id="5000", reply_message_id="5001",
+            discord_user_id="1", channel_id="2",
+        )
+        self.assertEqual(outcome["outcome"], "rejected")
+        return request_id
+
+    def survey(self, request_id):
+        with closing(redrive_selection.open_readonly(self.path)) as connection:
+            row = next(
+                r for r in redrive_selection.stuck_rows(connection)
+                if int(r["id"]) == request_id
+            )
+        return redrive_selection.survey_row(
+            row, StubbedServices(StubbedRadarr(THE_THING))
+        )
+
+    def test_a_rejected_row_is_reported_not_redriven(self):
+        request_id = self.reject(self.prompted())
+
+        record = self.survey(request_id)
+
+        self.assertEqual(record["outcome"], "rejected_by_requester")
+        self.assertNotIn("rejected_by_requester", redrive_selection.REDRIVABLE)
+        self.assertIn("rejected_by_requester", redrive_selection.TERMINAL)
+
+    def test_a_batch_never_prompts_a_rejected_row(self):
+        request_id = self.reject(self.prompted())
+        poster = FakePoster()
+
+        results = redrive_selection.redrive_batch(
+            self.store,
+            StubbedServices(StubbedRadarr(THE_THING)),
+            channel_id="2", poster=poster, limit=5,
+            pause_seconds=0, sleep=lambda _seconds: None,
+        )
+
+        self.assertEqual(poster.posted, [])
+        self.assertEqual(results[0]["action"], "skipped")
+        self.assertEqual(
+            self.store.get_request(request_id)["status"], "needs_selection"
+        )
+
+    def test_a_row_prompted_again_after_rejection_is_redrivable_once_more(self):
+        """Only the *latest* selection event decides, so a fresh prompt resets it."""
+
+        request_id = self.reject(self.prompted())
+        self.store.transition(request_id, "processing", "Re-driving", service="radarr")
+        self.store.create_candidate_confirmation(
+            request_id,
+            [
+                {
+                    "fingerprint": "c" * 64,
+                    "label": "The Thing (1982)",
+                    "work_id": "radarr:tmdb:1091",
+                    "source_work_ids": ["radarr:tmdb:1091"],
+                    "title": "The Thing", "author": None, "year": 1982,
+                    "content_kind": "video", "media_type": "movies-tv",
+                    "book_type": "movie",
+                }
+            ],
+        )
+        self.store.fail_candidate_prompt(request_id, "Could not deliver the prompt")
+
+        self.assertEqual(self.survey(request_id)["outcome"], "picker")
+
+
+class RejectionThenRerequestTests(unittest.TestCase):
+    """A rejected row must not block the requester trying again."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.store = RequestStore(Path(self.temporary.name) / "huey.db")
+        self.store.initialize()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    @staticmethod
+    def key(raw):
+        return request_target_key("movies-tv", parse_request(raw, "movies-tv"))
+
+    def submit(self, raw, message_id):
+        return self.store.create_request(
+            discord_user_id="1", discord_username="kyle", channel_id="2",
+            message_id=message_id, media_type="movies-tv", raw_request=raw,
+            title=raw, author=None, target_key=self.key(raw),
+        )
+
+    def stuck(self, raw, message_id):
+        request, _ = self.submit(raw, message_id)
+        request_id = int(request["id"])
+        self.store.transition(
+            request_id, "needs_selection", "requester rejected every candidate"
+        )
+        return request_id
+
+    def test_retyping_the_identical_title_is_not_blocked(self):
+        rejected = self.stuck("tv: Brooklyn 99", "500")
+
+        again, created = self.submit("tv: Brooklyn 99", "501")
+
+        self.assertTrue(created)
+        self.assertNotEqual(int(again["id"]), rejected)
+        # The keys really are identical; nothing collided because a rejected
+        # row sits outside the active-target index.
+        self.assertEqual(
+            self.store.get_request(rejected)["target_key"], again["target_key"]
+        )
+        self.store.transition(
+            int(again["id"]), "processing", "Looking up", service="sonarr"
+        )
+        self.assertEqual(
+            self.store.get_request(int(again["id"]))["status"], "processing"
+        )
+
+    def test_retyping_with_better_detail_is_a_different_target(self):
+        rejected = self.stuck("tv: Brooklyn 99", "500")
+
+        better, created = self.submit("tv: Brooklyn Nine-Nine", "501")
+
+        self.assertTrue(created)
+        self.assertNotEqual(
+            self.store.get_request(rejected)["target_key"], better["target_key"]
+        )
+
+    def test_acquiring_the_retyped_row_settles_the_rejected_one(self):
+        rejected = self.stuck("tv: Brooklyn 99", "500")
+        again, _ = self.submit("tv: Brooklyn 99", "501")
+
+        self.store.transition(int(again["id"]), "processing", "Looking up", service="sonarr")
+        self.store.transition(int(again["id"]), "queued", "Added to Sonarr", service="sonarr")
+
+        settled = self.store.get_request(rejected)
+        self.assertEqual(settled["canonical_request_id"], int(again["id"]))
 
 
 if __name__ == "__main__":

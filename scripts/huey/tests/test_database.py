@@ -1392,5 +1392,88 @@ class DuplicateTargetTests(unittest.TestCase):
         self.assertEqual(remaining, [])
 
 
+class RejectionAcrossServicesTests(unittest.TestCase):
+    """Every service sharing the prompt shares the way out of it."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.store = RequestStore(Path(self.temporary.name) / "huey.db")
+        self.store.initialize()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def options(self, media_type, book_type):
+        return [
+            {
+                "fingerprint": character * 64,
+                "label": label,
+                "work_id": work_id,
+                "source_work_ids": [work_id],
+                "title": "Dune",
+                "author": "Frank Herbert",
+                "year": year,
+                "content_kind": "book",
+                "media_type": media_type,
+                "book_type": book_type,
+            }
+            for character, label, work_id, year in (
+                ("a", "Dune (1965)", "hardcover:1", 1965),
+                ("b", "Dune (2019)", "hardcover:2", 2019),
+            )
+        ]
+
+    def reject(self, request_id, prompt="7000", reply="7001"):
+        self.store.bind_candidate_prompt(request_id, prompt)
+        return self.store.reject_candidate_selection(
+            prompt_message_id=prompt, reply_message_id=reply,
+            discord_user_id="1", channel_id="2",
+        )
+
+    def test_an_ebook_rejection_releases_the_cascade_too(self):
+        request, _ = self.store.create_request(
+            discord_user_id="1", discord_username="kyle", channel_id="2",
+            message_id="600", media_type="ebooks",
+            raw_request="Dune by Frank Herbert", title="Dune",
+            author="Frank Herbert", target_key="v1:dune",
+            ebook_backends=["shelfarr", "lazylibrarian"],
+        )
+        request_id = int(request["id"])
+        self.store.begin_ebook_attempt(request_id)
+        self.store.create_candidate_confirmation(
+            request_id, self.options("ebooks", "ebook")
+        )
+
+        outcome = self.reject(request_id)
+
+        self.assertEqual(outcome["outcome"], "rejected")
+        self.assertEqual(
+            self.store.get_request(request_id)["status"], "needs_selection"
+        )
+        # A released prompt must not leave the cascade mid-search.
+        self.assertEqual(self.store.get_ebook_cascade(request_id)["state"], "failed")
+
+    def test_an_audiobook_rejection_releases_a_row_with_no_cascade(self):
+        request, _ = self.store.create_request(
+            discord_user_id="1", discord_username="kyle", channel_id="2",
+            message_id="601", media_type="audiobooks",
+            raw_request="Dune by Frank Herbert", title="Dune",
+            author="Frank Herbert", target_key="v1:dune-audio",
+        )
+        request_id = int(request["id"])
+        self.store.transition(request_id, "processing", "Searching", service="abba")
+        self.store.create_candidate_confirmation(
+            request_id, self.options("audiobooks", "audiobook")
+        )
+
+        outcome = self.reject(request_id, prompt="7100", reply="7101")
+
+        self.assertEqual(outcome["outcome"], "rejected")
+        self.assertEqual(
+            self.store.get_request(request_id)["status"], "needs_selection"
+        )
+        self.assertIsNone(self.store.get_ebook_cascade(request_id))
+
+
 if __name__ == "__main__":
     unittest.main()

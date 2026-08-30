@@ -327,6 +327,7 @@ class RequestStore:
             connection.executescript(schema)
             self._migrate_trusted_notification_outbox(connection)
             self._migrate_candidate_option_kinds(connection)
+            self._migrate_candidate_reply_outcomes(connection)
             self._add_missing_columns(connection)
             connection.execute(
                 "UPDATE requests SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)"
@@ -1029,6 +1030,55 @@ class RequestStore:
                 (max(1, min(int(limit), 1000)),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _migrate_candidate_reply_outcomes(connection: sqlite3.Connection) -> None:
+        """Admit 'rejected' as a recorded reply outcome.
+
+        SQLite cannot alter a CHECK constraint, so the table is rebuilt. The
+        alternative was recording a rejection as 'invalid', which would make
+        the audit trail claim the requester typed nonsense when they answered
+        the question correctly.
+        """
+
+        definition = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'candidate_confirmation_replies'
+            """
+        ).fetchone()
+        if definition is None or "'rejected'" in str(definition["sql"]):
+            return
+        connection.executescript(
+            """
+            CREATE TABLE candidate_confirmation_replies_migrated (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                confirmation_id INTEGER NOT NULL,
+                reply_message_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                discord_user_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                outcome TEXT NOT NULL CHECK (
+                    outcome IN (
+                        'claimed', 'invalid', 'expired', 'duplicate', 'rejected'
+                    )
+                ),
+                FOREIGN KEY(confirmation_id)
+                    REFERENCES candidate_confirmations(id) ON DELETE CASCADE
+            );
+            INSERT INTO candidate_confirmation_replies_migrated (
+                id, confirmation_id, reply_message_id, created_at,
+                discord_user_id, channel_id, ordinal, outcome
+            )
+            SELECT id, confirmation_id, reply_message_id, created_at,
+                   discord_user_id, channel_id, ordinal, outcome
+            FROM candidate_confirmation_replies;
+            DROP TABLE candidate_confirmation_replies;
+            ALTER TABLE candidate_confirmation_replies_migrated
+                RENAME TO candidate_confirmation_replies;
+            """
+        )
 
     @staticmethod
     def _migrate_candidate_option_kinds(connection: sqlite3.Connection) -> None:
@@ -4497,6 +4547,187 @@ class RequestStore:
                 "SELECT * FROM requests WHERE id = ?", (request["id"],)
             ).fetchone()
             return self._selection_claim_result("claimed", request, option)
+
+    def reject_candidate_selection(
+        self,
+        *,
+        prompt_message_id: str | int,
+        reply_message_id: str | int,
+        discord_user_id: str | int,
+        channel_id: str | int,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Release a prompt the requester answered with 'none of these'.
+
+        This is an answer, not a delivery failure, so it carries the same
+        authorization as a claim: the same requester, in the same channel,
+        with the reply recorded so a Discord redelivery cannot replay it. The
+        row returns to ``needs_selection`` at once rather than waiting out its
+        TTL, and the prompt becomes terminal so a later, better-informed
+        request can prompt again.
+        """
+
+        prompt_id = self._discord_snowflake(prompt_message_id)
+        reply_id = self._discord_snowflake(reply_message_id)
+        if prompt_id is None:
+            return self._selection_claim_result("not_found", None)
+        observed_at = _selection_timestamp(now)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            joined = connection.execute(
+                """
+                SELECT candidate_confirmations.id AS confirmation_id,
+                       candidate_confirmations.status AS confirmation_status,
+                       candidate_confirmations.expires_at,
+                       requests.*
+                FROM candidate_confirmations
+                JOIN requests ON requests.id = candidate_confirmations.request_id
+                WHERE candidate_confirmations.prompt_message_id = ?
+                """,
+                (prompt_id,),
+            ).fetchone()
+            if joined is None:
+                return self._selection_claim_result("not_found", None)
+
+            request = {
+                key: joined[key]
+                for key in joined.keys()
+                if key not in {"confirmation_id", "confirmation_status", "expires_at"}
+            }
+            confirmation_id = int(joined["confirmation_id"])
+
+            def record(outcome: str) -> None:
+                if reply_id is None:
+                    return
+                connection.execute(
+                    """
+                    INSERT INTO candidate_confirmation_replies (
+                        confirmation_id, reply_message_id, created_at,
+                        discord_user_id, channel_id, ordinal, outcome
+                    ) VALUES (?, ?, ?, ?, ?, 0, ?)
+                    """,
+                    (
+                        confirmation_id,
+                        reply_id,
+                        observed_at,
+                        str(discord_user_id),
+                        str(channel_id),
+                        outcome,
+                    ),
+                )
+
+            existing_reply = (
+                connection.execute(
+                    "SELECT 1 FROM candidate_confirmation_replies "
+                    "WHERE reply_message_id = ?",
+                    (reply_id,),
+                ).fetchone()
+                if reply_id is not None
+                else None
+            )
+            if existing_reply is not None:
+                return self._selection_claim_result("duplicate", request)
+            if str(joined["confirmation_status"]) == "claimed":
+                # The requester already chose. A late rejection must not undo
+                # an acquisition which is already under way.
+                record("duplicate")
+                return self._selection_claim_result("duplicate", request)
+
+            identity_valid = bool(
+                reply_id is not None
+                and str(discord_user_id) == str(joined["discord_user_id"])
+                and str(channel_id) == str(joined["channel_id"])
+            )
+            if not identity_valid:
+                record("invalid")
+                return self._selection_claim_result("invalid", request)
+
+            if str(joined["confirmation_status"]) == "expired":
+                record("expired")
+                return self._selection_claim_result("expired", request)
+            if (
+                str(joined["confirmation_status"]) != "pending"
+                or request["status"] != "awaiting_selection"
+            ):
+                record("invalid")
+                return self._selection_claim_result("invalid", request)
+            if str(joined["expires_at"]) <= observed_at:
+                # Already gone by the clock. Release it on the expiry path so
+                # the requester gets the expiry wording, not an acceptance.
+                message = "Candidate confirmation expired; submit the request again."
+                connection.execute(
+                    """
+                    UPDATE candidate_confirmations
+                    SET status = 'expired', updated_at = ?, failure_message = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (observed_at, message, confirmation_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE requests
+                    SET status = 'needs_selection', updated_at = ?, error = ?
+                    WHERE id = ? AND status = 'awaiting_selection'
+                    """,
+                    (observed_at, message, request["id"]),
+                )
+                self._close_released_ebook_cascade(connection, int(request["id"]))
+                connection.execute(
+                    "INSERT INTO events (request_id, event_type, message) "
+                    "VALUES (?, ?, ?)",
+                    (request["id"], "selection_expired", message),
+                )
+                record("expired")
+                request = connection.execute(
+                    "SELECT * FROM requests WHERE id = ?", (request["id"],)
+                ).fetchone()
+                return self._selection_claim_result("expired", request)
+
+            message = (
+                "The requester rejected every offered candidate; none of them "
+                "was the work they asked for."
+            )
+            connection.execute(
+                """
+                UPDATE candidate_confirmations
+                SET status = 'failed', updated_at = ?, failure_message = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (observed_at, message, confirmation_id),
+            )
+            connection.execute(
+                """
+                UPDATE requests
+                SET status = 'needs_selection', updated_at = ?, error = ?
+                WHERE id = ? AND status = 'awaiting_selection'
+                """,
+                (observed_at, message, request["id"]),
+            )
+            self._close_released_ebook_cascade(connection, int(request["id"]))
+            # The durable record that re-prompting this row with the same
+            # candidates is pointless. ``redrive_selection`` reads it so a
+            # backfill cannot offer the rejected options straight back.
+            connection.execute(
+                "INSERT INTO events (request_id, event_type, message) VALUES (?, ?, ?)",
+                (request["id"], "selection_rejected", message),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO notification_deliveries (
+                    request_id, event_key, route, message
+                ) VALUES (?, 'request_rejected', 'request-status', ?)
+                """,
+                (
+                    request["id"],
+                    f"⚠️ Request #{request['id']} needs clarification: "
+                    "no offered candidate matched.",
+                ),
+            )
+            record("rejected")
+            request = connection.execute(
+                "SELECT * FROM requests WHERE id = ?", (request["id"],)
+            ).fetchone()
+            return self._selection_claim_result("rejected", request)
 
     def mark_candidate_dispatch_started(
         self, request_id: int, *, now: datetime | None = None

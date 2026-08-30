@@ -144,6 +144,50 @@ is now reset instead. One row per request stays a schema invariant —
 `request_id` and `shelfarr_correlation` are both `UNIQUE` — so a second prompt
 reuses the row rather than adding one.
 
+## Rejecting a picker: the token is `n`, and it could not be `0`
+
+A picker had no way to say "none of these". Request #113, `Tv: Brooklyn 99`,
+was offered Brooklyn DA (2013), Brooklyn 11223 (2012) and Brooklyn South
+(1997); any number acquires the wrong show, and the only escape was to let the
+prompt expire in silence.
+
+**`0` was not available.** `_SELECTION_ORDINAL` is `^[1-9][0-9]*$`, so
+`_selection_ordinal` already returns `0` for *every* unreadable reply —
+`"0"`, `"banana"`, `""`, `"0001"`, `" 1"`, overlong digits. Spending `0` on
+rejection would turn every typo into a silent release unless the sentinel were
+changed to `-1` and every call site re-audited, including the guard that stops
+a bare token becoming a standalone request. `n`/`no`/`none` occupy a disjoint
+token space and leave the ordinal contract alone. The same guard now covers
+bare rejection tokens too: in the book channels `no` parses as a title and
+reserves a real target key.
+
+`reject_candidate_selection` carries a claim's full authorization — same
+requester, same channel, reply ID recorded — because it is an answer, not a
+delivery failure. The row returns to `needs_selection` immediately, the prompt
+goes terminal so a better-informed request can prompt again, and a late
+rejection after a claim is a no-op rather than an undo.
+
+**A rejection is recorded as `rejected`, not `invalid`.** That needed a rebuild
+of `candidate_confirmation_replies`, whose CHECK could not be altered in place
+(`_migrate_candidate_reply_outcomes`, guarded on the stored table SQL so it is
+idempotent). Folding it into `invalid` would make the audit trail say the
+requester typed nonsense when they answered correctly.
+
+**The `selection_rejected` event is what stops the loop.** A rejected row goes
+back to `needs_selection`, which is exactly what the backfill re-drives — so
+without a durable record, batch two offers the identical three wrong shows
+again. `redrive_selection` classifies a row whose *latest* selection event is a
+rejection as `rejected_by_requester` and never prompts it. Latest, not any:
+a fresh prompt afterwards makes the row re-drivable once more. Confirmation
+status alone cannot carry this, because a rejection and an undeliverable prompt
+both land on `failed` and only the latter should be re-driven.
+
+A rejected row does **not** block a retry. `needs_selection` sits outside the
+active-target index, so retyping the identical string creates a new row with
+the identical `target_key` and proceeds normally; retyping with better detail
+is a different target anyway. If the retyped row is acquired, the sweep aliases
+the rejected row onto it.
+
 ## Duplicate rows for one exact target
 
 `requests_active_target_uq` is UNIQUE on `target_key` across the *active*

@@ -64,6 +64,16 @@ _DEWEY_TRUSTED_NONCE = re.compile(r"\Adewey:v1:[A-Za-z0-9_-]{16}\Z")
 # Channels whose ambiguity is resolved by a numbered candidate prompt. A bare
 # number in one of these is a selection token rather than a standalone title.
 _SELECTION_MEDIA_TYPES = frozenset({"ebooks", "audiobooks", "movies-tv"})
+# "None of these" needs a token the ordinal parser cannot already produce.
+# ``_SELECTION_ORDINAL`` is ^[1-9][0-9]*$, so 0 is what _selection_ordinal
+# already returns for every unreadable reply -- "banana", "", "0001". Spending
+# 0 on rejection would turn every typo into a silent release, so rejection
+# gets its own disjoint token space instead.
+_SELECTION_REJECTIONS = frozenset({"n", "no", "none"})
+
+
+def _is_selection_rejection(content: object) -> bool:
+    return str(content or "").strip().casefold() in _SELECTION_REJECTIONS
 
 
 def write_ready_marker(path: str | Path) -> None:
@@ -159,7 +169,7 @@ def format_candidate_prompt(
             f"Type: {media_type}\n"
             f"Did you mean {labels[0]}?\n"
             "Use Discord's Reply action on this message, then send 1 to confirm "
-            f"within {minutes} minute{plural}."
+            f"within {minutes} minute{plural}, or n if that is not it."
         )
     service = str(response.get("service") or "").casefold()
     if service in {"radarr", "sonarr"}:
@@ -175,7 +185,7 @@ def format_candidate_prompt(
         + "\n".join(lines)
         + f"\nUse Discord's Reply action on this message, then send one number within {minutes} minute"
         + plural
-        + "."
+        + ", or n if none of these match."
     )
 
 
@@ -238,11 +248,16 @@ async def _reply_targets_huey_candidate_prompt(
             " needs one metadata choice\n" in content
             or " needs one audiobook choice\n" in content
             or " needs one title choice\n" in content
+            # A single-option prompt is a confirmation, not a choice, and was
+            # missing here: a stale one never got the "not active" correction.
+            or " needs one confirmation\n" in content
         )
         and (
             "\nUse Discord's Reply action on this message, then send one number within "
             in content
             or "\nReply directly to this message with one number within " in content
+            or "\nUse Discord's Reply action on this message, then send 1 to confirm "
+            in content
         )
     )
 
@@ -259,12 +274,20 @@ def selection_correction(outcome: str, request_id: object = None) -> str:
             "⚠️ That Huey candidate-choice prompt is not active. "
             "Submit the title as a new standalone message to start another search."
         )
+    if outcome == "rejected":
+        return (
+            f"👍 Dropped request #{request_id}. None of those matched — send the "
+            "title again with more detail (a year, or the full name)."
+            if request_id is not None
+            else "👍 Dropped that request. None of those matched — send the title "
+            "again with more detail (a year, or the full name)."
+        )
     if outcome == "unreferenced":
         return (
-            "⚠️ Huey did not apply that number because it was not sent with "
+            "⚠️ Huey did not apply that reply because it was not sent with "
             "Discord's Reply action on a candidate-choice prompt. Use Reply on the "
-            "Huey prompt and send one listed whole number; if the prompt expired, "
-            "submit the title again."
+            "Huey prompt and send one listed whole number, or n for none of them; "
+            "if the prompt expired, submit the title again."
         )
     return (
         f"⚠️ That is not a valid choice{suffix}. "
@@ -1883,6 +1906,7 @@ def build_client(
 
         prompt_message_id = _reply_reference_message_id(message)
         if prompt_message_id is not None:
+            rejected = _is_selection_rejection(message.content)
             selection_delivery = {
                 **delivery,
                 "prompt_message_id": prompt_message_id,
@@ -1890,7 +1914,10 @@ def build_client(
             }
             try:
                 selection_response = await asyncio.to_thread(
-                    processor.process_candidate_reply, selection_delivery
+                    processor.process_candidate_rejection
+                    if rejected
+                    else processor.process_candidate_reply,
+                    selection_delivery,
                 )
             except Exception as error:
                 LOGGER.error(
@@ -1913,6 +1940,19 @@ def build_client(
                 selection_response.get("selection_outcome") or "not_found"
             )
             if selection_outcome == "duplicate":
+                return
+            if selection_outcome == "rejected":
+                try:
+                    await message.reply(
+                        selection_correction(
+                            "rejected", selection_response.get("request_id")
+                        )
+                    )
+                except Exception as error:
+                    LOGGER.warning(
+                        "Could not acknowledge a candidate rejection (%s)",
+                        type(error).__name__,
+                    )
                 return
             if selection_outcome in {"invalid", "expired"}:
                 try:
@@ -1956,10 +1996,15 @@ def build_client(
         # recorded choice without its message reference: the durable reply-ID
         # lookup above normally coalesces it, and this guard prevents a race from
         # ever dispatching a separate request whose title is merely "1".
+        # A bare rejection token is no safer than a bare ordinal: in the book
+        # channels "no" parses as a title and reserves a real target key.
         if (
             prompt_message_id is None
             and media_type in _SELECTION_MEDIA_TYPES
-            and _selection_ordinal(message.content) in {1, 2, 3}
+            and (
+                _selection_ordinal(message.content) in {1, 2, 3}
+                or _is_selection_rejection(message.content)
+            )
         ):
             try:
                 await message.reply(selection_correction("unreferenced"))
