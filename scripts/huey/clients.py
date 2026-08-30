@@ -2742,6 +2742,38 @@ class AbbaClient(JsonClient):
                 break
         return tuple(values) if len(values) >= 2 else ()
 
+    def _indistinguishable_band(self, selection: Any) -> tuple[Any, ...]:
+        """Return the tied releases when they all render one identical label.
+
+        An ambiguous selection means every tied release cleared the confidence
+        floor, so they agree on the work. When they also render the same label
+        they agree on everything Huey can see -- title, author, narrator, year,
+        format, edition, size -- and the only disagreement left is over which
+        upload, not which book. The confidence gate exists to stop Huey picking
+        the wrong work; it was never meant to stop it picking between two
+        copies of the right one. Offering the requester two identical lines
+        asks them to break a tie on information nobody has.
+        """
+
+        if selection.reason != "ambiguous" or not selection.ranked:
+            return ()
+        top_score = selection.ranked[0].score
+        band = [
+            ranked
+            for ranked in selection.ranked
+            if ranked.score >= self.minimum_confidence
+            and top_score - ranked.score < self.runner_up_gap
+        ]
+        if len(band) < 2:
+            return ()
+        labels = set()
+        for ranked in band:
+            try:
+                labels.add(str(self._candidate_snapshot(ranked.item)["label"]))
+            except ServiceError:
+                return ()
+        return tuple(band) if len(labels) == 1 else ()
+
     @classmethod
     def _job_payload(
         cls,
@@ -3017,6 +3049,20 @@ class AbbaClient(JsonClient):
                     service="abba",
                     selection_proposal=proposal,
                 )
+            # Only once no real choice exists: a tie nobody can break is
+            # settled by taking the top-ranked listing and saying how many
+            # were identical. Deliberately not applied to a low-confidence
+            # decline, where the work itself is still unproven.
+            identical = self._indistinguishable_band(selection)
+            if identical:
+                grabbed = self._grab_candidate(
+                    self._candidate_snapshot(identical[0].item),
+                    int(request_id),
+                    before_create=before_create,
+                )
+                if grabbed.get("status") == "queued":
+                    grabbed["duplicate_listings"] = len(identical)
+                return grabbed
             if selection.reason == "no_results":
                 message = "ABBA found no matching audiobook. Check the title and author."
                 decline = "selection_no_results"

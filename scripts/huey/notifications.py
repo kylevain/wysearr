@@ -400,6 +400,10 @@ def response_notifications(
             # names the decline reason. Flattening it here is what made all
             # three reasons read identically in the lifecycle channel.
             neutral.pop("needs_selection")
+        if status == "queued" and int(response.get("duplicate_listings") or 0) > 1:
+            # Same reasoning: the neutral sentence is already in the message,
+            # and it is the only place the duplicate count is stated.
+            neutral.pop("queued")
         response_detail = neutral.get(status, response_detail)
 
     if status == "awaiting_selection":

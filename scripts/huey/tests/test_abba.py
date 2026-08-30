@@ -20,7 +20,7 @@ from clients import (
 from database import RequestStore
 from huey import reconcile_abba_requests
 from orchestrator import RequestProcessor
-from results import result
+from results import SELECTION_DECLINE_STATUSES, result
 from services import ServiceRegistry
 
 
@@ -605,17 +605,89 @@ class AbbaPickerTests(unittest.TestCase):
         self.assertEqual(queued["status"], "queued")
         self.assertEqual(self.submit(*self.SUBTITLED)["status"], "awaiting_selection")
 
+    def test_two_identical_listings_are_settled_rather_than_offered(self):
+        # Both real ABB hits for this book are titled exactly "Leaders Eat Last
+        # - Simon Sinek", both MP3, and /api/search exposes no size, bitrate, or
+        # uploader to tell them apart. The requester has nothing to choose on.
+        first = "abba:" + f"{1:064x}"
+        session = ScriptedSession(
+            search_response(
+                release(1, "Leaders Eat Last - Simon Sinek"),
+                release(2, "Leaders Eat Last - Simon Sinek"),
+            ),
+            status_missing(),
+            grab_response(candidate_id=first),
+        )
+        response = AbbaClient("http://abba:8080", session=session).submit(
+            "audiobooks", "Leaders Eat Last", None, 42
+        )
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["duplicate_listings"], 2)
+        # The highest-ranked listing, and exactly one grab.
+        self.assertEqual(sum(call[1].endswith("/api/grab") for call in session.calls), 1)
+
+    def test_a_real_alternative_is_offered_rather_than_settled(self):
+        response = self.submit(
+            "Leaders Eat Last - Simon Sinek",
+            "Leaders Eat Last - Simon Sinek",
+            "Leaders Eat Last",
+        )
+
+        self.assertEqual(response["status"], "awaiting_selection")
+        self.assertEqual(len(response["selection_proposal"]), 2)
+        # Nothing was acquired: a genuine choice still belongs to the requester.
+        self.assertEqual(len(self.session.calls), 1)
+
+    def test_identical_listings_below_the_confidence_floor_are_never_settled(self):
+        # Same collapse, but the work itself is unproven. Auto-picking here is
+        # exactly the wrong-work risk the confidence gate exists to prevent.
+        response = self.submit(LEADERS, LEADERS)
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["external_status"], "selection_low_confidence")
+        self.assertEqual(len(self.session.calls), 1)
+
     def test_each_decline_reason_is_recorded_on_the_result(self):
+        # selection_ambiguous is not listed: an ambiguous band whose labels
+        # collapse is now settled automatically, and one whose labels differ
+        # becomes a picker. It survives only as a defensive mapping, covered by
+        # AudiobookDeclineMessageTests.
         cases = (
             ((), "selection_no_results"),
             (("Something Entirely Different",), "selection_low_confidence"),
-            (("Leaders Eat Last", "Leaders Eat Last"), "selection_ambiguous"),
         )
         for titles, expected in cases:
             with self.subTest(expected=expected):
                 response = self.submit(*titles)
                 self.assertEqual(response["status"], "needs_selection")
                 self.assertEqual(response["external_status"], expected)
+
+
+class AudiobookDeclineMessageTests(unittest.TestCase):
+    """Every decline reason gets its own backend-neutral sentence."""
+
+    def rendered(self, external_status):
+        return RequestProcessor._generic_audiobook_result(
+            result(
+                "needs_selection",
+                "ABBA found no audiobook with enough confidence.",
+                service="abba",
+                external_status=external_status,
+            )
+        )["message"]
+
+    def test_every_reason_maps_to_its_own_sentence(self):
+        sentences = {
+            status: self.rendered(status) for status in SELECTION_DECLINE_STATUSES
+        }
+
+        self.assertEqual(len(set(sentences.values())), len(SELECTION_DECLINE_STATUSES))
+        for sentence in sentences.values():
+            self.assertNotIn("abba", sentence.casefold())
+
+    def test_an_unmarked_decline_keeps_the_generic_sentence(self):
+        self.assertIn("could not prove one exact", self.rendered(None))
 
 
 class AbbaPersistenceTests(unittest.TestCase):
@@ -1207,11 +1279,6 @@ class AbbaRoutingAndRecoveryTests(unittest.TestCase):
                 (release(1, "Something Entirely Different"),),
                 "selection_low_confidence",
             ),
-            (
-                "The Twin Book",
-                (release(1, "The Twin Book"), release(2, "The Twin Book")),
-                "selection_ambiguous",
-            ),
         )
         messages = {}
         for index, (title, results, expected) in enumerate(cases):
@@ -1235,7 +1302,27 @@ class AbbaRoutingAndRecoveryTests(unittest.TestCase):
                 self.assertNotIn("abba", response["message"].casefold())
                 messages[expected] = response["message"]
 
-        self.assertEqual(len(set(messages.values())), 3, messages)
+        self.assertEqual(len(set(messages.values())), 2, messages)
+
+    def test_settled_duplicates_are_stated_to_the_requester(self):
+        first = "abba:" + f"{1:064x}"
+        session = ScriptedSession(
+            search_response(
+                release(1, "Leaders Eat Last - Simon Sinek"),
+                release(2, "Leaders Eat Last - Simon Sinek"),
+            ),
+            status_missing(),
+            grab_response(request_id=1, candidate_id=first),
+        )
+        response = self.abba_processor(session).process(
+            {**self.delivery, "message_id": "400", "content": "Leaders Eat Last"}
+        )
+
+        self.assertEqual(response["status"], "queued")
+        self.assertIn("2 identical", response["message"])
+        self.assertNotIn("abba", response["message"].casefold())
+        # The lifecycle channel says it too, instead of the flattened sentence.
+        self.assertIn("2 identical", self.lifecycle_text(response["request_id"]))
 
     def test_low_confidence_intake_persists_a_candidate_prompt(self):
         session = ScriptedSession(

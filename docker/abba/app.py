@@ -1358,8 +1358,13 @@ class Journal:
 
 
 def _parse_size_bytes(value: str) -> int | None:
+    # AudioBookBay pluralises: "File Size: 271.11 MBs". Requiring a word
+    # boundary straight after the unit dropped every size the site publishes,
+    # which is what left two listings for one book rendering an identical
+    # label. The trailing "s" is optional and the unit list stays explicit, so
+    # "Bitrate: 64 Kbps" still cannot be read as a size.
     match = re.search(
-        r"(?i)\b(\d+(?:\.\d+)?)\s*(B|KB|KIB|MB|MIB|GB|GIB|TB|TIB)\b", value
+        r"(?i)\b(\d+(?:\.\d+)?)\s*(B|KB|KIB|MB|MIB|GB|GIB|TB|TIB)s?\b", value
     )
     if not match:
         return None

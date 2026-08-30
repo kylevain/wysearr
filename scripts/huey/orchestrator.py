@@ -302,7 +302,13 @@ class RequestProcessor:
                 "is allowed."
             )
         elif status == "queued":
-            message = "Found an audiobook match and queued it for download."
+            duplicates = int(normalized.get("duplicate_listings") or 0)
+            message = (
+                f"Found {duplicates} identical audiobook listings and queued one "
+                "of them for download."
+                if duplicates > 1
+                else "Found an audiobook match and queued it for download."
+            )
         elif status == "completed":
             message = "This exact audiobook is already available in the library workflow."
         elif status == "needs_selection":

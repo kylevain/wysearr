@@ -909,6 +909,21 @@ class JournalTests(AdapterTestCase):
         self.assertEqual(candidate_ids, [new_id])
 
 
+class SizeParsingTests(unittest.TestCase):
+    def test_units_are_read_singular_or_plural_and_bitrates_are_not(self) -> None:
+        for text, expected in (
+            ("File Size: 271.11 MBs", int(271.11 * 1024**2)),
+            ("File Size: 271.11 MB", int(271.11 * 1024**2)),
+            ("File Size: 1.2 GBs", int(1.2 * 1024**3)),
+            ("File Size: 700.5MBs", int(700.5 * 1024**2)),
+            ("Size: 1 GiB", 1024**3),
+            ("Bitrate: 64 Kbps", None),
+            ("Bitrate: 128 kbps\nFile Size: 271.11 MBs", int(271.11 * 1024**2)),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(adapter._parse_size_bytes(text), expected)
+
+
 class ABBClientTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -949,6 +964,35 @@ class ABBClientTests(unittest.TestCase):
         self.assertEqual(value["author"], "Example Author")
         self.assertEqual(value["size_bytes"], 1024**3)
         self.assertNotIn("url", value)
+
+    def test_search_parses_the_plural_size_audiobookbay_publishes(self) -> None:
+        # The site writes "MBs"/"GBs". Requiring a word boundary straight after
+        # the unit dropped every size it publishes, which left two listings for
+        # one book rendering an identical label and no way to choose between
+        # them.
+        plural = (
+            '<div class="post"><div class="postTitle"><h2>'
+            f'<a href="{PATH_A}">Example Book</a></h2></div>'
+            "<div>Format: MP3\nBitrate: 64 Kbps\nFile Size: 271.11 MBs</div></div>"
+        )
+        value = self.client(FakeResponse(self.search_html(plural))).search(
+            "Example Book", None, 10
+        )[0].public_dict()
+
+        self.assertEqual(value["size_bytes"], int(271.11 * 1024**2))
+        self.assertEqual(value["format"], "MP3")
+
+    def test_a_bitrate_is_never_read_as_a_size(self) -> None:
+        no_size = (
+            '<div class="post"><div class="postTitle"><h2>'
+            f'<a href="{PATH_A}">Example Book</a></h2></div>'
+            "<div>Format: MP3\nBitrate: 64 Kbps</div></div>"
+        )
+        value = self.client(FakeResponse(self.search_html(no_size))).search(
+            "Example Book", None, 10
+        )[0].public_dict()
+
+        self.assertNotIn("size_bytes", value)
 
     def test_search_accepts_current_abss_result_paths(self) -> None:
         path = "/abss/the-yellow-wallpaper/"

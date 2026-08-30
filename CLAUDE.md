@@ -138,6 +138,24 @@ downstream then scores against a title that contains an author, so any release
 whose name does not also repeat the author is penalised — the correct book
 scores 0.401 where the same book scores 0.484 when the author is parsed out.
 
+## What AudioBookBay listings actually look like
+
+Verified against `/api/search` on 2026-08-29, not modelled. Post titles are
+bare `Title - Author` with no subtitle — `Leaders Eat Last - Simon Sinek` —
+which is why a title-only request lands in the *ambiguous* band (>=0.82) and
+never in `low_confidence`. The post block carries `Format:` and `Bitrate:` but
+no `Author:`, `Narrator:`, `Year:`, or `Edition:` line, so every one of those
+fields comes back null. Do not model ABB results as subtitled catalogue
+titles; that assumption produced a fix that passed its tests and failed in
+Discord.
+
+Two listings for one book can therefore be identical in every field Huey can
+see. `AbbaClient._indistinguishable_band` settles that case by taking the
+top-ranked listing and reporting the count, rather than offering a choice
+nobody has information to make. It is deliberately restricted to `ambiguous`:
+in `low_confidence` the work itself is unproven, and auto-picking there is the
+wrong-work risk the confidence gate exists to prevent.
+
 `AbbaClient.PICKER_MIN_TITLE_SCORE` is 0.40 rather than ARR's 0.45 to
 accommodate exactly that, and `PICKER_MIN_TITLE_RECALL` exists because the same
 unparsed author lets an unrelated book by that author score 0.57. **Both

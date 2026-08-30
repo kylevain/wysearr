@@ -191,6 +191,7 @@ def result(
     selection_proposal: object = (),
     backend_outcome: str | None = None,
     resolved_identity: object = None,
+    duplicate_listings: int = 0,
 ) -> dict[str, Any]:
     if status not in RESULT_STATUSES:
         raise ValueError(f"Invalid handler result status: {status}")
@@ -203,6 +204,18 @@ def result(
         raise ValueError("Only awaiting-selection results may include candidates")
     if backend_outcome is not None and backend_outcome not in BACKEND_OUTCOMES:
         raise ValueError(f"Invalid backend outcome: {backend_outcome}")
+    # How many listings the backend could not tell apart from the one it took.
+    # A tie the requester has no information to break is not a question worth
+    # asking, but it is worth saying out loud, and the requester-facing
+    # sentence is rewritten downstream -- so the count has to travel as state.
+    if (
+        isinstance(duplicate_listings, bool)
+        or not isinstance(duplicate_listings, int)
+        or duplicate_listings < 0
+    ):
+        raise ValueError("Duplicate listing counts must be a non-negative integer")
+    if duplicate_listings and status != "queued":
+        raise ValueError("Only a queued result may report duplicate listings")
     identity = _normalize_resolved_identity(resolved_identity)
     return {
         "status": status,
@@ -215,6 +228,7 @@ def result(
         "selection_proposal": proposal,
         "backend_outcome": backend_outcome,
         "resolved_identity": identity,
+        "duplicate_listings": int(duplicate_listings),
     }
 
 
@@ -232,4 +246,5 @@ def normalize_result(value: Any) -> dict[str, Any]:
         selection_proposal=value.get("selection_proposal", ()),
         backend_outcome=value.get("backend_outcome"),
         resolved_identity=value.get("resolved_identity"),
+        duplicate_listings=value.get("duplicate_listings") or 0,
     )
