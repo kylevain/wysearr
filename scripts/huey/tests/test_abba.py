@@ -11,6 +11,8 @@ import requests
 HUEY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HUEY_ROOT))
 
+from matching import RankedCandidate, Selection
+
 from clients import (
     AbbaClient,
     CanonicalAcquisition,
@@ -708,6 +710,107 @@ class AbbaPickerTests(unittest.TestCase):
         self.assertEqual(response["external_status"], "selection_low_confidence")
         self.assertEqual(len(self.session.calls), 1)
 
+    def test_a_lone_release_that_cleared_the_bar_is_a_confirmation(self):
+        # Constructed, not searched. No live ABB result set reaches this today:
+        # a lone survivor above 0.82 needs a tie whose rivals the picker gates
+        # drop, and a rival within 0.08 of 0.82 always clears those gates --
+        # except by rendering one identical label, which the indistinguishable
+        # band settles before this rule is consulted. The rule is here because
+        # it is the policy, and because scoring changes make it reachable; the
+        # assertion is that a proved lone release becomes a question rather
+        # than a dead end.
+        client = AbbaClient("http://abba:8080")
+        ranked = (
+            RankedCandidate(
+                item=release(1, "Leaders Eat Last - Simon Sinek"),
+                score=0.90,
+                seeders=0,
+                stable_key="abba:" + f"{1:064x}",
+            ),
+            RankedCandidate(
+                item=release(2, "Something Else Entirely"),
+                score=0.85,
+                seeders=0,
+                stable_key="abba:" + f"{2:064x}",
+            ),
+        )
+        proposal = client._selection_proposal(
+            "Leaders Eat Last", None, Selection(None, "ambiguous", ranked)
+        )
+
+        self.assertEqual(
+            [option["label"] for option in proposal],
+            ["Leaders Eat Last - Simon Sinek"],
+        )
+
+    def test_a_constructed_lone_release_under_the_bar_stays_out(self):
+        client = AbbaClient("http://abba:8080")
+        ranked = (
+            RankedCandidate(
+                item=release(1, "Leaders Eat Last - Simon Sinek"),
+                score=client.minimum_confidence - 0.001,
+                seeders=0,
+                stable_key="abba:" + f"{1:064x}",
+            ),
+        )
+
+        self.assertEqual(
+            client._selection_proposal(
+                "Leaders Eat Last", None, Selection(None, "low_confidence", ranked)
+            ),
+            (),
+        )
+
+    def test_a_lone_release_below_the_automatic_bar_is_not_offered(self):
+        # Request #288's live shape, verified against /api/search on
+        # 2026-08-29: the correct release scores 0.767 on its title and 0.8182
+        # blended -- eighteen ten-thousandths under ABBA's 0.82 bar. One option
+        # below the bar is a confirmation of a work Huey has not proved, and
+        # "did you mean X?" with no rival to compare X against invites the
+        # agreement rather than the judgement. The picker still offers releases
+        # this weak, because two options ask for a judgement.
+        response = self.submit(
+            "Kaiju: Battlefield Surgeon: A LitRPG Adventure - Matt Dinniman",
+            "Matt Dinniman Audio Book Collection",
+            title="Kaiju: Battlefield Surgeon",
+            author="Matt Dinniman",
+        )
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["external_status"], "selection_low_confidence")
+
+    def test_an_unevidenced_author_still_blocks_a_lone_confirmation(self):
+        # The floor reads the blend, not the title, and this is why: an exact
+        # title on a post that names Brian Herbert is 1.000 on the title and
+        # 0.780 blended. The 0.22 the blend withholds is the only signal that
+        # the post is somebody else's Dune.
+        response = self.submit(
+            "Brian Herbert - Dune", title="Dune", author="Frank Herbert"
+        )
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["selection_proposal"], ())
+
+    def test_identical_listings_are_settled_rather_than_confirmed(self):
+        # The lone rule must not undo the indistinguishable band: two copies of
+        # one label collapse to a single option, and "did you mean X?" asked of
+        # two identical X's is the question the band rule already declined.
+        first = "abba:" + f"{1:064x}"
+        session = ScriptedSession(
+            search_response(
+                release(1, "Leaders Eat Last - Simon Sinek"),
+                release(2, "Leaders Eat Last - Simon Sinek"),
+            ),
+            status_missing(),
+            grab_response(candidate_id=first),
+        )
+        response = AbbaClient("http://abba:8080", session=session).submit(
+            "audiobooks", "Leaders Eat Last", None, 42
+        )
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["duplicate_listings"], 2)
+
     def test_each_decline_reason_is_recorded_on_the_result(self):
         # selection_ambiguous is not listed: an ambiguous band whose labels
         # collapse is now settled automatically, and one whose labels differ
@@ -748,6 +851,35 @@ class AudiobookDeclineMessageTests(unittest.TestCase):
 
     def test_an_unmarked_decline_keeps_the_generic_sentence(self):
         self.assertIn("could not prove one exact", self.rendered(None))
+
+    def test_one_option_is_described_as_a_confirmation(self):
+        option = {
+            "fingerprint": "a" * 64,
+            "label": "Leaders Eat Last - Simon Sinek",
+            "work_id": "abba:" + "b" * 64,
+            "source_work_ids": ("abba:" + "b" * 64,),
+            "title": "Leaders Eat Last - Simon Sinek",
+            "author": None,
+            "year": None,
+            "content_kind": "book",
+            "media_type": "audiobooks",
+            "book_type": "audiobook",
+        }
+
+        def rendered(*options):
+            return RequestProcessor._generic_audiobook_result(
+                result(
+                    "awaiting_selection",
+                    "ABBA found close audiobook matches.",
+                    service="abba",
+                    selection_proposal=options,
+                )
+            )["message"]
+
+        second = {**option, "fingerprint": "c" * 64, "work_id": "abba:" + "d" * 64}
+        second["source_work_ids"] = (second["work_id"],)
+        self.assertIn("one close audiobook match", rendered(option))
+        self.assertIn("Choose one", rendered(option, second))
 
 
 class AbbaPersistenceTests(unittest.TestCase):

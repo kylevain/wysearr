@@ -327,9 +327,14 @@ class RequestProcessor:
         status = normalized["status"]
         uncertain = normalized.get("external_status") == "submission_uncertain"
         if status == "awaiting_selection":
+            # One option is a confirmation, not a choice; saying "choose one"
+            # of a single line describes a prompt the requester is not seeing.
             message = (
-                "Huey found multiple close audiobook matches. Choose one verified "
-                "title before acquisition starts."
+                "Huey found one close audiobook match. Confirm it before "
+                "acquisition starts."
+                if len(normalized.get("selection_proposal") or ()) == 1
+                else "Huey found multiple close audiobook matches. Choose one "
+                "verified title before acquisition starts."
             )
         elif status == "queued" and uncertain:
             message = (

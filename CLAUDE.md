@@ -364,6 +364,67 @@ actually lost it**. Radarr's failure message already contains its own reason,
 and preferring the fragment would have trimmed a fuller sentence to a shorter
 one.
 
+## Modelling ABB has now been wrong twice
+
+Request #288 was written up as a book ABB does not carry. It carries it. The
+live probe (`scripts/huey/abba_probe.py`, run on wysearr) returns
+`Kaiju: Battlefield Surgeon: A LitRPG Adventure - Matt Dinniman` for all three
+phrasings, title score 0.767, recall 1.000, nothing blocking it from a picker.
+The absence was inferred, never checked.
+
+That is the second wrong conclusion from modelling ABB rather than querying it
+-- the first produced a subtitled-catalogue-title fix that passed its tests and
+failed in Discord (see below). **Run the probe before reasoning about what ABB
+returns.** It is read-only and has no path to `/api/grab`.
+
+## A lone ABBA option is a confirmation, and today it cannot happen
+
+ARR's single-option confirmation is now in ABBA too, on the same terms: below
+two options, one surviving release is offered only if it clears
+`minimum_confidence` (0.82), the bar ABBA's automatic gate already demands. No
+new number, and the same reasoning as ARR -- two options ask the requester to
+discriminate, one asks them to agree, and agreement is cheap.
+
+The bar is read off the **blended ranking score**, not the title score the
+display floors use. That is both the faithful reuse (the gate reads the blend)
+and the safe one: ABB post titles are `Title - Author`, so a requester-supplied
+author that goes unevidenced usually means the post names a *different* author,
+and the 0.22 the blend withholds is the only signal saying so. A floor on the
+title alone scores `Brian Herbert - Dune` at 1.000 and would confirm it to
+someone who asked for Frank Herbert's.
+
+`_indistinguishable_band` runs **ahead** of a lone confirmation. Two listings
+rendering one identical label collapse to a single option, and "did you mean
+X?" asked of two identical copies of X is the question the band rule already
+declined to put to anybody.
+
+**The rule cannot fire on a live result set today, and that is not a bug in the
+rule.** Enumerate the routes: one candidate above the bar auto-matches (the gap
+gate needs two); a gap wide enough to decline means the top was below the bar,
+where the rule is barred by design; a tie within 0.08 of >=0.82 puts every
+rival at >=0.74, which clears the 0.40 title floor and the 0.6 recall gate, so
+two options survive -- unless the labels collide, and then the band settles it
+first. ARR's equivalent is reachable only because ARR has a *year filter* that
+discards a strong candidate before its gates. ABBA has no such "something else
+stopped it" mechanism. The rule is kept because it is the correct policy and
+because a scoring change makes it live; its test constructs the `Selection`
+directly and says so.
+
+**So #288 is not a picker problem.** It is 0.8182 blended against a 0.82 bar --
+eighteen ten-thousandths short, with every word the requester typed present in
+the release name. What docks it is that the release is *more specific* than the
+request: `Kaiju: Battlefield Surgeon` vs
+`Kaiju: Battlefield Surgeon: A LitRPG Adventure - Matt Dinniman` scores 0.767
+on the title. Complete recall earns nothing, exactly as a corroborating year
+earns nothing (see *A requested year orders the field*). Score agreement as
+evidence and #288 clears 0.82 and **auto-matches** -- the runner-up sits at
+0.3268, so the gap gate never engages and no prompt is involved. That is the
+auto-accept-moving class of change, not the picker class, and it needs its own
+evaluation against the backlog.
+
+Lowering `HUEY_ABBA_MINIMUM_CONFIDENCE` reaches #288 the same way and is worse:
+it moves every auto-accept at once. Do not treat it as the small fix.
+
 ## What AudioBookBay listings actually look like
 
 Verified against `/api/search` on 2026-08-29, not modelled. Post titles are

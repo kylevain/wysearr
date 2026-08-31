@@ -2816,12 +2816,11 @@ class AbbaClient(JsonClient):
             return ()
         wanted = set(normalize_text(title).split())
         values: list[dict[str, Any]] = []
+        scores: list[float] = []
         labels: set[str] = set()
         for ranked in selection.ranked:
-            if (
-                self._release_title_score(title, ranked.item, author)
-                < self.PICKER_MIN_TITLE_SCORE
-            ):
+            title_score = self._release_title_score(title, ranked.item, author)
+            if title_score < self.PICKER_MIN_TITLE_SCORE:
                 continue
             if wanted:
                 present = wanted & set(
@@ -2842,10 +2841,41 @@ class AbbaClient(JsonClient):
                 # discarding the whole proposal over a duplicate listing.
                 continue
             labels.add(label)
+            scores.append(ranked.score)
             values.append(snapshot)
             if len(values) == self.MAX_PROPOSAL_CANDIDATES:
                 break
-        return tuple(values) if len(values) >= 2 else ()
+        if len(values) >= 2:
+            return tuple(values)
+        # One surviving release is a confirmation, not a choice, so it clears a
+        # higher bar than the display floors above: ``minimum_confidence``, the
+        # bar the automatic gate already demands -- no new number. Two options
+        # ask the requester to discriminate between named alternatives; one
+        # asks them to agree, and agreement is cheap. So a lone option is only
+        # worth putting to them when the identity is already strong and
+        # something else stopped the grab.
+        #
+        # The bar is read off the blended ranking score, not the title score
+        # the display floors use, because the blend is the quantity the
+        # automatic gate reads and reusing a bar means reusing it on its own
+        # quantity. It also has to be the blend for safety: with ABB post
+        # titles shaped "Title - Author", a requester-supplied author that
+        # goes unevidenced usually means the post named a *different* author,
+        # and the 0.22 the blend withholds is the only signal that says so.
+        # A floor on the title alone would confirm "Brian Herbert - Dune" to
+        # someone who asked for Frank Herbert's.
+        #
+        # Consequence, stated because it is easy to misread as a live feature:
+        # this cannot fire from a low_confidence decline, where by definition
+        # nothing reached the bar. It fires when a release clears the bar and
+        # something else stopped the grab -- which today means an ambiguous
+        # tie whose rivals the picker gates dropped. It is deliberately the
+        # same shape as the ARR rule rather than a looser one; if ABBA later
+        # scores agreement as evidence, this is what turns those releases into
+        # a question instead of a dead end.
+        if values and scores[0] >= self.minimum_confidence:
+            return tuple(values)
+        return ()
 
     def _indistinguishable_band(self, selection: Any) -> tuple[Any, ...]:
         """Return the tied releases when they all render one identical label.
@@ -3147,7 +3177,7 @@ class AbbaClient(JsonClient):
         selection = self._selection(title, author, candidates)
         if selection.selected is None:
             proposal = self._selection_proposal(title, author, selection)
-            if proposal:
+            if len(proposal) >= 2:
                 return result(
                     "awaiting_selection",
                     "ABBA found multiple close audiobook matches. Choose one before acquisition starts.",
@@ -3158,6 +3188,12 @@ class AbbaClient(JsonClient):
             # settled by taking the top-ranked listing and saying how many
             # were identical. Deliberately not applied to a low-confidence
             # decline, where the work itself is still unproven.
+            #
+            # This runs ahead of a lone confirmation, not behind it. Two
+            # listings that render one identical label collapse to one option
+            # in the proposal above, and asking "did you mean X?" of two
+            # indistinguishable copies of X is the same question this rule
+            # already declined to put to the requester.
             identical = self._indistinguishable_band(selection)
             if identical:
                 grabbed = self._grab_candidate(
@@ -3168,6 +3204,13 @@ class AbbaClient(JsonClient):
                 if grabbed.get("status") == "queued":
                     grabbed["duplicate_listings"] = len(identical)
                 return grabbed
+            if proposal:
+                return result(
+                    "awaiting_selection",
+                    "ABBA found one close audiobook match. Confirm it before acquisition starts.",
+                    service="abba",
+                    selection_proposal=proposal,
+                )
             if selection.reason == "no_results":
                 message = "ABBA found no matching audiobook. Check the title and author."
                 decline = "selection_no_results"
