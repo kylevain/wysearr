@@ -60,6 +60,23 @@ _AUDIOBOOK_DECLINE_MESSAGES = {
 if set(_AUDIOBOOK_DECLINE_MESSAGES) != SELECTION_DECLINE_STATUSES:  # pragma: no cover
     raise RuntimeError("Audiobook decline messages must cover every decline reason")
 
+# A hard failure used to collapse into one sentence which promised the reader
+# that "an administrator can review the saved request" while overwriting the
+# only diagnosis there was. The cause now travels as state, exactly as the
+# decline reasons above do, and the specific text is kept for the error column.
+AUDIOBOOK_SERVICE_ERROR = "acquisition_service_error"
+AUDIOBOOK_INTERNAL_ERROR = "internal_error"
+_AUDIOBOOK_FAILURE_MESSAGES = {
+    AUDIOBOOK_SERVICE_ERROR: (
+        "The audiobook service could not complete this request. Huey saved the "
+        "reason on the request; try again shortly."
+    ),
+    AUDIOBOOK_INTERNAL_ERROR: (
+        "Huey hit an internal error handling this audiobook request. The reason "
+        "is saved on the request for an administrator."
+    ),
+}
+
 
 def _safe_service_message(error: ServiceError) -> str:
     message = str(error).strip()
@@ -178,7 +195,7 @@ class RequestProcessor:
         except ServiceError as error:
             safe_message = _safe_service_message(error)
             LOGGER.warning("Request %s service failure: %s", request_id, safe_message)
-            return result(
+            value = result(
                 "failed",
                 f"The acquisition service could not queue this request: {safe_message}",
                 service=(
@@ -186,7 +203,10 @@ class RequestProcessor:
                     if intended_service == "lazylibrarian"
                     else None
                 ),
+                external_status=AUDIOBOOK_SERVICE_ERROR,
             )
+            value["_diagnostic"] = safe_message
+            return value
         except Exception as error:  # Keep Discord alive and avoid logging secrets.
             LOGGER.error(
                 "Request %s failed during %s handling (%s)",
@@ -194,10 +214,16 @@ class RequestProcessor:
                 media_type,
                 type(error).__name__,
             )
-            return result(
+            value = result(
                 "failed",
                 "An internal processing error occurred. The request was saved for review.",
+                external_status=AUDIOBOOK_INTERNAL_ERROR,
             )
+            # The exception type is the whole diagnosis here, and it only ever
+            # reached the log. It is inert text, but it is still not requester
+            # wording, so it travels to the error column and no further.
+            value["_diagnostic"] = f"Internal error: {type(error).__name__}"
+            return value
 
     def _persist_handler_result(
         self,
@@ -224,8 +250,17 @@ class RequestProcessor:
         # a candidate prompt expires or a confirmation fails. Recording it for
         # an intake decline too is what lets a reader see why a request is
         # sitting in clarification without replaying the Discord channel.
+        # Prefer the specific cause, but only when the requester-facing message
+        # has actually lost it. A handler whose message already carries its own
+        # reason keeps that fuller sentence rather than being trimmed to a
+        # fragment of itself.
+        diagnostic = str(handler_result.get("_diagnostic") or "")
         error_message = (
-            handler_result["message"]
+            (
+                diagnostic
+                if diagnostic and diagnostic not in handler_result["message"]
+                else handler_result["message"]
+            )
             if handler_result["status"] in {"failed", "needs_selection"}
             else None
         )
@@ -318,11 +353,17 @@ class RequestProcessor:
                 "narrator, year, or edition and try again.",
             )
         else:
-            message = (
-                "Huey could not complete this audiobook acquisition. An "
-                "administrator can review the saved request safely."
+            message = _AUDIOBOOK_FAILURE_MESSAGES.get(
+                str(normalized.get("external_status") or ""),
+                "Huey could not complete this audiobook acquisition. The reason "
+                "is saved on the request for an administrator.",
             )
         normalized["message"] = message
+        # ``normalize_result`` whitelists its fields, so a cause set upstream
+        # has to be re-attached explicitly or this rewrite is the last place it
+        # exists.
+        if value.get("_diagnostic"):
+            normalized["_diagnostic"] = value["_diagnostic"]
         return normalized
 
     def _coalesce_canonical_audiobook(

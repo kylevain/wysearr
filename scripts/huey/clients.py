@@ -176,6 +176,16 @@ class CanonicalAcquisition(RuntimeError):
 
 
 LOGGER = logging.getLogger("huey.clients")
+
+
+class _UnusableListing(Exception):
+    """One search result Huey cannot render, in a response that is otherwise fine.
+
+    Distinct from ``ServiceError`` on purpose. A response whose *shape* is
+    wrong means the sidecar contract changed and must stay loud; a single
+    listing whose *text* cannot be displayed safely is just one result, and
+    dropping the other nine with it is how a whole request failed.
+    """
 MAX_TORRENT_BYTES = 16 * 1024 * 1024
 TORRENT_CHUNK_BYTES = 64 * 1024
 
@@ -2469,6 +2479,40 @@ class AbbaClient(JsonClient):
             amount /= 1024
         return f"{amount:.0f} {unit}" if unit in {"B", "KiB"} else f"{amount:.1f} {unit}"
 
+    @staticmethod
+    def _strip_site_tags(value: str) -> str:
+        """Remove bracketed site tags so a real release is not lost to one.
+
+        AudioBookBay post titles routinely carry "[www.audiobookbay.se]" or a
+        parenthesised mirror. That is packaging, not identity: stripping it
+        leaves a perfectly good candidate where dropping the listing loses a
+        real result. Only a bracketed group *containing* a link is removed --
+        every other bracketed group (format, edition, year) is identity and
+        stays. The result is still put through ``sanitize_display_text``; this
+        never decides what is safe, it only removes a tag before asking.
+        """
+
+        stripped = re.sub(
+            r"[\[\(][^\]\)]*(?:https?://|ftp://|www\.|discord\.gg/)[^\]\)]*[\]\)]",
+            " ",
+            value,
+            flags=re.IGNORECASE,
+        )
+        return " ".join(stripped.split())
+
+    @classmethod
+    def _renderable(cls, value: object, *, limit: int) -> tuple[str | None, bool]:
+        """Sanitize text, retrying once without site tags. Reports if one was cut."""
+
+        raw = str(value or "")
+        rendered = sanitize_display_text(raw, limit=limit)
+        if rendered is not None:
+            return rendered, False
+        stripped = cls._strip_site_tags(raw)
+        if stripped == raw.strip():
+            return None, False
+        return sanitize_display_text(stripped, limit=limit), True
+
     @classmethod
     def _search_candidate(cls, value: object) -> dict[str, Any]:
         if not isinstance(value, Mapping) or set(value) - cls._CANDIDATE_FIELDS:
@@ -2480,9 +2524,16 @@ class AbbaClient(JsonClient):
         candidate_id = raw_candidate_id
         if not cls._CANDIDATE_ID.fullmatch(candidate_id):
             raise ServiceError("ABBA returned an invalid search result.")
-        title = sanitize_display_text(raw_title, limit=160)
+        title, title_tag_stripped = cls._renderable(raw_title, limit=160)
         if title is None:
-            raise ServiceError("ABBA returned an invalid search result.")
+            # The title is the listing's identity. Without a renderable one
+            # there is nothing to rank or display, so this listing alone is
+            # dropped -- the rest of the response is untouched.
+            raise _UnusableListing("its title cannot be displayed safely")
+        if title_tag_stripped:
+            LOGGER.info(
+                "ABBA listing %s had a site tag stripped from its title", candidate_id
+            )
 
         optional_text: dict[str, str | None] = {}
         for field, limit in (
@@ -2494,11 +2545,23 @@ class AbbaClient(JsonClient):
             raw = value.get(field)
             if raw not in (None, "") and not isinstance(raw, str):
                 raise ServiceError("ABBA returned an invalid search result.")
-            normalized = (
-                sanitize_display_text(raw, limit=limit) if raw not in (None, "") else None
-            )
-            if raw not in (None, "") and normalized is None:
-                raise ServiceError("ABBA returned an invalid search result.")
+            if raw in (None, ""):
+                optional_text[field] = None
+                continue
+            normalized, tag_stripped = cls._renderable(raw, limit=limit)
+            if normalized is None:
+                # The listing is the unit of exclusion, not the field. Blanking
+                # an unrenderable narrator would keep a listing whose metadata
+                # is not what it should be; dropping it keeps that judgement in
+                # one place and preserves the original all-or-nothing intent
+                # for a single result.
+                raise _UnusableListing(f"its {field} cannot be displayed safely")
+            if tag_stripped:
+                LOGGER.info(
+                    "ABBA listing %s had a site tag stripped from its %s",
+                    candidate_id,
+                    field,
+                )
             optional_text[field] = normalized
 
         raw_size = value.get("size_bytes")
@@ -2600,7 +2663,32 @@ class AbbaClient(JsonClient):
             raise ServiceError("ABBA returned an invalid search response.")
         if len(value["results"]) > self.search_limit:
             raise ServiceError("ABBA returned too many search results.")
-        candidates = [self._search_candidate(item) for item in value["results"]]
+        # One unrenderable listing used to raise straight out of this loop and
+        # fail the whole request, discarding every good result beside it.
+        candidates = []
+        dropped = 0
+        for item in value["results"]:
+            try:
+                candidates.append(self._search_candidate(item))
+            except _UnusableListing as reason:
+                dropped += 1
+                identifier = (
+                    item.get("id") if isinstance(item, Mapping) else None
+                )
+                LOGGER.warning(
+                    "ABBA search dropped listing %s: %s",
+                    identifier or "<no id>",
+                    reason,
+                )
+        if dropped:
+            # A search that quietly loses candidates has to be visible, or a
+            # thin result set reads as "the book is not on ABB".
+            LOGGER.warning(
+                "ABBA search kept %d of %d listings for this title; %d dropped",
+                len(candidates),
+                len(value["results"]),
+                dropped,
+            )
         if len({item["id"] for item in candidates}) != len(candidates):
             raise ServiceError("ABBA returned duplicate search identities.")
         return candidates

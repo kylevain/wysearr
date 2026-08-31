@@ -279,6 +279,29 @@ identity itself is weak, the prompt becomes a backdoor to accepting what the
 gate refused. Only the ARR picker emits one option; Shelfarr, LazyLibrarian
 and ABBA keep their own two-option rule.
 
+## A trailing year no longer defeats author parsing
+
+Request #288, `Kaiju: Battlefield Surgeon by Matt Dinniman 2019`, did not split
+its author at all. `_looks_like_author` required every word of the candidate to
+contain a letter, so `2019` rejected the whole candidate and the entire string
+— `by`, author and year — became a five-word title. The requester supplied the
+most information of three attempts and got the worst parse for it: title score
+0.859 against the real release where the same request without the year scores
+1.000.
+
+A trailing four-digit year is now split off before the candidate is judged, and
+returned as a `year` hint. **Deliberately narrow**: only `1\d{3}` or `20\d{2}`,
+only at the end. `Blink 182` is still rejected — that is a name containing a
+number, not a year — and `Stand by Me 1986` is still a title, because pronoun
+rejection runs on the year-stripped remainder. The `year` key is present only
+when one was actually split off, so no existing caller's shape changes.
+
+**This changes `target_key` for such requests.** `by Matt Dinniman 2019` now
+keys on title `kaiju: battlefield surgeon` + author `matt dinniman` rather than
+one long title. A row acquired under the old parse will not coalesce with a new
+request typed the same way; the result is a duplicate request, not lost data,
+and it only affects requests carrying a trailing year after an author.
+
 ## Known limitation: the parser keeps the author inside the title
 
 `parse_request` only splits an author off when the text contains ` by `.
@@ -287,6 +310,59 @@ and ABBA keep their own two-option rule.
 downstream then scores against a title that contains an author, so any release
 whose name does not also repeat the author is penalised — the correct book
 scores 0.401 where the same book scores 0.484 when the author is parsed out.
+
+## One bad listing must not fail the whole ABBA search
+
+Requests #289 and #290 ("Dream it. Do it.") came back `failed`, not
+`needs_selection`. `AbbaClient.search` validated every listing inside one
+comprehension, and `_search_candidate` raised `ServiceError` whenever
+`sanitize_display_text` returned `None` for a post title. That pattern matches
+`www.`, `https?://`, `magnet:` and `discord.gg/` — and AudioBookBay post titles
+routinely carry a site tag. **One tagged listing among ten failed the entire
+request and discarded the nine good releases beside it.**
+
+The codebase already disagreed with itself here: `_selection_proposal` hits the
+same sanitiser on the same data and skips the release rather than dying. That
+policy just never ran, because the fatal raise was three functions upstream.
+
+Now:
+
+- A bracketed group *containing a link* is stripped and the listing kept —
+  `[www.audiobookbay.se] Dream It Do It - Marty Sklar` is a real result, and
+  losing it is a worse outcome than losing the tag. Only bracketed groups with
+  a link are removed; `[M4B]`, `(Unabridged)`, `[2019]` are identity and stay.
+- If the text still cannot be rendered, **the listing** is dropped, not the
+  response. The unit of exclusion is the listing even when the unrenderable
+  field is optional: blanking a narrator would keep a listing whose metadata is
+  not what it should be.
+- Every drop is logged with the candidate id and the reason, plus a
+  kept/dropped tally, because a search that quietly loses candidates reads as
+  "the book is not on ABB".
+
+`sanitize_display_text` is unchanged and still decides what is safe. Stripping
+only removes a tag *before* asking it; a stripped title is put through the
+sanitiser exactly as before, so a title that is only a URL is still dropped.
+
+## A failed audiobook result must carry its own cause
+
+`_generic_audiobook_result` rewrites the requester-facing sentence, and its
+`else` branch — every `failed` result — replaced the message with "An
+administrator can review the saved request safely". That rewrite ran *before*
+`_persist_handler_result`, so the `error` column got the same generic text: the
+row promised a reviewable artifact and carried nothing to review. The only
+surviving record was a log line.
+
+The cause now travels as state, the way the decline reasons already did:
+`external_status` is `acquisition_service_error` or `internal_error`, and the
+specific text reaches the `error` column via `_diagnostic`. `error` is never
+sent to Discord for ebooks or audiobooks — `notifications.py` returns a fixed
+sentence for those media types before it reads the field — so a backend's own
+words belong there and stay out of the channel.
+
+`_persist_handler_result` prefers `_diagnostic` **only when the message has
+actually lost it**. Radarr's failure message already contains its own reason,
+and preferring the fragment would have trimmed a fuller sentence to a shorter
+one.
 
 ## What AudioBookBay listings actually look like
 

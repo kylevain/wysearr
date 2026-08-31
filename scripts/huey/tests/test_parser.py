@@ -63,5 +63,60 @@ class ParserTests(unittest.TestCase):
                     parse_request(value, media_type)
 
 
+class TrailingYearAuthorTests(unittest.TestCase):
+    """More detail must never produce a worse parse than less detail."""
+
+    def parse(self, raw):
+        return parse_request(raw, "audiobooks")
+
+    def test_a_trailing_year_no_longer_swallows_the_author(self):
+        # Request #288: every word of the candidate author had to contain a
+        # letter, so "2019" rejected the split and the whole string -- "by"
+        # and year included -- became a five-word title.
+        with_year = self.parse("Kaiju: Battlefield Surgeon by Matt Dinniman 2019")
+        without = self.parse("Kaiju: Battlefield Surgeon by Matt Dinniman")
+
+        self.assertEqual(with_year["title"], without["title"])
+        self.assertEqual(with_year["author"], without["author"])
+        self.assertEqual(with_year["author"], "Matt Dinniman")
+
+    def test_the_year_is_available_as_a_hint(self):
+        self.assertEqual(
+            self.parse("Kaiju: Battlefield Surgeon by Matt Dinniman 2019")["year"],
+            2019,
+        )
+
+    def test_the_year_key_is_absent_when_none_was_split_off(self):
+        # No existing caller's shape changes.
+        self.assertEqual(
+            self.parse("Dune by Frank Herbert"), {"title": "Dune", "author": "Frank Herbert"}
+        )
+
+    def test_a_number_in_a_name_is_still_not_a_year(self):
+        """Narrow on purpose: this is not general numeric tolerance."""
+
+        parsed = self.parse("Something by Blink 182")
+
+        self.assertIsNone(parsed["author"])
+        self.assertEqual(parsed["title"], "Something by Blink 182")
+
+    def test_a_bare_year_is_not_an_author(self):
+        parsed = self.parse("Something by 2019")
+
+        self.assertIsNone(parsed["author"])
+        self.assertEqual(parsed["title"], "Something by 2019")
+
+    def test_a_pronoun_title_survives_a_trailing_year(self):
+        parsed = self.parse("Stand by Me 1986")
+
+        self.assertIsNone(parsed["author"])
+        self.assertEqual(parsed["title"], "Stand by Me 1986")
+
+    def test_only_four_digits_count(self):
+        for raw in ("Something by Author 999", "Something by Author 20199"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(self.parse(raw)["author"])
+
+
 if __name__ == "__main__":
     unittest.main()

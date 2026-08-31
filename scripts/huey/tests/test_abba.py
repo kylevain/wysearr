@@ -226,10 +226,6 @@ class AbbaClientTests(unittest.TestCase):
             {"results": []},
             {"results": [candidate() | {"magnet": "magnet:?xt=secret"}], "cached": False},
             {
-                "results": [candidate(narrator="https://private.invalid/token")],
-                "cached": False,
-            },
-            {
                 "results": [candidate(), candidate()],
                 "cached": False,
             },
@@ -249,6 +245,70 @@ class AbbaClientTests(unittest.TestCase):
                         "http://abba:8080",
                         session=ScriptedSession(FakeResponse(value)),
                     ).search("Dune")
+
+    def test_one_unrenderable_listing_is_dropped_not_fatal(self):
+        """A sensitive listing excludes itself, not every result beside it.
+
+        This used to raise out of the search comprehension, so one AudioBookBay
+        post carrying a link failed the whole request and lost every good
+        release with it.
+        """
+
+        session = ScriptedSession(
+            search_response(
+                candidate(),
+                candidate(CANDIDATE_B, narrator="https://private.invalid/token"),
+            )
+        )
+
+        results = AbbaClient("http://abba:8080", session=session).search("Dune")
+
+        self.assertEqual([item["id"] for item in results], [CANDIDATE_A])
+
+    def test_a_listing_that_is_only_sensitive_text_is_still_dropped(self):
+        session = ScriptedSession(
+            search_response(candidate(CANDIDATE_B, title="https://private.invalid/x"))
+        )
+
+        self.assertEqual(
+            AbbaClient("http://abba:8080", session=session).search("Dune"), []
+        )
+
+    def test_a_bracketed_site_tag_is_stripped_rather_than_losing_the_release(self):
+        """Dropping "[www.audiobookbay.se] Title" would lose a real result."""
+
+        session = ScriptedSession(
+            search_response(
+                candidate(title="[www.audiobookbay.se] Dream It Do It - Marty Sklar")
+            )
+        )
+
+        results = AbbaClient("http://abba:8080", session=session).search("Dream It Do It")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["title"], "Dream It Do It - Marty Sklar")
+
+    def test_stripping_never_removes_an_identity_bearing_bracket(self):
+        session = ScriptedSession(
+            search_response(candidate(title="Dune [M4B] (Unabridged) [2019]"))
+        )
+
+        results = AbbaClient("http://abba:8080", session=session).search("Dune")
+
+        self.assertEqual(results[0]["title"], "Dune [M4B] (Unabridged) [2019]")
+
+    def test_a_stripped_title_is_still_put_through_the_sanitiser(self):
+        """Stripping removes a tag; it never decides what is safe."""
+
+        session = ScriptedSession(
+            search_response(
+                candidate(title="[www.audiobookbay.se] Dune https://private.invalid/x")
+            )
+        )
+
+        self.assertEqual(
+            AbbaClient("http://abba:8080", session=session).search("Dune"), []
+        )
 
     def test_unreachable_abba_is_sanitized_and_never_attempts_grab(self):
         session = ScriptedSession(
@@ -1255,6 +1315,53 @@ class AbbaRoutingAndRecoveryTests(unittest.TestCase):
         ).casefold()
         for backend in ("abba", "qbittorrent", "prowlarr", "bookbot"):
             self.assertNotIn(backend, requester_text)
+
+    def test_a_hard_failure_saves_a_cause_the_row_can_be_read_for(self):
+        """The message promised a reviewable request while erasing the diagnosis."""
+
+        # Two listings sharing one identity: a real ServiceError, reached only
+        # after the unrenderable listing is dropped rather than instead of it.
+        session = ScriptedSession(
+            search_response(
+                candidate(title="https://private.invalid/x"),
+                candidate(),
+                candidate(),
+            )
+        )
+        processor = self.abba_processor(session)
+
+        response = processor.process({**self.delivery, "message_id": "900"})
+        saved = self.store.get_request(response["request_id"])
+
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["external_status"], "acquisition_service_error")
+        # The row now carries the cause; the requester text stays neutral.
+        self.assertNotEqual(saved["error"], response["message"])
+        self.assertIn("ABBA", saved["error"])
+        self.assertNotIn("abba", response["message"].casefold())
+        self.assertNotIn(
+            "administrator can review the saved request", response["message"]
+        )
+
+    def test_an_internal_error_is_distinguishable_from_a_service_error(self):
+        class Exploding:
+            def submit(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+            def search(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        registry = ServiceRegistry({"ABBA_ENABLED": "true"})
+        registry._clients["abba"] = Exploding()
+        response = RequestProcessor(self.store, services=registry).process(
+            {**self.delivery, "message_id": "901"}
+        )
+        saved = self.store.get_request(response["request_id"])
+
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["external_status"], "internal_error")
+        self.assertIn("RuntimeError", saved["error"])
+        self.assertNotIn("RuntimeError", response["message"])
 
     def abba_processor(self, session):
         registry = ServiceRegistry({"ABBA_ENABLED": "true"})
