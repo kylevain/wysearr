@@ -425,6 +425,47 @@ evaluation against the backlog.
 Lowering `HUEY_ABBA_MINIMUM_CONFIDENCE` reaches #288 the same way and is worse:
 it moves every auto-accept at once. Do not treat it as the small fix.
 
+## Before scoring agreement: the survey, and what it already shows
+
+`scripts/huey/scoring_survey.py` is the read-only evaluation of the
+agreement-scoring change, in the same posture as `redrive_selection.py`:
+database opened read-only, search and lookup endpoints only, no path to an
+add, a grab, or a Discord post. It must be run on wysearr and read before the
+scoring formula is touched.
+
+The change it models is a bounded promotion mirroring the year rule's bounded
+demotion: when recall is **complete** -- every token of the requested title
+survives in the candidate's -- the title score is raised by a fixed bonus,
+capped at 1.0. Partial overlap is not credited; that is what the similarity
+score already measures. The sweep runs 0.00 to 0.12 in steps of 0.02, the year
+rule's own step and cap, so the survey introduces no number of its own. Only
+the score formula is duplicated; the search, sanitising, variant extraction,
+filtering and gates are the clients' own, and a row whose zero-bonus
+recomputation disagrees with the client is reported as survey drift rather
+than counted.
+
+Three things are already settled by arithmetic, before the backlog is read:
+
+- **This change cannot produce pickers. It produces acquisitions.** #288 is
+  0.8182 against 0.82 with its runner-up 0.49 behind, so the moment the
+  promotion clears the floor the runner-up gap cannot engage and the outcome
+  is `selected` -- acquired, nobody asked. The smallest step in the sweep,
+  0.02, is already enough. Any row shaped like #288 moves decline -> auto-match
+  with no intermediate picker state to review.
+- **The hazard is a book that wholly contains the request.** `Dune` has
+  complete recall against `Dune Messiah - Frank Herbert` (title 0.688), and
+  with the author supplied and evidenced it crosses 0.82 at a bonus of
+  **0.10**. That is the ceiling: 0.02-0.08 leaves every known wrong-book case
+  below the bar, 0.10 starts auto-acquiring sequels.
+- **It does not rescue the subtitled-catalogue case.** `Leaders Eat Last`
+  against its own subtitled release is 0.484 and reaches 0.604 at the cap --
+  nowhere near. #279-#281 stay a picker problem; only #288-shaped requests,
+  where the release adds a short subtitle, move at all.
+
+The wrong-author hole stays shut: `Brian Herbert - Dune` is 1.000 on the title
+and unmoved at every bonus, because its penalty is on the author half of the
+blend and the promotion never touches that.
+
 ## What AudioBookBay listings actually look like
 
 Verified against `/api/search` on 2026-08-29, not modelled. Post titles are
