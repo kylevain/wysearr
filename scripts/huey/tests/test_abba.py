@@ -11,7 +11,12 @@ import requests
 HUEY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HUEY_ROOT))
 
-from matching import RankedCandidate, Selection
+from matching import (
+    COMPLETE_AGREEMENT_BONUS,
+    RankedCandidate,
+    Selection,
+    title_agreement,
+)
 
 from clients import (
     AbbaClient,
@@ -794,6 +799,77 @@ class AbbaPickerTests(unittest.TestCase):
 
         self.assertEqual(response["status"], "needs_selection")
         self.assertEqual(response["external_status"], "selection_low_confidence")
+
+    def test_promotion_can_close_a_choice_by_widening_the_gap(self):
+        # The third outcome mode, and the only one that removes a question
+        # rather than adding one. Both releases clear the confidence floor and
+        # both survive the picker's display gates, so this was a two-option
+        # picker. Only the first has complete agreement, so only the first is
+        # promoted, and the runner-up gap widens past 0.08 -- the requester is
+        # no longer asked.
+        title, author = "storm tower long", "Brandon Sanderson"
+        first = release(1, "storm tower long unabridged - Brandon Sanderson")
+        second = release(2, "storm tower - Brandon Sanderson")
+        client = AbbaClient("http://abba:8080")
+
+        unpromoted = [
+            0.78 * AbbaClient._release_title_score(title, item, author) + 0.22
+            for item in (first, second)
+        ]
+        # Without the promotion these are 0.9201 and 0.8480: inside the gap.
+        self.assertLess(unpromoted[0] - unpromoted[1], client.runner_up_gap)
+        # Both would have been offered; neither is filtered out of the picker.
+        for item in (first, second):
+            self.assertGreaterEqual(
+                AbbaClient._release_title_score(title, item, author),
+                AbbaClient.PICKER_MIN_TITLE_SCORE,
+            )
+            self.assertGreaterEqual(
+                title_agreement(title, item["title"]),
+                AbbaClient.PICKER_MIN_TITLE_RECALL,
+            )
+
+        selection = client._selection(title, author, [first, second])
+
+        self.assertEqual(selection.reason, "selected")
+        self.assertGreaterEqual(
+            selection.ranked[0].score - selection.ranked[1].score,
+            client.runner_up_gap,
+        )
+        # The window is exactly one promotion wide: 0.78 x 0.02.
+        self.assertAlmostEqual(
+            (selection.ranked[0].score - selection.ranked[1].score)
+            - (unpromoted[0] - unpromoted[1]),
+            0.78 * COMPLETE_AGREEMENT_BONUS,
+        )
+
+    def test_an_equally_promoted_field_keeps_its_picker(self):
+        # The gap only moves when the promotion is uneven. Two releases that
+        # both carry every typed word rise together, so the distance between
+        # them is exactly what it was and the requester is still asked.
+        title = "storm tower long"
+        titles = (
+            "storm tower long unabridged - Brandon Sanderson",
+            "storm tower long book two - Brandon Sanderson",
+        )
+        client = AbbaClient("http://abba:8080")
+        items = [release(index + 1, value) for index, value in enumerate(titles)]
+        for item in items:
+            self.assertEqual(title_agreement(title, item["title"]), 1.0)
+
+        selection = client._selection(title, None, items)
+        unpromoted = [
+            AbbaClient._release_title_score(title, item, None) for item in items
+        ]
+
+        self.assertEqual(selection.reason, "ambiguous")
+        self.assertAlmostEqual(
+            selection.ranked[0].score - selection.ranked[1].score,
+            abs(unpromoted[0] - unpromoted[1]),
+        )
+        response = self.submit(*titles, title=title)
+        self.assertEqual(response["status"], "awaiting_selection")
+        self.assertEqual(len(response["selection_proposal"]), 2)
 
     def test_a_book_that_merely_contains_the_request_is_not_promoted_over(self):
         # "Dune" survives whole inside "Dune Messiah", so agreement is complete

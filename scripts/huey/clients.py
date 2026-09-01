@@ -2880,9 +2880,14 @@ class AbbaClient(JsonClient):
         # nothing reached the bar. It fires when a release clears the bar and
         # something else stopped the grab -- which today means an ambiguous
         # tie whose rivals the picker gates dropped. It is deliberately the
-        # same shape as the ARR rule rather than a looser one; if ABBA later
-        # scores agreement as evidence, this is what turns those releases into
-        # a question instead of a dead end.
+        # same shape as the ARR rule rather than a looser one.
+        #
+        # Agreement scoring did not make this reachable, and it was wrong to
+        # expect it would: ``COMPLETE_AGREEMENT_BONUS`` promotes inside
+        # ``_selection``, so a release it lifts over the bar is *selected* and
+        # acquired outright rather than arriving here as a question. Request
+        # #288 is that case. What this still catches is the opposite one -- a
+        # release already above the bar that the gap gate stopped.
         if values and scores[0] >= self.minimum_confidence:
             return tuple(values)
         return ()

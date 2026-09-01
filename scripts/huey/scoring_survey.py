@@ -76,21 +76,38 @@ MEDIA_TYPES = ("audiobooks", "ebooks")
 # same step and the same ceiling rather than over a range invented here.
 AGREEMENT_STEP = 0.02
 AGREEMENT_CAP = 0.12
+SWEEP = tuple(
+    round(AGREEMENT_STEP * step, 3)
+    for step in range(int(round(AGREEMENT_CAP / AGREEMENT_STEP)) + 1)
+)
 BONUSES = tuple(
     sorted(
-        {
-            round(AGREEMENT_STEP * step, 2)
-            for step in range(int(round(AGREEMENT_CAP / AGREEMENT_STEP)) + 1)
-        }
+        set(SWEEP)
         # Whatever is shipped has to be in the sweep, or the baseline every
         # projection is measured against would not be in the table.
-        | {round(COMPLETE_AGREEMENT_BONUS, 2)}
+        | {COMPLETE_AGREEMENT_BONUS}
     )
 )
+
+
+def label(bonus: float) -> str:
+    """Name a column by its exact bonus.
+
+    Deliberately not rounded to the sweep's two places. The next person to
+    touch ``COMPLETE_AGREEMENT_BONUS`` will be doing it because a threshold
+    felt wrong, and 0.025 is exactly the kind of value they would try. Rounding
+    the label while ranking at the raw constant would silently measure every
+    projection against a 0.03 column that was never shipped, and the drift
+    self-check would still pass because it compares at 0.025.
+    """
+
+    return f"{bonus:.3f}"
+
+
 # The bonus production already applies. Every projection is a delta from here,
 # not from zero: a zero-bonus column stopped describing live behaviour the
 # moment the promotion shipped.
-BASELINE = f"{round(COMPLETE_AGREEMENT_BONUS, 2):.2f}"
+BASELINE = label(COMPLETE_AGREEMENT_BONUS)
 # Rows that already committed to an acquisition. A scoring change can only be
 # evaluated against these as a regression check: raising scores unevenly can
 # close a runner-up gap and turn a working auto-match into a prompt.
@@ -380,7 +397,7 @@ class Surveyor:
                 minimum_confidence=client.minimum_confidence,
                 runner_up_gap=client.runner_up_gap,
             )
-            outcomes[f"{bonus:.2f}"] = verdict(selection)
+            outcomes[label(bonus)] = verdict(selection)
         record["outcomes"] = outcomes
         record["top_score"] = round(live.ranked[0].score, 4) if live.ranked else None
         record["top_title"] = (
@@ -413,7 +430,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     summary: dict[str, Any] = {}
     for bonus in BONUSES:
-        key = f"{bonus:.2f}"
+        key = label(bonus)
         if key == BASELINE:
             continue
         changed = [
@@ -465,7 +482,7 @@ def report(
     records = [surveyor.row(row) for row in rows]
     return {
         "baseline": BASELINE,
-        "bonuses": [f"{bonus:.2f}" for bonus in BONUSES],
+        "bonuses": [label(bonus) for bonus in BONUSES],
         "statuses": list(statuses),
         "surveyed": len(records),
         "skipped": _counted(

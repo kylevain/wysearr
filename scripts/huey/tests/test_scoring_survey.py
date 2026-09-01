@@ -88,16 +88,34 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(survey.promote(0.4321, 1.0, 0.0), 0.4321)
 
     def test_the_sweep_is_the_year_rules_step_and_cap(self):
-        self.assertEqual(survey.BONUSES[0], 0.0)
-        self.assertEqual(survey.BONUSES[1], 0.02)
-        self.assertEqual(survey.BONUSES[-1], 0.12)
+        # Asserted against the sweep itself, not against BONUSES: BONUSES also
+        # carries the shipped bonus, so testing it here would fail for a change
+        # to the shipped constant while claiming the sweep had moved.
+        self.assertEqual(survey.SWEEP[0], 0.0)
+        self.assertEqual(survey.SWEEP[1], survey.AGREEMENT_STEP)
+        self.assertEqual(survey.SWEEP[-1], survey.AGREEMENT_CAP)
+        self.assertEqual(
+            len(survey.SWEEP), int(survey.AGREEMENT_CAP / survey.AGREEMENT_STEP) + 1
+        )
 
     def test_the_shipped_bonus_is_always_in_the_sweep(self):
         # Every projection is a delta from the shipped column, so it has to be
         # a column. A shipped value outside the sweep would make the summary
         # measure against a baseline that was never computed.
-        self.assertIn(round(survey.COMPLETE_AGREEMENT_BONUS, 2), survey.BONUSES)
-        self.assertIn(survey.BASELINE, [f"{bonus:.2f}" for bonus in survey.BONUSES])
+        self.assertIn(survey.COMPLETE_AGREEMENT_BONUS, survey.BONUSES)
+        self.assertIn(survey.BASELINE, [survey.label(b) for b in survey.BONUSES])
+
+    def test_an_off_grid_bonus_gets_its_own_column(self):
+        # The value the next person tries when a threshold feels wrong. The
+        # baseline must name the column that was actually computed with it,
+        # not a rounded neighbour that was never shipped.
+        self.assertEqual(survey.label(0.025), "0.025")
+        self.assertNotEqual(survey.label(0.025), survey.label(0.03))
+
+    def test_the_baseline_names_a_column_computed_at_the_shipped_bonus(self):
+        columns = {survey.label(bonus): bonus for bonus in survey.BONUSES}
+
+        self.assertEqual(columns[survey.BASELINE], survey.COMPLETE_AGREEMENT_BONUS)
 
     def test_the_survey_knob_agrees_with_the_shipped_rule(self):
         # Two statements of one rule. If they drift, every projection is a lie.
@@ -214,9 +232,9 @@ class ProjectionTests(unittest.TestCase):
             "Kaiju: Battlefield Surgeon by Matt Dinniman 2019", KAIJU
         )
 
-        self.assertEqual(record["outcomes"]["0.00"], "decline_low_confidence")
+        self.assertEqual(record["outcomes"][survey.label(0.0)], "decline_low_confidence")
         self.assertEqual(record["outcomes"][survey.BASELINE], "auto_match")
-        self.assertEqual(survey.BASELINE, "0.02")
+        self.assertEqual(survey.BASELINE, "0.020")
         # The live client score, promoted: 0.78 x (0.767 + 0.02) + 0.22.
         self.assertEqual(record["top_score"], 0.8338)
 
@@ -278,9 +296,9 @@ class SummaryTests(unittest.TestCase):
             "request_id": request_id,
             "media_type": "audiobooks",
             "status": "needs_selection",
-            "outcomes": {f"{bonus:.2f}": baseline for bonus in survey.BONUSES},
+            "outcomes": {survey.label(bonus): baseline for bonus in survey.BONUSES},
         }
-        row["outcomes"]["0.12"] = promoted
+        row["outcomes"][survey.label(0.12)] = promoted
         row.update(overrides)
         return row
 
@@ -290,7 +308,7 @@ class SummaryTests(unittest.TestCase):
                 self.record(1, "decline_low_confidence", "auto_match"),
                 self.record(2, "auto_match", "picker_2", status="queued"),
             ]
-        )["0.12"]
+        )[survey.label(0.12)]
 
         self.assertEqual(summary["changed"], 2)
         self.assertEqual(summary["into_auto_match"], 1)
@@ -306,7 +324,7 @@ class SummaryTests(unittest.TestCase):
     def test_unchanged_rows_are_not_counted(self):
         summary = survey.summarize(
             [self.record(1, "auto_match", "auto_match")]
-        )["0.12"]
+        )[survey.label(0.12)]
 
         self.assertEqual(summary["changed"], 0)
         self.assertEqual(summary["request_ids"], [])

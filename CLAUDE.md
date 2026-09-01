@@ -466,6 +466,19 @@ modelled, so changing it would ship something nobody evaluated.
 
 Three things are settled by arithmetic, independent of the backlog:
 
+- **It can also remove a choice, by widening a gap.** The promotion is uneven
+  by design -- only complete agreement is credited -- so a top candidate that
+  earns it pulls away from a runner-up that does not, and a pair that was
+  inside the runner-up gap can fall outside it. `storm tower long` against
+  `storm tower long unabridged` (0.9201) and `storm tower` (0.8480): gap 0.0721
+  before, 0.0877 after, so a two-option picker becomes a silent acquisition.
+  Both survive the picker's display gates, so this was a real choice, not a
+  lone confirmation. **The window is exactly one promotion wide** -- the gap
+  moves by `0.78 x 0.02 = 0.0156`, so only a pre-gap in `[0.0644, 0.08)` flips
+  -- and the live backlog contained no such pair, which is why 3-of-38 did not
+  show it. It is the only mode that takes a question away rather than adding
+  one, and it is covered by
+  `test_promotion_can_close_a_choice_by_widening_the_gap`.
 - **This change mostly cannot produce pickers. It produces acquisitions.** #288 is
   0.8182 against 0.82 with its runner-up 0.49 behind, so the moment the
   promotion clears the floor the runner-up gap cannot engage and the outcome
@@ -482,10 +495,23 @@ Three things are settled by arithmetic, independent of the backlog:
   nowhere near. #279-#281 stay a picker problem; only #288-shaped requests,
   where the release adds a short subtitle, move at all.
 
+`abba_probe.py` reports both quantities and they are not interchangeable:
+`title_score`/`recall` are the picker's own, unpromoted, because the display
+floors read them; `gate_score` is what the confidence bar weighed, with
+agreement credited. A decline is explained by `gate_score`, and the probe also
+prints `selection` and the exact options the client would offer rather than
+inferring them from a count.
+
 Every projection the survey prints is now a delta from the **shipped** column,
 not from zero: a zero-bonus column stopped describing live behaviour the moment
 0.02 landed, and the survey's self-check runs against the shipped value for the
 same reason. Re-run it before changing the constant again.
+
+Columns are keyed by the **exact** bonus, to three places, not rounded onto the
+sweep's grid. The next person to touch `COMPLETE_AGREEMENT_BONUS` will do it
+because a threshold felt wrong, and `0.025` is exactly what they would try; a
+rounded label would have measured every projection against a `0.03` column
+nobody shipped, and the drift self-check would still have passed.
 
 ## What AudioBookBay listings actually look like
 
