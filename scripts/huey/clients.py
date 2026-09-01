@@ -20,6 +20,7 @@ try:  # Support both package imports and direct container script execution.
         ArrCandidate,
         RankedCandidate,
         Selection,
+        agreement_promoted,
         normalize_text,
         normalize_identity_text,
         ARR_AUTO_MATCH_MIN_SIMILARITY,
@@ -34,6 +35,7 @@ except ImportError:  # pragma: no cover - exercised by the container entrypoint
         ArrCandidate,
         RankedCandidate,
         Selection,
+        agreement_promoted,
         normalize_identity_text,
         normalize_text,
         ARR_AUTO_MATCH_MIN_SIMILARITY,
@@ -2765,7 +2767,15 @@ class AbbaClient(JsonClient):
 
         ranked: list[RankedCandidate] = []
         for candidate in candidates:
-            title_score = self._release_title_score(title, candidate, author)
+            # Complete agreement is credited on the title half only. The author
+            # half already carries its own evidence, and promoting a blend that
+            # withheld 0.22 because the post names somebody else would undo the
+            # one signal saying so.
+            title_score = agreement_promoted(
+                self._release_title_score(title, candidate, author),
+                title,
+                candidate.get("title"),
+            )
             if author:
                 author_score = (
                     1.0 if self._author_is_evidenced(author, candidate) else 0.0

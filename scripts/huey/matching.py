@@ -246,6 +246,55 @@ YEAR_MISMATCH_PENALTY_PER_YEAR = 0.02
 MAX_YEAR_MISMATCH_PENALTY = 0.12
 _YEAR_TOKEN = re.compile(r"\b((?:18|19|20|21)\d{2})\b")
 
+# Scoring used to be one-sided: a candidate is demoted for disagreeing with the
+# requester, and earned nothing for agreeing. So a release carrying every word
+# the requester typed and adding a short subtitle was scored as though the
+# extra words were errors. Request #288 lost that way -- 0.767 on the title,
+# 0.8182 blended, against a 0.82 bar, with every typed word present.
+#
+# Complete recall is the evidence the similarity cannot express: not "these
+# strings are alike" but "nothing you asked for is missing, and the difference
+# is that the candidate is more specific". It is credited once, as a bounded
+# promotion mirroring the bounded year demotion above -- same step, and never
+# more than one step.
+#
+# 0.02 rather than the year rule's 0.12 cap, chosen against the live backlog
+# rather than by argument: at 0.02 three of thirty-eight rows change, which is
+# #287 and #288 reaching an automatic match and one row moving the other way,
+# from an automatic match to a two-option picker. Every higher value in the
+# survey only adds rows that should still be asked about, and at 0.10 "Dune"
+# starts auto-acquiring "Dune Messiah", which has complete recall against it.
+# Partial overlap is deliberately not credited; that is what the similarity
+# score already measures, and crediting it twice is double-counting.
+#
+# Raising a score moves *automatic* outcomes, so re-run
+# ``scripts/huey/scoring_survey.py`` against the backlog before changing this.
+COMPLETE_AGREEMENT_BONUS = 0.02
+
+
+def title_agreement(title: str, candidate_title: object) -> float:
+    """Fraction of the requested title's tokens surviving in a candidate."""
+
+    wanted = set(normalize_text(title).split())
+    if not wanted:
+        return 0.0
+    return len(wanted & set(normalize_text(candidate_title).split())) / len(wanted)
+
+
+def agreement_promoted(
+    score: float, title: str, candidate_title: object
+) -> float:
+    """Credit complete agreement, and only complete agreement.
+
+    Returns ``score`` unchanged unless every token of ``title`` survives in
+    ``candidate_title``, so a candidate can never be promoted for containing
+    part of the request.
+    """
+
+    if title_agreement(title, candidate_title) < 1.0:
+        return score
+    return min(1.0, score + COMPLETE_AGREEMENT_BONUS)
+
 
 @dataclass(frozen=True)
 class ArrCandidate:
@@ -444,7 +493,10 @@ def select_shelfarr_candidate(
 
     ranked: list[RankedCandidate] = []
     for work_id, item in unique.items():
-        title_score = title_similarity(title, str(item.get("title") or ""))
+        candidate_title = str(item.get("title") or "")
+        title_score = agreement_promoted(
+            title_similarity(title, candidate_title), title, candidate_title
+        )
         if author:
             candidate_author = str(item.get("author") or "")
             author_score = title_similarity(author, candidate_author)

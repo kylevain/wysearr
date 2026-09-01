@@ -761,23 +761,50 @@ class AbbaPickerTests(unittest.TestCase):
             (),
         )
 
-    def test_a_lone_release_below_the_automatic_bar_is_not_offered(self):
-        # Request #288's live shape, verified against /api/search on
-        # 2026-08-29: the correct release scores 0.767 on its title and 0.8182
-        # blended -- eighteen ten-thousandths under ABBA's 0.82 bar. One option
-        # below the bar is a confirmation of a work Huey has not proved, and
-        # "did you mean X?" with no rival to compare X against invites the
-        # agreement rather than the judgement. The picker still offers releases
-        # this weak, because two options ask for a judgement.
-        response = self.submit(
-            "Kaiju: Battlefield Surgeon: A LitRPG Adventure - Matt Dinniman",
-            "Matt Dinniman Audio Book Collection",
-            title="Kaiju: Battlefield Surgeon",
-            author="Matt Dinniman",
+    KAIJU = (
+        "Kaiju: Battlefield Surgeon: A LitRPG Adventure - Matt Dinniman",
+        "Matt Dinniman Audio Book Collection",
+    )
+
+    def test_request_288_is_acquired_once_agreement_counts(self):
+        # The live shape, verified against /api/search on 2026-08-29: 0.767 on
+        # the title with every typed word present, 0.8182 blended -- eighteen
+        # ten-thousandths under the bar. Crediting complete agreement puts it
+        # at 0.8338, and because the runner-up is 0.49 behind the gap gate
+        # never engages, so this acquires rather than asking.
+        session = ScriptedSession(
+            search_response(*(release(i + 1, value) for i, value in enumerate(self.KAIJU))),
+            status_missing(),
+            grab_response(candidate_id="abba:" + f"{1:064x}"),
         )
+        response = AbbaClient("http://abba:8080", session=session).submit(
+            "audiobooks", "Kaiju: Battlefield Surgeon", "Matt Dinniman", 42
+        )
+
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(sum(call[1].endswith("/api/grab") for call in session.calls), 1)
+
+    def test_the_same_book_without_an_author_still_asks(self):
+        # Request #286's form. The promotion is credited on the title half
+        # only, so with no author to evidence the blend is 0.787 -- still under
+        # the bar, and a lone option under the bar is not offered. The
+        # requester supplied less and is asked for more; that is the intended
+        # difference between #286 and #287.
+        response = self.submit(*self.KAIJU, title="Kaiju: Battlefield Surgeon")
 
         self.assertEqual(response["status"], "needs_selection")
         self.assertEqual(response["external_status"], "selection_low_confidence")
+
+    def test_a_book_that_merely_contains_the_request_is_not_promoted_over(self):
+        # "Dune" survives whole inside "Dune Messiah", so agreement is complete
+        # for a book nobody asked for. One step of promotion is what keeps it
+        # under the bar; this is the row that sets the ceiling on the bonus.
+        response = self.submit(
+            "Dune Messiah - Frank Herbert", title="Dune", author="Frank Herbert"
+        )
+
+        self.assertEqual(response["status"], "needs_selection")
+        self.assertEqual(response["selection_proposal"], ())
 
     def test_an_unevidenced_author_still_blocks_a_lone_confirmation(self):
         # The floor reads the blend, not the title, and this is why: an exact

@@ -11,6 +11,7 @@ sys.path.insert(0, str(HUEY_ROOT))
 import scoring_survey as survey
 from clients import AbbaClient
 from database import RequestStore
+from matching import agreement_promoted
 
 
 class FakeResponse:
@@ -90,6 +91,31 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(survey.BONUSES[0], 0.0)
         self.assertEqual(survey.BONUSES[1], 0.02)
         self.assertEqual(survey.BONUSES[-1], 0.12)
+
+    def test_the_shipped_bonus_is_always_in_the_sweep(self):
+        # Every projection is a delta from the shipped column, so it has to be
+        # a column. A shipped value outside the sweep would make the summary
+        # measure against a baseline that was never computed.
+        self.assertIn(round(survey.COMPLETE_AGREEMENT_BONUS, 2), survey.BONUSES)
+        self.assertIn(survey.BASELINE, [f"{bonus:.2f}" for bonus in survey.BONUSES])
+
+    def test_the_survey_knob_agrees_with_the_shipped_rule(self):
+        # Two statements of one rule. If they drift, every projection is a lie.
+        for score, title, candidate in (
+            (0.767, "Kaiju: Battlefield Surgeon", "Kaiju: Battlefield Surgeon: A LitRPG Adventure"),
+            (0.688, "Dune", "Dune Messiah - Frank Herbert"),
+            (0.500, "Leaders Eat Last", "Leaders - Simon Sinek"),
+            (0.995, "Dune", "Dune"),
+        ):
+            with self.subTest(candidate=candidate):
+                self.assertAlmostEqual(
+                    survey.promote(
+                        score,
+                        survey.title_agreement(title, candidate),
+                        survey.COMPLETE_AGREEMENT_BONUS,
+                    ),
+                    agreement_promoted(score, title, candidate),
+                )
 
 
 class RowSelectionTests(unittest.TestCase):
@@ -179,17 +205,20 @@ class ProjectionTests(unittest.TestCase):
         return record
 
     def test_request_288_moves_straight_to_auto_match(self):
-        # The point of the survey. 0.8182 blended against a 0.82 bar, with the
-        # runner-up 0.49 behind: the moment the promotion clears the floor the
-        # gap gate cannot engage, so the outcome is an acquisition and not a
-        # question. The smallest step in the sweep is already enough.
+        # The point of the survey, now shipped. 0.8182 blended against a 0.82
+        # bar with the runner-up 0.49 behind: the moment the promotion clears
+        # the floor the gap gate cannot engage, so the outcome is an
+        # acquisition and not a question. The 0.00 column is what this row did
+        # before the promotion landed; the baseline column is what it does now.
         record = self.surveyed(
             "Kaiju: Battlefield Surgeon by Matt Dinniman 2019", KAIJU
         )
 
         self.assertEqual(record["outcomes"]["0.00"], "decline_low_confidence")
-        self.assertEqual(record["outcomes"]["0.02"], "auto_match")
-        self.assertEqual(record["top_score"], 0.8182)
+        self.assertEqual(record["outcomes"][survey.BASELINE], "auto_match")
+        self.assertEqual(survey.BASELINE, "0.02")
+        # The live client score, promoted: 0.78 x (0.767 + 0.02) + 0.22.
+        self.assertEqual(record["top_score"], 0.8338)
 
     def test_a_book_that_merely_contains_the_request_stays_declined(self):
         # "Dune" is wholly present in "Dune Messiah", so recall is complete and

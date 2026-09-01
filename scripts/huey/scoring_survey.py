@@ -15,6 +15,11 @@ capped at 1.0. Nothing else moves. The sweep runs 0.00 to 0.12 in steps of
 0.02, which is the year rule's own step and its own cap, so no new number is
 introduced by the survey itself.
 
+The promotion has since shipped at ``COMPLETE_AGREEMENT_BONUS``, so every
+projection here is a delta from *that* column, not from zero. A zero-bonus
+column stopped describing live behaviour the moment it landed, and the
+self-check below is run against the shipped value for the same reason.
+
 **Nothing here writes.** The database is opened read-only, only search and
 lookup endpoints are called, and there is no code path to an add, a grab, or a
 Discord post. It exists to be read before anyone edits a scoring formula,
@@ -41,9 +46,11 @@ from typing import Any, Iterable, Mapping
 
 try:
     from .matching import (
+        COMPLETE_AGREEMENT_BONUS,
         RankedCandidate,
         Selection,
         normalize_text,
+        title_agreement,
         title_similarity,
     )
     from .parser import RequestParseError, parse_request
@@ -51,9 +58,11 @@ try:
     from .services import ServiceRegistry
 except ImportError:  # pragma: no cover - direct container entrypoint
     from matching import (
+        COMPLETE_AGREEMENT_BONUS,
         RankedCandidate,
         Selection,
         normalize_text,
+        title_agreement,
         title_similarity,
     )
     from parser import RequestParseError, parse_request
@@ -68,9 +77,20 @@ MEDIA_TYPES = ("audiobooks", "ebooks")
 AGREEMENT_STEP = 0.02
 AGREEMENT_CAP = 0.12
 BONUSES = tuple(
-    round(AGREEMENT_STEP * step, 2)
-    for step in range(int(round(AGREEMENT_CAP / AGREEMENT_STEP)) + 1)
+    sorted(
+        {
+            round(AGREEMENT_STEP * step, 2)
+            for step in range(int(round(AGREEMENT_CAP / AGREEMENT_STEP)) + 1)
+        }
+        # Whatever is shipped has to be in the sweep, or the baseline every
+        # projection is measured against would not be in the table.
+        | {round(COMPLETE_AGREEMENT_BONUS, 2)}
+    )
 )
+# The bonus production already applies. Every projection is a delta from here,
+# not from zero: a zero-bonus column stopped describing live behaviour the
+# moment the promotion shipped.
+BASELINE = f"{round(COMPLETE_AGREEMENT_BONUS, 2):.2f}"
 # Rows that already committed to an acquisition. A scoring change can only be
 # evaluated against these as a regression check: raising scores unevenly can
 # close a runner-up gap and turn a working auto-match into a prompt.
@@ -114,22 +134,14 @@ def survey_rows(
     return [dict(row) for row in rows]
 
 
-def recall(wanted: frozenset[str], value: object) -> float:
-    """Fraction of the requested title's tokens surviving in a candidate."""
-
-    if not wanted:
-        return 0.0
-    present = wanted & set(normalize_text(value).split())
-    return len(present) / len(wanted)
-
-
 def promote(score: float, agreement: float, bonus: float) -> float:
     """Credit complete agreement, and only complete agreement.
 
-    Partial overlap is already what the similarity score measures; promoting it
-    again would double-count the same evidence. Complete recall says something
-    the similarity cannot: every word the requester chose is present, and the
-    only difference left is that the candidate is *more* specific.
+    The shipped rule lives in ``matching.agreement_promoted`` and is fixed at
+    one bonus. This is the same rule with the bonus left as a knob, so a sweep
+    can be run without editing production scoring; ``title_agreement`` is
+    imported rather than restated so the two cannot disagree about what
+    complete agreement means.
     """
 
     if bonus <= 0 or agreement < 1.0:
@@ -152,12 +164,11 @@ def abba_ranked(
     numbers before any of this is believed.
     """
 
-    wanted = frozenset(normalize_text(title).split())
     rescored: list[RankedCandidate] = []
     for candidate in ranked:
         title_score = promote(
             client._release_title_score(title, candidate.item, author),
-            recall(wanted, candidate.item.get("title")),
+            title_agreement(title, candidate.item.get("title")),
             bonus,
         )
         if author:
@@ -193,7 +204,6 @@ def book_ranked(
 ) -> tuple[RankedCandidate, ...]:
     """Re-score Shelfarr/LazyLibrarian candidates, mirroring the selector."""
 
-    wanted = frozenset(normalize_text(title).split())
     wanted_author = normalize_text(author)
     rescored: list[RankedCandidate] = []
     for candidate in ranked:
@@ -201,7 +211,7 @@ def book_ranked(
         candidate_title = str(item.get("title") or "")
         title_score = promote(
             title_similarity(title, candidate_title),
-            recall(wanted, candidate_title),
+            title_agreement(title, candidate_title),
             bonus,
         )
         if author:
@@ -351,7 +361,7 @@ class Surveyor:
         # The survey's own arithmetic has to reproduce the client's before any
         # of its projections mean anything. A drift here is a bug in the
         # survey, and it is reported as one rather than averaged into a count.
-        baseline = rank(0.0)
+        baseline = rank(COMPLETE_AGREEMENT_BONUS)
         for original, recomputed in zip(live.ranked, baseline):
             if abs(original.score - recomputed.score) > 1e-9:
                 return {
@@ -402,17 +412,19 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     """Count what each bonus changes, and what it changes *into*."""
 
     summary: dict[str, Any] = {}
-    for bonus in BONUSES[1:]:
+    for bonus in BONUSES:
         key = f"{bonus:.2f}"
+        if key == BASELINE:
+            continue
         changed = [
             record
             for record in records
             if record.get("outcomes")
-            and record["outcomes"][key] != record["outcomes"]["0.00"]
+            and record["outcomes"][key] != record["outcomes"][BASELINE]
         ]
         transitions: dict[str, int] = {}
         for record in changed:
-            move = f"{record['outcomes']['0.00']} -> {record['outcomes'][key]}"
+            move = f"{record['outcomes'][BASELINE]} -> {record['outcomes'][key]}"
             transitions[move] = transitions.get(move, 0) + 1
         summary[key] = {
             "changed": len(changed),
@@ -420,7 +432,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
                 1 for record in changed if record["outcomes"][key] == AUTO_MATCH
             ),
             "out_of_auto_match": sum(
-                1 for record in changed if record["outcomes"]["0.00"] == AUTO_MATCH
+                1 for record in changed if record["outcomes"][BASELINE] == AUTO_MATCH
             ),
             "changed_by_media": _counted(record["media_type"] for record in changed),
             "changed_by_status": _counted(record["status"] for record in changed),
@@ -452,6 +464,7 @@ def report(
     surveyor = Surveyor(ServiceRegistry(dict(environment)), pause=pause)
     records = [surveyor.row(row) for row in rows]
     return {
+        "baseline": BASELINE,
         "bonuses": [f"{bonus:.2f}" for bonus in BONUSES],
         "statuses": list(statuses),
         "surveyed": len(records),
@@ -461,7 +474,7 @@ def report(
             if record.get("skipped")
         ),
         "baseline_outcomes": _counted(
-            record["outcomes"]["0.00"] for record in records if record.get("outcomes")
+            record["outcomes"][BASELINE] for record in records if record.get("outcomes")
         ),
         "by_bonus": summarize(records),
         "rows": records,

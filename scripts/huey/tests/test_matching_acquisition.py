@@ -20,7 +20,12 @@ from matching import (
     rank_arr_candidates,
     select_arr_candidate,
     select_release,
+    COMPLETE_AGREEMENT_BONUS,
+    YEAR_MISMATCH_PENALTY_PER_YEAR,
+    agreement_promoted,
     select_shelfarr_candidate,
+    title_agreement,
+    title_similarity,
 )
 from results import safe_display_title
 
@@ -204,6 +209,82 @@ class MatchingTests(unittest.TestCase):
         )
         self.assertEqual(selection.reason, "selected")
         self.assertEqual(selection.selected["author"], "Herbert, Frank")
+
+
+class AgreementPromotionTests(unittest.TestCase):
+    """Complete agreement is evidence; partial overlap already scored once."""
+
+    def test_only_complete_agreement_is_credited(self):
+        # "Dune" survives whole in "Dune Messiah"; "Leaders Eat Last" does not
+        # survive whole in "Leaders".
+        self.assertAlmostEqual(
+            agreement_promoted(0.688, "Dune", "Dune Messiah - Frank Herbert"),
+            0.688 + COMPLETE_AGREEMENT_BONUS,
+        )
+        self.assertEqual(
+            agreement_promoted(0.500, "Leaders Eat Last", "Leaders - Simon Sinek"),
+            0.500,
+        )
+
+    def test_a_whole_score_cannot_be_promoted_past_one(self):
+        self.assertEqual(agreement_promoted(0.995, "Dune", "Dune"), 1.0)
+
+    def test_an_empty_request_is_never_promoted(self):
+        # No tokens means no agreement to credit, not vacuous agreement.
+        self.assertEqual(agreement_promoted(0.4, "", "Dune"), 0.4)
+        self.assertEqual(title_agreement("", "Dune"), 0.0)
+
+    def test_the_bonus_is_one_step_of_the_year_rule(self):
+        # Bounded promotion mirroring a bounded demotion, and deliberately the
+        # smallest step: 0.10 starts auto-acquiring "Dune Messiah" for "Dune".
+        self.assertEqual(COMPLETE_AGREEMENT_BONUS, YEAR_MISMATCH_PENALTY_PER_YEAR)
+
+    def test_a_more_specific_book_reaches_the_metadata_gate(self):
+        def candidate(title, work_id):
+            return {
+                "work_id": work_id,
+                "title": title,
+                "author": "Matt Dinniman",
+                "content_kind": "book",
+                "available_book_types": ["ebook"],
+            }
+
+        selection = select_shelfarr_candidate(
+            "Kaiju: Battlefield Surgeon",
+            "Matt Dinniman",
+            "ebooks",
+            [candidate("Kaiju: Battlefield Surgeon: A LitRPG Adventure", "ol:1")],
+        )
+        unpromoted = title_similarity(
+            "Kaiju: Battlefield Surgeon",
+            "Kaiju: Battlefield Surgeon: A LitRPG Adventure",
+        )
+
+        self.assertAlmostEqual(
+            selection.ranked[0].score,
+            0.74 * (unpromoted + COMPLETE_AGREEMENT_BONUS) + 0.26,
+        )
+
+    def test_a_partial_match_is_scored_exactly_as_before(self):
+        selection = select_shelfarr_candidate(
+            "Leaders Eat Last",
+            "Simon Sinek",
+            "ebooks",
+            [
+                {
+                    "work_id": "ol:2",
+                    "title": "Leaders",
+                    "author": "Simon Sinek",
+                    "content_kind": "book",
+                    "available_book_types": ["ebook"],
+                }
+            ],
+        )
+
+        self.assertAlmostEqual(
+            selection.ranked[0].score,
+            0.74 * title_similarity("Leaders Eat Last", "Leaders") + 0.26,
+        )
 
 
 class DirectAcquirerTests(unittest.TestCase):

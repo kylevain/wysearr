@@ -425,7 +425,7 @@ evaluation against the backlog.
 Lowering `HUEY_ABBA_MINIMUM_CONFIDENCE` reaches #288 the same way and is worse:
 it moves every auto-accept at once. Do not treat it as the small fix.
 
-## Before scoring agreement: the survey, and what it already shows
+## Agreement is scored, at 0.02, chosen against the backlog
 
 `scripts/huey/scoring_survey.py` is the read-only evaluation of the
 agreement-scoring change, in the same posture as `redrive_selection.py`:
@@ -444,9 +444,29 @@ filtering and gates are the clients' own, and a row whose zero-bonus
 recomputation disagrees with the client is reported as survey drift rather
 than counted.
 
-Three things are already settled by arithmetic, before the backlog is read:
+**The value shipped is 0.02**, read off the live survey rather than argued:
+three of thirty-eight rows change. Two are #287 and #288 reaching an automatic
+match -- the case that started this. The third is #14, "A Court of Thorns and
+Roses", moving *out* of `auto_match` into a two-option picker, which is an
+accepted trade: it currently acquires without showing alternatives, and one tap
+is cheap. Every higher bonus only adds #286, the bare-title form with no
+author, which should still be asked about.
 
-- **This change cannot produce pickers. It produces acquisitions.** #288 is
+The promotion is credited on the **title half only**. #286 stays at 0.787 for
+exactly that reason: with no author supplied there is nothing to evidence, and
+a requester who typed less is asked for more. It also keeps the wrong-author
+hole shut -- `Brian Herbert - Dune` is 1.000 on the title and its penalty sits
+on the author half, which the promotion never touches.
+
+`COMPLETE_AGREEMENT_BONUS` lives in `matching.py` and is applied in exactly two
+places: `AbbaClient._selection` and `select_shelfarr_candidate`. The ABBA
+picker's own display floor (`PICKER_MIN_TITLE_SCORE`) deliberately still reads
+the **unpromoted** title score -- that gate was not part of what the survey
+modelled, so changing it would ship something nobody evaluated.
+
+Three things are settled by arithmetic, independent of the backlog:
+
+- **This change mostly cannot produce pickers. It produces acquisitions.** #288 is
   0.8182 against 0.82 with its runner-up 0.49 behind, so the moment the
   promotion clears the floor the runner-up gap cannot engage and the outcome
   is `selected` -- acquired, nobody asked. The smallest step in the sweep,
@@ -462,9 +482,10 @@ Three things are already settled by arithmetic, before the backlog is read:
   nowhere near. #279-#281 stay a picker problem; only #288-shaped requests,
   where the release adds a short subtitle, move at all.
 
-The wrong-author hole stays shut: `Brian Herbert - Dune` is 1.000 on the title
-and unmoved at every bonus, because its penalty is on the author half of the
-blend and the promotion never touches that.
+Every projection the survey prints is now a delta from the **shipped** column,
+not from zero: a zero-bonus column stopped describing live behaviour the moment
+0.02 landed, and the survey's self-check runs against the shipped value for the
+same reason. Re-run it before changing the constant again.
 
 ## What AudioBookBay listings actually look like
 
