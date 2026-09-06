@@ -2356,6 +2356,13 @@ class LazyLibrarianClient(JsonClient):
 class AbbaClient(JsonClient):
     """Strict AudioBookBay search/grab client with Huey-owned selection."""
 
+    # ABBA validates ``limit`` against its own ABBA_MAX_RESULTS, which is
+    # itself capped at 10 (docker/abba/app.py) and pinned to "10" in
+    # docker-compose.yml with no env indirection. This bound was 20, so an
+    # ABBA_SEARCH_LIMIT of 11-20 was accepted here and then rejected by ABBA
+    # with a 400 on every single search. Named rather than repeated so this
+    # ceiling and services.py cannot drift apart again.
+    MAX_SEARCH_LIMIT = 10
     MAX_PROPOSAL_CANDIDATES = 3
     # Display-only gates, mirroring the ARR picker and having no bearing on what
     # ``_selection`` auto-accepts: that still requires ``minimum_confidence``
@@ -2434,9 +2441,11 @@ class AbbaClient(JsonClient):
         if (
             isinstance(search_limit, bool)
             or not isinstance(search_limit, int)
-            or not 1 <= search_limit <= 20
+            or not 1 <= search_limit <= self.MAX_SEARCH_LIMIT
         ):
-            raise ValueError("ABBA search_limit must be between 1 and 20")
+            raise ValueError(
+                f"ABBA search_limit must be between 1 and {self.MAX_SEARCH_LIMIT}"
+            )
         if not 0 <= minimum_confidence <= 1:
             raise ValueError("ABBA minimum_confidence must be between 0 and 1")
         if not 0 <= runner_up_gap <= 1:

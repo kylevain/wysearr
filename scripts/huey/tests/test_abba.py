@@ -1823,8 +1823,13 @@ class AbbaRoutingAndRecoveryTests(unittest.TestCase):
     def test_registry_uses_canonical_abba_port_by_default(self):
         registry = ServiceRegistry({"ABBA_ENABLED": "true"})
         self.assertEqual(registry.abba().base_url, "http://abba:5078/")
-        with self.assertRaisesRegex(ValueError, "between 1 and 20"):
-            AbbaClient("http://abba:5078", search_limit=21)
+        # ABBA validates limit against its own ABBA_MAX_RESULTS ceiling of 10,
+        # so 11-20 was accepted here and 400ed on every search.
+        with self.assertRaisesRegex(ValueError, "between 1 and 10"):
+            AbbaClient("http://abba:5078", search_limit=11)
+        self.assertEqual(AbbaClient.MAX_SEARCH_LIMIT, 10)
+        with self.assertRaisesRegex(ValueError, "ABBA_SEARCH_LIMIT"):
+            ServiceRegistry({"ABBA_ENABLED": "true", "ABBA_SEARCH_LIMIT": "11"}).abba()
         with self.assertRaisesRegex(ValueError, "literal true or false"):
             ServiceRegistry({"ABBA_ENABLED": "TRUE"})
 

@@ -9,6 +9,17 @@ class RequestParseError(ValueError):
     """Raised when a Discord request cannot be parsed safely."""
 
 
+class ReservedRequestSyntax(RequestParseError):
+    """Raised for text reserved for a feature that does not exist yet.
+
+    Deliberately a *subclass*, so every existing ``except RequestParseError``
+    caller keeps its behaviour with no edit: the target-key backfill, the
+    surveys and the probe all read reserved text as "identifies no work",
+    which is exactly the required outcome -- it must reserve no target key
+    and must never reach an acquisition service.
+    """
+
+
 _MOVIE_TV_RE = re.compile(r"^(movie|tv)(?:(?:\s*:\s*)|\s+)(.+)$", re.IGNORECASE)
 _AUTHOR_DELIMITER_RE = re.compile(r"\s+by\s+", re.IGNORECASE)
 # A publication year trailing an author, and nothing more permissive than that.
@@ -18,6 +29,21 @@ _AUTHOR_DELIMITER_RE = re.compile(r"\s+by\s+", re.IGNORECASE)
 # stays rejected, because that is a name with a number in it, not a year.
 _TRAILING_YEAR_RE = re.compile(r"\s+(1\d{3}|20\d{2})\Z")
 _AUTHOR_MEDIA = frozenset({"ebooks", "audiobooks"})
+# ``Author:`` names a person to browse, not a work to acquire, and until the
+# browse exists it must not be parsed at all. There is no " by " to split on,
+# so "Author: Brandon Sanderson" would otherwise parse as a four-word *title*,
+# clear ``identifies_a_work``, reserve a real ``target_key`` and be dispatched
+# to an acquisition service, which is request #126's failure mode exactly.
+#
+# The colon is required. ``_MOVIE_TV_RE`` also accepts a space-separated
+# prefix, but only because a prefix is mandatory in that channel; here a bare
+# "Author X" form would swallow real titles.
+_RESERVED_BOOK_SYNTAX = re.compile(r"^authors?\s*:", re.IGNORECASE)
+_RESERVED_SYNTAX_NOTICE = (
+    "Huey cannot browse by author yet, so this was not saved as a request. "
+    "To request a book, send its title on its own "
+    "(for example, `The Way of Kings by Brandon Sanderson`)."
+)
 _NATURAL_TITLE_MEDIA = frozenset(
     {"ebooks", "audiobooks", "manga-comics", "roms", "sheet-music", "music"}
 )
@@ -25,6 +51,28 @@ _NATURAL_TITLE_MEDIA = frozenset(
 
 def _clean(value: str) -> str:
     return " ".join(value.strip().split())
+
+
+def _is_author_channel(media_type: str | None) -> bool:
+    normalized = media_type.lower() if isinstance(media_type, str) else None
+    return normalized in _AUTHOR_MEDIA or normalized is None
+
+
+def reserved_syntax_notice(text: object, media_type: str | None = None) -> str | None:
+    """Return the requester-facing notice if this text is reserved, else None.
+
+    Exposed so the Discord layer can decline the message *before* it is
+    persisted. A reserved message is not a failed request -- it is not a
+    request -- so it should not land in the ``needs_selection`` backlog that
+    nothing retries, and Louie should not show it as ``unparsed``.
+    ``parse_request`` enforces the same rule for every other caller.
+    """
+
+    if not isinstance(text, str) or not _is_author_channel(media_type):
+        return None
+    if _RESERVED_BOOK_SYNTAX.match(_clean(text)):
+        return _RESERVED_SYNTAX_NOTICE
+    return None
 
 
 def _split_trailing_year(value: str) -> tuple[str, int | None]:
@@ -100,6 +148,9 @@ def parse_request(text: str, media_type: str | None = None) -> dict[str, str | N
 
     if normalized_media_type not in _NATURAL_TITLE_MEDIA and normalized_media_type is not None:
         raise RequestParseError(f"Unsupported request channel type: {normalized_media_type}")
+
+    if _RESERVED_BOOK_SYNTAX.match(cleaned) and _is_author_channel(normalized_media_type):
+        raise ReservedRequestSyntax(_RESERVED_SYNTAX_NOTICE)
 
     author = None
     year: int | None = None

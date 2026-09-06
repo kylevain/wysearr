@@ -302,6 +302,64 @@ one long title. A row acquired under the old parse will not coalesce with a new
 request typed the same way; the result is a duplicate request, not lost data,
 and it only affects requests carrying a trailing year after an author.
 
+## `Author:` is reserved, and reserving it was urgent on its own
+
+`Author: Brandon Sanderson` in `#audiobooks` was live the moment it was typed,
+whether or not an author browse existed. The parser had no keyword concept in
+the book channels -- `_MOVIE_TV_RE` exists only for `movies-tv` -- and the
+string contains no ` by `, so it parsed as a four-word **title**. That clears
+`identifies_a_work` easily (long, alphabetic, not a format token), so
+`request_target_key` returned a real key, a real `queued` row was created, and
+ABBA searched AudioBookBay for the literal string. **That is request #126's
+failure mode exactly**: a message naming no work becoming a queued acquisition
+and the active owner of a target key.
+
+The reservation lives in two places on purpose:
+
+- `parser.py` raises `ReservedRequestSyntax`, **a subclass of
+  `RequestParseError`**, so every existing `except RequestParseError` caller
+  keeps its behaviour with no edit. `_backfill_target_keys`, `redrive_selection`,
+  `scoring_survey` and `abba_probe` all read reserved text as "identifies no
+  work", which is the required outcome -- it must reserve no target key and must
+  never reach an acquisition service.
+- `huey.py` declines it *before* `processor.process`, via
+  `reserved_syntax_notice`, alongside the bare-ordinal guard. This is not
+  redundant: a `RequestParseError` **still persists a `needs_selection` row**
+  (`orchestrator.py`, `parse_rejected`). A reserved message is not a request
+  that failed, it is not a request, so it belongs neither in the 75-row backlog
+  that nothing retries nor in Louie's `unparsed` bucket.
+
+**The colon is required.** `_MOVIE_TV_RE` also accepts a space-separated prefix,
+but only because a prefix is mandatory in that channel; here a bare `Author X`
+form would swallow real titles. `The Death of the Author` and
+`Author Author by Rebecca Kuang` both still parse normally. The rule is scoped
+to `_AUTHOR_MEDIA` (`ebooks`, `audiobooks`), not `_NATURAL_TITLE_MEDIA`: there
+is no author browse in `#manga-comics` or `#roms` to reserve for.
+
+This was the first reserved keyword in a book channel. `_SELECTION_MEDIA_TYPES`
+was previously the only non-request branch in the entire message handler.
+
+## `ABBA_SEARCH_LIMIT` could exceed what ABBA accepts
+
+`AbbaClient` validated `search_limit` as `1..20` while ABBA validates `limit`
+against its own `ABBA_MAX_RESULTS`, which is itself capped at 10
+(`_env_int(source, "ABBA_MAX_RESULTS", 10, 1, 10)`) and pinned to `"10"` in
+`docker-compose.yml` with no env indirection. An `ABBA_SEARCH_LIMIT` of 11-20
+was therefore accepted by Huey and rejected by ABBA with a 400 on **every**
+audiobook search. Latent only because the value is 10.
+
+The ceiling is now `AbbaClient.MAX_SEARCH_LIMIT`, read by both the constructor
+and `services.py`, so the two cannot drift apart again.
+
+**ABBA cannot return more than 10 results for any query, and there is no
+pagination.** `PAGE_LIMIT` is `_env_int(source, "PAGE_LIMIT", 1, 1, 1)` -- min
+and max both 1 -- and is then never read anywhere; the scraper takes
+`soup.select(".post")` off page one and stops. Walking `/page/N/` would be a
+service change: a new search method, a new API parameter, a
+`SEARCH_CONTRACT_VERSION` bump because the cache key includes `limit`, and a
+re-audit of `_candidate_path`'s allowed-path check. Not done, deliberately --
+see whether 10 is actually annoying first.
+
 ## Known limitation: the parser keeps the author inside the title
 
 `parse_request` only splits an author off when the text contains ` by `.

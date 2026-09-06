@@ -435,7 +435,7 @@ class ServiceRegistry:
                 self._env("ABBA_SEARCH_LIMIT", "10"),
                 "ABBA_SEARCH_LIMIT",
                 1,
-                20,
+                AbbaClient.MAX_SEARCH_LIMIT,
             ),
             minimum_confidence=_bounded_float(
                 self._env("HUEY_ABBA_MINIMUM_CONFIDENCE", "0.82"),

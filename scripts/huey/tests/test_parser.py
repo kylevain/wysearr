@@ -6,7 +6,12 @@ from pathlib import Path
 HUEY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HUEY_ROOT))
 
-from parser import RequestParseError, parse_request
+from parser import (
+    RequestParseError,
+    ReservedRequestSyntax,
+    parse_request,
+    reserved_syntax_notice,
+)
 
 
 class ParserTests(unittest.TestCase):
@@ -116,6 +121,77 @@ class TrailingYearAuthorTests(unittest.TestCase):
         for raw in ("Something by Author 999", "Something by Author 20199"):
             with self.subTest(raw=raw):
                 self.assertIsNone(self.parse(raw)["author"])
+
+
+class ReservedAuthorSyntaxTests(unittest.TestCase):
+    """``Author:`` must never become a request. This is #126's failure mode."""
+
+    BOOK_CHANNELS = ("ebooks", "audiobooks")
+
+    def test_author_prefix_is_rejected_in_both_book_channels(self):
+        for media_type in self.BOOK_CHANNELS:
+            for raw in (
+                "Author: Brandon Sanderson",
+                "author:Brandon Sanderson",
+                "AUTHOR : Brandon Sanderson",
+                "Authors: Brandon Sanderson",
+                "  Author:   Brandon Sanderson  ",
+            ):
+                with self.subTest(media_type=media_type, raw=raw):
+                    with self.assertRaises(ReservedRequestSyntax):
+                        parse_request(raw, media_type)
+
+    def test_a_bare_keyword_is_reserved_too(self):
+        """"Author:" alone names no work either, so it must not parse."""
+
+        with self.assertRaises(ReservedRequestSyntax):
+            parse_request("Author:", "audiobooks")
+
+    def test_reserved_syntax_is_a_parse_error_for_existing_callers(self):
+        """The backfill and surveys catch RequestParseError and skip the row.
+
+        Subclassing is what keeps them correct with no edit: reserved text
+        must reserve no target key.
+        """
+
+        with self.assertRaises(RequestParseError):
+            parse_request("Author: Brandon Sanderson", "ebooks")
+
+    def test_the_colon_is_required(self):
+        """A bare space form would swallow real titles, so it is not reserved."""
+
+        parsed = parse_request("Author Author by Rebecca Kuang", "ebooks")
+        self.assertEqual(parsed["title"], "Author Author")
+        self.assertEqual(parsed["author"], "Rebecca Kuang")
+
+    def test_a_title_merely_containing_author_is_untouched(self):
+        parsed = parse_request("The Death of the Author", "ebooks")
+        self.assertEqual(parsed["title"], "The Death of the Author")
+
+    def test_other_channels_keep_the_text_as_a_title(self):
+        """There is no author browse outside the book channels to reserve for."""
+
+        parsed = parse_request("Author: Osamu Tezuka", "manga-comics")
+        self.assertEqual(parsed["title"], "Author: Osamu Tezuka")
+
+    def test_movies_tv_is_unaffected(self):
+        with self.assertRaises(RequestParseError) as caught:
+            parse_request("Author: Brandon Sanderson", "movies-tv")
+        self.assertNotIsInstance(caught.exception, ReservedRequestSyntax)
+
+    def test_notice_matches_the_parser_and_names_the_channel_rule(self):
+        notice = reserved_syntax_notice("Author: Brandon Sanderson", "audiobooks")
+        self.assertIsNotNone(notice)
+        with self.assertRaises(ReservedRequestSyntax) as caught:
+            parse_request("Author: Brandon Sanderson", "audiobooks")
+        self.assertEqual(str(caught.exception), notice)
+
+    def test_notice_is_none_for_ordinary_and_non_book_input(self):
+        self.assertIsNone(reserved_syntax_notice("Dune by Frank Herbert", "ebooks"))
+        self.assertIsNone(reserved_syntax_notice("Author: Osamu Tezuka", "roms"))
+        self.assertIsNone(reserved_syntax_notice("Author: X", "movies-tv"))
+        self.assertIsNone(reserved_syntax_notice(None, "ebooks"))
+        self.assertIsNone(reserved_syntax_notice(12, "ebooks"))
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ try:
         terminal_notifications,
     )
     from .orchestrator import RequestProcessor
+    from .parser import reserved_syntax_notice
     from .physical_media import PhysicalMediaIntake, PhysicalRadarrClient, PhysicalSonarrClient
     from .results import sanitize_display_text
     from .services import ServiceRegistry
@@ -48,6 +49,7 @@ except ImportError:  # Direct execution from /app/scripts/huey/huey.py.
         terminal_notifications,
     )
     from orchestrator import RequestProcessor
+    from parser import reserved_syntax_notice
     from physical_media import PhysicalMediaIntake, PhysicalRadarrClient, PhysicalSonarrClient
     from results import sanitize_display_text
     from services import ServiceRegistry
@@ -2011,6 +2013,23 @@ def build_client(
             except Exception as error:
                 LOGGER.warning(
                     "Could not send standalone selection correction (%s)",
+                    type(error).__name__,
+                )
+            return
+
+        # ``Author:`` is reserved for a browse Huey cannot do yet. It has to be
+        # declined here rather than by the parser's own rejection, because a
+        # RequestParseError still persists a ``needs_selection`` row: this is
+        # not a request that failed, it is not a request, and it belongs in
+        # neither the backlog nor Louie's ``unparsed`` bucket. The parser
+        # raises for every other caller so no path can key it.
+        reserved = reserved_syntax_notice(message.content, media_type)
+        if reserved is not None:
+            try:
+                await message.reply(f"\u26a0\ufe0f {reserved}")
+            except Exception as error:
+                LOGGER.warning(
+                    "Could not send reserved syntax notice (%s)",
                     type(error).__name__,
                 )
             return
