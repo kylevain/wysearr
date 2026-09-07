@@ -332,12 +332,46 @@ The reservation lives in two places on purpose:
 **The colon is required.** `_MOVIE_TV_RE` also accepts a space-separated prefix,
 but only because a prefix is mandatory in that channel; here a bare `Author X`
 form would swallow real titles. `The Death of the Author` and
-`Author Author by Rebecca Kuang` both still parse normally. The rule is scoped
-to `_AUTHOR_MEDIA` (`ebooks`, `audiobooks`), not `_NATURAL_TITLE_MEDIA`: there
-is no author browse in `#manga-comics` or `#roms` to reserve for.
+`Author Author by Rebecca Kuang` both still parse normally.
 
 This was the first reserved keyword in a book channel. `_SELECTION_MEDIA_TYPES`
 was previously the only non-request branch in the entire message handler.
+
+### The browse exists, in Pilot, and the notice points at it
+
+Feature A -- an ABBA author listing in Huey -- was **cancelled**, not deferred.
+Pilot took the route instead: Dewey already had an Open Library catalogue, a
+durable numbered-choice state machine, and a content-agnostic Discord
+transport. Pilot browses, the requester picks a number, and Dewey posts the
+chosen title into the channel as an ordinary request that Huey handles
+normally. No ABBA 10-result ceiling, no Discord ordinals, no 15-minute browse
+expiry, nothing in `candidate_confirmations`.
+
+So the notice must not say "yet". It names Pilot, and it leads with
+**"Nothing was saved"** because the whole point of the reservation is that no
+row and no `target_key` were created -- a requester left wondering whether
+something got queued is the confusion this prevents.
+
+**The reservation covers every channel Pilot can browse**, which is
+`_AUTHOR_BROWSE_MEDIA` = `_AUTHOR_MEDIA` + `manga-comics`, deliberately a
+*separate* set from `_AUTHOR_MEDIA` so manga-comics does not also gain
+`TITLE by AUTHOR` splitting. `#manga-comics` is not a lower-stakes channel:
+its handler is `handle_direct`, which submits straight to an acquisition
+service, so `Author: Osamu Tezuka` there is the same accidental acquisition as
+in the book channels. `#roms`, `#sheet-music` and `#music` are not browsable in
+Pilot and keep the text as an ordinary title.
+
+**The per-channel example is not decoration.** manga-comics does not split
+` by `, so offering `Pluto by Naoki Urasawa` as the direct-request form there
+would recommend the exact shape that buries an author inside a title (see *the
+parser keeps the author inside the title*). That channel is told to send
+`Pluto`; the book channels are told `Project Hail Mary by Andy Weir`.
+
+Dewey's own posts pass through the same guard, since they enter through the
+ordinary `on_message` path. They carry a plain Open Library title, so they
+cannot match `^authors?\s*:` -- and if Open Library ever returns a work whose
+title genuinely begins `Author:`, that is left failing loudly rather than
+widening the guard for it.
 
 ## `ABBA_SEARCH_LIMIT` could exceed what ABBA accepts
 
@@ -357,8 +391,10 @@ and max both 1 -- and is then never read anywhere; the scraper takes
 `soup.select(".post")` off page one and stops. Walking `/page/N/` would be a
 service change: a new search method, a new API parameter, a
 `SEARCH_CONTRACT_VERSION` bump because the cache key includes `limit`, and a
-re-audit of `_candidate_path`'s allowed-path check. Not done, deliberately --
-see whether 10 is actually annoying first.
+re-audit of `_candidate_path`'s allowed-path check. **Not done, and no longer
+needed for browsing**: the author browse went to Pilot over Open Library, which
+has no such ceiling. The 10 still bounds every ordinary title search, where it
+has never been the binding constraint.
 
 ## Known limitation: the parser keeps the author inside the title
 

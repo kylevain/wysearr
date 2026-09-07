@@ -126,10 +126,11 @@ class TrailingYearAuthorTests(unittest.TestCase):
 class ReservedAuthorSyntaxTests(unittest.TestCase):
     """``Author:`` must never become a request. This is #126's failure mode."""
 
-    BOOK_CHANNELS = ("ebooks", "audiobooks")
+    # Every channel Pilot can browse, not just the two that split " by ".
+    BROWSE_CHANNELS = ("ebooks", "audiobooks", "manga-comics")
 
-    def test_author_prefix_is_rejected_in_both_book_channels(self):
-        for media_type in self.BOOK_CHANNELS:
+    def test_author_prefix_is_rejected_in_every_browsable_channel(self):
+        for media_type in self.BROWSE_CHANNELS:
             for raw in (
                 "Author: Brandon Sanderson",
                 "author:Brandon Sanderson",
@@ -168,11 +169,46 @@ class ReservedAuthorSyntaxTests(unittest.TestCase):
         parsed = parse_request("The Death of the Author", "ebooks")
         self.assertEqual(parsed["title"], "The Death of the Author")
 
-    def test_other_channels_keep_the_text_as_a_title(self):
-        """There is no author browse outside the book channels to reserve for."""
+    def test_manga_comics_is_reserved_because_it_reaches_an_acquisition_service(self):
+        """``handle_direct`` submits, so the accidental-acquisition risk is equal."""
 
-        parsed = parse_request("Author: Osamu Tezuka", "manga-comics")
-        self.assertEqual(parsed["title"], "Author: Osamu Tezuka")
+        with self.assertRaises(ReservedRequestSyntax):
+            parse_request("Author: Osamu Tezuka", "manga-comics")
+
+    def test_manga_comics_did_not_gain_author_splitting(self):
+        """The reservation set is separate from ``_AUTHOR_MEDIA`` on purpose."""
+
+        parsed = parse_request("Pluto by Naoki Urasawa", "manga-comics")
+        self.assertIsNone(parsed["author"])
+        self.assertEqual(parsed["title"], "Pluto by Naoki Urasawa")
+
+    def test_channels_pilot_cannot_browse_keep_the_text_as_a_title(self):
+        for media_type in ("roms", "sheet-music", "music"):
+            with self.subTest(media_type=media_type):
+                parsed = parse_request("Author: Someone", media_type)
+                self.assertEqual(parsed["title"], "Author: Someone")
+
+    def test_the_example_matches_the_channel(self):
+        """A #manga-comics reader must not be told to type "Title by Author"."""
+
+        for media_type in ("ebooks", "audiobooks"):
+            with self.subTest(media_type=media_type):
+                notice = reserved_syntax_notice("Author: X", media_type)
+                self.assertIn(f"show me {media_type} by Andy Weir", notice)
+                self.assertIn("`Project Hail Mary by Andy Weir`", notice)
+
+        manga = reserved_syntax_notice("Author: X", "manga-comics")
+        self.assertIn("show me comics by Naoki Urasawa", manga)
+        self.assertIn("`Pluto`", manga)
+        self.assertNotIn(" by Naoki Urasawa`", manga)
+
+    def test_every_notice_points_at_pilot_and_says_nothing_was_saved(self):
+        for media_type in self.BROWSE_CHANNELS:
+            with self.subTest(media_type=media_type):
+                notice = reserved_syntax_notice("Author: X", media_type)
+                self.assertIn("Nothing was saved", notice)
+                self.assertIn("Pilot", notice)
+                self.assertNotIn("yet", notice)
 
     def test_movies_tv_is_unaffected(self):
         with self.assertRaises(RequestParseError) as caught:
@@ -188,7 +224,7 @@ class ReservedAuthorSyntaxTests(unittest.TestCase):
 
     def test_notice_is_none_for_ordinary_and_non_book_input(self):
         self.assertIsNone(reserved_syntax_notice("Dune by Frank Herbert", "ebooks"))
-        self.assertIsNone(reserved_syntax_notice("Author: Osamu Tezuka", "roms"))
+        self.assertIsNone(reserved_syntax_notice("Author: Someone", "roms"))
         self.assertIsNone(reserved_syntax_notice("Author: X", "movies-tv"))
         self.assertIsNone(reserved_syntax_notice(None, "ebooks"))
         self.assertIsNone(reserved_syntax_notice(12, "ebooks"))

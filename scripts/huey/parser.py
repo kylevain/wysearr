@@ -29,9 +29,9 @@ _AUTHOR_DELIMITER_RE = re.compile(r"\s+by\s+", re.IGNORECASE)
 # stays rejected, because that is a name with a number in it, not a year.
 _TRAILING_YEAR_RE = re.compile(r"\s+(1\d{3}|20\d{2})\Z")
 _AUTHOR_MEDIA = frozenset({"ebooks", "audiobooks"})
-# ``Author:`` names a person to browse, not a work to acquire, and until the
-# browse exists it must not be parsed at all. There is no " by " to split on,
-# so "Author: Brandon Sanderson" would otherwise parse as a four-word *title*,
+# ``Author:`` names a person to browse, not a work to acquire, so Huey must not
+# parse it at all. There is no " by " to split on, so "Author: Brandon
+# Sanderson" would otherwise parse as a four-word *title*,
 # clear ``identifies_a_work``, reserve a real ``target_key`` and be dispatched
 # to an acquisition service, which is request #126's failure mode exactly.
 #
@@ -39,23 +39,50 @@ _AUTHOR_MEDIA = frozenset({"ebooks", "audiobooks"})
 # prefix, but only because a prefix is mandatory in that channel; here a bare
 # "Author X" form would swallow real titles.
 _RESERVED_BOOK_SYNTAX = re.compile(r"^authors?\s*:", re.IGNORECASE)
-_RESERVED_SYNTAX_NOTICE = (
-    "Huey cannot browse by author yet, so this was not saved as a request. "
-    "To request a book, send its title on its own "
-    "(for example, `The Way of Kings by Brandon Sanderson`)."
-)
+# Browsing by author exists, in Pilot, which advertises ebooks, audiobooks and
+# comics/manga. So the reservation covers every channel Pilot can browse, not
+# just the two that split " by ": ``manga-comics`` reaches ``handle_direct``,
+# which submits straight to an acquisition service, so "Author: Osamu Tezuka"
+# there is the same accidental acquisition as in the book channels.
+#
+# Deliberately a separate set from ``_AUTHOR_MEDIA``. That set governs
+# ``TITLE by AUTHOR`` splitting, which manga-comics must not gain.
+_AUTHOR_BROWSE_MEDIA = _AUTHOR_MEDIA | frozenset({"manga-comics"})
+# Pilot's phrasing and a directly-requestable title, per channel. The direct
+# example is not decoration: manga-comics does not split " by ", so suggesting
+# "Pluto by Naoki Urasawa" there would recommend the exact shape that buries an
+# author inside a title (see "the parser keeps the author inside the title").
+_BROWSE_EXAMPLES = {
+    "ebooks": ("ebooks by Andy Weir", "`Project Hail Mary by Andy Weir`"),
+    "audiobooks": ("audiobooks by Andy Weir", "`Project Hail Mary by Andy Weir`"),
+    "manga-comics": ("comics by Naoki Urasawa", "`Pluto`"),
+}
+_DEFAULT_BROWSE_EXAMPLE = _BROWSE_EXAMPLES["ebooks"]
+
 _NATURAL_TITLE_MEDIA = frozenset(
     {"ebooks", "audiobooks", "manga-comics", "roms", "sheet-music", "music"}
 )
+
+
+def _reserved_syntax_notice(media_type: str | None) -> str:
+    """Build the notice, with the example matching the channel it is sent to."""
+
+    normalized = media_type.lower() if isinstance(media_type, str) else None
+    browse, example = _BROWSE_EXAMPLES.get(normalized, _DEFAULT_BROWSE_EXAMPLE)
+    return (
+        "Nothing was saved — Huey doesn't browse by author. Ask Pilot instead "
+        f'("show me {browse}"); pick a number and it posts your choice here as '
+        f"a normal request. To request one directly, send its title, like {example}."
+    )
 
 
 def _clean(value: str) -> str:
     return " ".join(value.strip().split())
 
 
-def _is_author_channel(media_type: str | None) -> bool:
+def _is_browse_channel(media_type: str | None) -> bool:
     normalized = media_type.lower() if isinstance(media_type, str) else None
-    return normalized in _AUTHOR_MEDIA or normalized is None
+    return normalized in _AUTHOR_BROWSE_MEDIA or normalized is None
 
 
 def reserved_syntax_notice(text: object, media_type: str | None = None) -> str | None:
@@ -68,10 +95,10 @@ def reserved_syntax_notice(text: object, media_type: str | None = None) -> str |
     ``parse_request`` enforces the same rule for every other caller.
     """
 
-    if not isinstance(text, str) or not _is_author_channel(media_type):
+    if not isinstance(text, str) or not _is_browse_channel(media_type):
         return None
     if _RESERVED_BOOK_SYNTAX.match(_clean(text)):
-        return _RESERVED_SYNTAX_NOTICE
+        return _reserved_syntax_notice(media_type)
     return None
 
 
@@ -149,8 +176,8 @@ def parse_request(text: str, media_type: str | None = None) -> dict[str, str | N
     if normalized_media_type not in _NATURAL_TITLE_MEDIA and normalized_media_type is not None:
         raise RequestParseError(f"Unsupported request channel type: {normalized_media_type}")
 
-    if _RESERVED_BOOK_SYNTAX.match(cleaned) and _is_author_channel(normalized_media_type):
-        raise ReservedRequestSyntax(_RESERVED_SYNTAX_NOTICE)
+    if _RESERVED_BOOK_SYNTAX.match(cleaned) and _is_browse_channel(normalized_media_type):
+        raise ReservedRequestSyntax(_reserved_syntax_notice(normalized_media_type))
 
     author = None
     year: int | None = None
