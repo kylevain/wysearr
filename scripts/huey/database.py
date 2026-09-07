@@ -309,9 +309,17 @@ def _ebook_backend_identity(backend: str, value: object) -> str:
 class RequestStore:
     """Small transaction-oriented repository around the Huey SQLite database."""
 
-    def __init__(self, path: str | Path, schema_path: str | Path | None = None):
+    def __init__(self, path: str | Path, schema_path: str | Path | None = None,
+        proxy_bot_user_id=None,
+        proxy_owner_user_id=None,
+    ):
         self.path = Path(path)
         self.schema_path = Path(schema_path) if schema_path else Path(__file__).with_name("schema.sql")
+        # Injected, never read from the environment: this layer takes its
+        # configuration from the caller. Both default to off, so an
+        # unconfigured store authorises exactly as it did before.
+        self._proxy_bot_user_id = str(proxy_bot_user_id or "").strip()
+        self._proxy_owner_user_id = str(proxy_owner_user_id or "").strip()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10, factory=_ClosingConnection)
@@ -4261,6 +4269,44 @@ class RequestStore:
             "option": dict(option) if option is not None else None,
         }
 
+    def _is_proxy_originated(self, stored_requester_id) -> bool:
+        """True only for rows created through Dewey's nonce-gated proxy.
+
+        Dewey submits through Huey's own bot credential, so a Dewey-originated
+        row stores the proxy bot as its requester rather than the human who
+        asked. Proxy origin is inferred from that stored requester rather than
+        recorded in a column, because the inference is the durable consequence
+        of a gate that already exists: intake ignores every other bot and every
+        webhook, and admits Huey's own identity only when the Message Create
+        event carries a valid dewey:v1:<16> nonce. A row can therefore only
+        carry the proxy bot's ID if it came through Dewey. The nonce itself is
+        parsed and discarded at intake; this is what it turned into.
+
+        This is the SINGLE place to tighten if Huey ever gains a request path
+        that passes the bot's own ID to create_request(). It has none today:
+        create_request takes discord_user_id as a required keyword and every
+        caller sources it from an inbound message author.
+        """
+
+        return bool(self._proxy_bot_user_id) and (
+            str(stored_requester_id) == self._proxy_bot_user_id
+        )
+
+    def _proxy_owner_may_claim(self, stored_requester_id, replying_user_id) -> bool:
+        """Allow the configured owner to answer a picker on a proxied request.
+
+        Deliberately narrow. It grants nothing on an ordinary request, nothing
+        to anyone but the one configured owner, and nothing at all while either
+        identifier is unconfigured. Reply-ID and same-channel checks are
+        untouched and still apply in every case.
+        """
+
+        if not self._proxy_owner_user_id:
+            return False
+        if not self._is_proxy_originated(stored_requester_id):
+            return False
+        return str(replying_user_id) == self._proxy_owner_user_id
+
     def claim_candidate_selection(
         self,
         *,
@@ -4338,9 +4384,18 @@ class RequestStore:
                     )
                 return self._selection_claim_result("duplicate", request)
 
+            # The requester is normally the only one who may answer. A Dewey-proxied
+            # row stores the proxy bot as its requester, so the configured owner may
+            # answer that row and only that row. Reply-ID and same-channel are
+            # unchanged and still required in both cases.
+            requester_valid = str(discord_user_id) == str(joined["discord_user_id"])
+            if not requester_valid:
+                requester_valid = self._proxy_owner_may_claim(
+                    joined["discord_user_id"], discord_user_id
+                )
             identity_valid = bool(
                 reply_id is not None
-                and str(discord_user_id) == str(joined["discord_user_id"])
+                and requester_valid
                 and str(channel_id) == str(joined["channel_id"])
             )
             if not identity_valid:

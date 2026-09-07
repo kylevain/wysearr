@@ -2099,7 +2099,12 @@ def main() -> None:
     database_path = Path(os.environ.get("HUEY_DB_PATH", "/state/huey.db"))
 
     channel_config = load_channel_config(config_path)
-    store = RequestStore(database_path)
+    proxy_bot_user_id = os.environ.get("HUEY_PROXY_BOT_ID", "").strip()
+    proxy_owner_user_id = os.environ.get("HUEY_PROXY_OWNER_ID", "").strip()
+    store = RequestStore(database_path,
+        proxy_bot_user_id=proxy_bot_user_id,
+        proxy_owner_user_id=proxy_owner_user_id,
+    )
     store.initialize()
     try:
         reconcile_seconds = float(os.environ.get("HUEY_RECONCILE_SECONDS", "30"))
