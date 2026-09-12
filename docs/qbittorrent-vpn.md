@@ -112,6 +112,47 @@ be `tun0`, and both boolean preferences must be `false`. PIA controls the lease
 and may assign a different port after reconnect; never hard-code the observed
 number.
 
+## OpenVPN encryption preset
+
+`PRIVATE_INTERNET_ACCESS_OPENVPN_ENCRYPTION_PRESET` selects PIA's data cipher.
+It applies only when `VPN_TYPE` is `openvpn`, which is what WyseARR runs.
+
+| Value | Data cipher | PIA CA |
+| --- | --- | --- |
+| `strong` | `AES-256-GCM` | 4096-bit RSA |
+| `normal` | `AES-128-GCM` | 2048-bit RSA |
+
+The compose default is `strong`, which is also Gluetun's own default for PIA, so
+a deploy that sets nothing keeps the shipped behavior. `normal` exists to measure
+how much of OpenVPN's CPU cost on this host is cipher work: the AMD G-T48E has no
+AES-NI, so both presets run AES in software and AES-128 does roughly two thirds
+the round work of AES-256. It is a measurement, not a tuning knob to leave
+changed without a reason.
+
+Two traps:
+
+- **Those are the only two recognised values, and Gluetun v3.41.3 does not
+  validate this setting.** `internal/provider/privateinternetaccess/openvpnconf.go`
+  switches on `presets.Normal` and sends everything else to `default: // strong`.
+  A typo is a silent no-op, not a startup error.
+- **`OPENVPN_CIPHERS` overrides the preset's cipher.** `defaultStringSlice` in
+  `internal/provider/utils/openvpn.go` prefers the explicit setting. If
+  `OPENVPN_CIPHERS` is set in `.env`, changing the preset moves the CA but not
+  the cipher, and the measurement is meaningless.
+
+Confirm which cipher is actually live by reading the generated config rather than
+the logs — the INFO settings summary would show the preset, but `LOG_LEVEL` must
+stay at `warn` for the PIA-username reason above:
+
+```bash
+docker compose exec -T gluetun grep data-ciphers /etc/openvpn/target.ovpn
+```
+
+Gluetun writes `data-ciphers-fallback` and `data-ciphers` lines naming the
+selected cipher. The preset is read at container start, so it takes effect on
+`docker compose up -d gluetun`, which drops the tunnel and every qBittorrent
+transfer sharing its namespace.
+
 ## Routine validation
 
 Run both validators. They do not acquire media and do not intentionally disrupt

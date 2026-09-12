@@ -29,6 +29,13 @@ services:
       OPENVPN_USER: ${OPENVPN_USER:?OPENVPN_USER must be set}
       OPENVPN_PASSWORD: ${OPENVPN_PASSWORD:?OPENVPN_PASSWORD must be set}
       OPENVPN_PROTOCOL: ${OPENVPN_PROTOCOL:-udp}
+      # PIA OpenVPN data cipher. 'strong' (gluetun's default for PIA) selects
+      # AES-256-GCM with PIA's 4096-bit RSA CA; 'normal' selects AES-128-GCM with
+      # PIA's 2048-bit RSA CA. Those are the only two recognised values, and gluetun
+      # v3.41.3 does not validate the setting: anything else falls through to
+      # 'strong' silently, so a typo reads as a no-op rather than an error.
+      # OpenVPN only; ignored when VPN_TYPE is not openvpn.
+      PRIVATE_INTERNET_ACCESS_OPENVPN_ENCRYPTION_PRESET: ${PRIVATE_INTERNET_ACCESS_OPENVPN_ENCRYPTION_PRESET:-strong}
       SERVER_REGIONS: ${VPN_SERVER_REGIONS:-CA Vancouver}
       PORT_FORWARD_ONLY: "on"
       VPN_PORT_FORWARDING: "on"
